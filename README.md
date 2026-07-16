@@ -47,16 +47,32 @@ model. Load your literal `diff all` and the sim flies with *your* tune.
 | `client-godot/` | MIT | Godot 4 frontend (planned) |
 | `python/` | MIT | `propwash_gym` gymnasium env (planned) |
 
-## Build
+## Build & fly
 
 ```bash
 git clone --recursive <repo>
 cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build -j
-./build/tools/tester/pw-tester      # headless smoke test
+ctest --test-dir build              # headless hover + UDP end-to-end
 ```
 
 Requires: CMake ≥ 3.20, GCC/Clang with C11 + C++17, Linux (x86_64).
+
+**Fly it** (Godot 4.3+, e.g. `pacman -S godot`):
+
+```bash
+godot --path client-godot           # spawns build/propwash-core itself
+```
+
+- With a RadioMaster Pocket (EdgeTX USB Joystick mode) plugged in, the core
+  reads it directly (auto-detected by name) — ARM ch5, ANGLE ch6, same
+  switch plan as the real quad.
+- Without a radio: keyboard mode — arrows = right stick, W/S throttle,
+  A/D yaw, E arm, Q angle toggle, R reset.
+- Betaflight Configurator connects any time to TCP `127.0.0.1:5761`.
+
+Core standalone: `./build/propwash-core [--server|--realtime] [--port 9100]
+[--eeprom path] [--js /dev/input/jsN | --no-js]`.
 
 ## Why C++ / why in-process
 

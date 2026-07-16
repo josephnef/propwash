@@ -109,6 +109,9 @@ namespace SimITL{
 
       simState.armed = (BF::armingFlags & BF::ARMED) == BF::ARMED;
       simState.armingDisabledFlags = (int)BF::getArmingDisableFlags();
+      simState.flightModeFlags = (int)BF::flightModeFlags;
+      simState.beep = BF::isBeeperOn();
+      simState.stateOutput.beep = simState.beep ? 1U : 0U;
       simState.microsPassed = BF::pw_micros_passed;
       simState.motorsState[0].pwm = BF::pw_motors_pwm[0] / 1000.0f;
       simState.motorsState[1].pwm = BF::pw_motors_pwm[1] / 1000.0f;

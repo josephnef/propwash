@@ -48,6 +48,7 @@ namespace SimITL{
 
       #include "fc/rc_modes.h"
       #include "flight/pid.h"
+      #include "io/beeper.h"
 
       #include "build/debug.h"
 

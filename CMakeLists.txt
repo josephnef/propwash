@@ -19,8 +19,10 @@ add_library(pw_sim STATIC
   core/sim/sim.cpp
   core/sim/physics.cpp
   core/sim/util/SimplexNoise.cpp
+  core/net/server.cpp
+  core/input/joystick.cpp
 )
-target_include_directories(pw_sim PUBLIC core core/sim)
+target_include_directories(pw_sim PUBLIC core core/sim protocol)
 target_link_libraries(pw_sim PUBLIC bf_sitl)
 target_compile_options(pw_sim PRIVATE -Wall -Wextra -Wno-unused-parameter)
 
@@ -34,3 +36,6 @@ target_link_libraries(pw-tester PRIVATE pw_sim ${BF_LINK_OPTIONS})
 
 enable_testing()
 add_test(NAME headless_scenario COMMAND pw-tester)
+add_test(NAME udp_e2e
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tools/tester/run_e2e.sh $<TARGET_FILE:propwash-core>)
+set_tests_properties(udp_e2e PROPERTIES TIMEOUT 120)

@@ -102,6 +102,7 @@ namespace SimITL{
 
     bool armed = false;
     int armingDisabledFlags = 0;
+    int flightModeFlags = 0;
 
     bool beep = false;
 
