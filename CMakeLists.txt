@@ -39,3 +39,15 @@ add_test(NAME headless_scenario COMMAND pw-tester)
 add_test(NAME udp_e2e
   COMMAND bash ${CMAKE_SOURCE_DIR}/tools/tester/run_e2e.sh $<TARGET_FILE:propwash-core>)
 set_tests_properties(udp_e2e PROPERTIES TIMEOUT 120)
+
+# Godot client autotest (runs only if a godot 4 binary is available).
+# PROPWASH_AUTOTEST=1 arms + hovers via the real GDScript client, headless.
+find_program(GODOT_BIN NAMES godot godot4 Godot_v4.3-stable_linux.x86_64
+  PATHS /tmp)
+if(GODOT_BIN)
+  add_test(NAME godot_client
+    COMMAND ${GODOT_BIN} --headless --path ${CMAKE_SOURCE_DIR}/client-godot)
+  set_tests_properties(godot_client PROPERTIES
+    TIMEOUT 120
+    ENVIRONMENT "PROPWASH_AUTOTEST=1;PROPWASH_CORE=$<TARGET_FILE:propwash-core>")
+endif()

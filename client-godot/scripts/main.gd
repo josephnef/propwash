@@ -15,6 +15,10 @@
 #   R           reset
 extends Node3D
 
+# explicit preload: the class_name global cache doesn't exist on a first
+# headless run (no .godot import cache yet)
+const PwProtocol = preload("res://scripts/protocol.gd")
+
 const CORE_PORT := 9100
 
 var _udp := PacketPeerUDP.new()
@@ -39,8 +43,17 @@ var _angle_sw := true
 var _last_out := {}
 var _await_warned := false
 
+# autotest (PROPWASH_AUTOTEST=1): no keyboard/radio — arm at t=5.2 s, run
+# the reference hover controller, assert altitude/tilt, exit 0/1. This is
+# how the GDScript client itself is verified headless in CI.
+var _autotest := false
+var _at_time := 0.0
+var _at_alts: Array[float] = []
+var _at_armed_seen := false
+
 
 func _ready() -> void:
+	_autotest = OS.get_environment("PROPWASH_AUTOTEST") == "1"
 	_build_world()
 	_spawn_core()
 	_udp.connect_to_host("127.0.0.1", CORE_PORT)
@@ -63,7 +76,10 @@ func _spawn_core() -> void:
 
 
 func _physics_process(delta: float) -> void:
-	_update_keyboard_rc(delta)
+	if _autotest:
+		_update_autotest_rc(delta)
+	else:
+		_update_keyboard_rc(delta)
 
 	# --- sim-frame pose (convert Godot -> sim: negate z / negate qx,qy)
 	var sim_pos := Vector3(_pos.x, _pos.y, -_pos.z)
@@ -120,6 +136,8 @@ func _physics_process(delta: float) -> void:
 
 	_drone.transform = Transform3D(Basis(_rot), _pos)
 	_update_hud()
+	if _autotest:
+		_autotest_check(delta)
 
 
 func _update_keyboard_rc(delta: float) -> void:
@@ -165,7 +183,57 @@ func _update_hud() -> void:
 		o.arming_disable]
 
 
+# --------------------------------------------------------------- autotest
+func _update_autotest_rc(delta: float) -> void:
+	_rc[0] = 0.0
+	_rc[1] = 0.0
+	_rc[3] = 0.0
+	_rc[5] = 1.0                                    # ANGLE on
+	_rc[4] = 1.0 if _at_time >= 5.2 else -1.0       # ARM at 5.2 s
+	if not _last_out.is_empty() and _last_out.armed:
+		var u: float = -0.3 + 0.5 * (2.0 - _pos.y) - 0.4 * _linvel.y
+		u = clampf(u, -1.0, 0.6)
+		_throttle = clampf(u, _throttle - 2.0 * delta, _throttle + 2.0 * delta)
+	else:
+		_throttle = -1.0
+	_rc[2] = _throttle
+
+
+func _autotest_check(delta: float) -> void:
+	_at_time += delta
+	if not _last_out.is_empty() and _last_out.armed:
+		_at_armed_seen = true
+	if _at_time >= 13.0:
+		_at_alts.append(_pos.y)
+	if fmod(_at_time, 1.0) < delta:
+		print("[autotest] t=%.1f alt=%.2f armed=%s dis=0x%x" % [
+			_at_time, _pos.y, str(not _last_out.is_empty() and _last_out.armed),
+			_last_out.arming_disable if not _last_out.is_empty() else -1])
+	if _at_time >= 20.0:
+		var lo := 1e9
+		var hi := -1e9
+		for a in _at_alts:
+			lo = minf(lo, a)
+			hi = maxf(hi, a)
+		var ok := _at_armed_seen and _at_alts.size() > 0 and lo > 1.5 and hi < 2.5
+		print("[autotest] hover band [%.2f, %.2f] armed_seen=%s" % [lo, hi, str(_at_armed_seen)])
+		print("[autotest] %s" % ("PASS" if ok else "FAIL"))
+		get_tree().quit(0 if ok else 1)
+
+
 # ------------------------------------------------------------------ world
+func _add_box(pos: Vector3, size: Vector3, color: Color) -> void:
+	var mi := MeshInstance3D.new()
+	var mesh := BoxMesh.new()
+	mesh.size = size
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = color
+	mesh.material = mat
+	mi.mesh = mesh
+	mi.position = pos
+	add_child(mi)
+
+
 func _build_world() -> void:
 	# light + sky
 	var sun := DirectionalLight3D.new()
