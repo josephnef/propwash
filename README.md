@@ -1,100 +1,166 @@
 # propwash
 
-An open-source FPV drone simulator that runs **real Betaflight firmware in the loop**.
+**An open-source FPV drone simulator that runs *real Betaflight firmware* in the loop.**
 
-Unlike commercial sims (VelociDrone, Liftoff), propwash does not approximate the
-flight controller — it compiles the pilot's actual Betaflight version (pinned:
-**4.5.2**, matching a GEPRC CineLog35 V3) into the simulator process and runs the
-real scheduler, PID loops, rates, arming logic, and failsafe against a physics
-model. Load your literal `diff all` and the sim flies with *your* tune.
+Unlike commercial sims (VelociDrone, Liftoff), propwash doesn't approximate the
+flight controller — it compiles the pilot's actual Betaflight firmware (pinned
+**4.5.2**) into the simulator process and runs the real scheduler, PID loops,
+rates, arming logic, failsafe, and OSD against a physics model. Load your literal
+`diff all` off the quad and the sim flies with **your** tune.
+
+Built around a GEPRC **CineLog35 V3** (3.5″ ducted cinewhoop, F722), but the
+pairing is generic to any serial-ELRS + Betaflight setup.
+
+![disarmed on the pad](docs/demo-disarmed.png)
+![hovering with the real tune](docs/demo-hover-real-tune.png)
+
+*FPV view from where the DJI O3 sits — front ducts and props in frame, the real
+Betaflight OSD overlaid, live motor RPM in the HUD.*
+
+## Why
+
+Every other sim reimplements or approximates the flight controller. propwash
+runs the genuine article, which makes it uniquely suited to three things a
+normal sim can't do:
+
+1. **Train on your exact tune** — same PIDs, rates, filters, arming/failsafe
+   behaviour as the real quad.
+2. **Deterministic lockstep** — identical inputs produce byte-identical
+   trajectories, so it can back a reproducible RL gym and replay real blackbox
+   logs for sim-vs-real validation.
+3. **Configurator-compatible** — the real Betaflight Configurator connects over
+   TCP and tunes it live, exactly like a bench quad.
 
 ## Architecture
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│ propwash-core  (C++, GPL-3.0, standalone executable)       │
-│  ┌──────────────┐   in-process    ┌────────────────────┐   │
-│  │ physics 8kHz │ ◄─ motor PWM ── │ Betaflight 4.5.2   │   │
-│  │ (rigid body, │ ── gyro/accel ► │ (static lib, real  │   │
-│  │  motors, bat)│                 │  scheduler ticks)  │   │
-│  └──────┬───────┘                 └─────────┬──────────┘   │
-│         │ UDP protocol (versioned)          │ TCP 5761+    │
-└─────────┼───────────────────────────────────┼──────────────┘
-          │                                   │
-   Godot 4 client / Quest 3 /          Betaflight Configurator
-   Python gym env / bbreplay                (MSP/CLI)
+┌─────────────────────────────────────────────────────────────┐
+│ propwash-core   (C++, GPL-3.0, standalone executable)       │
+│  ┌───────────────┐   in-process    ┌─────────────────────┐  │
+│  │ physics 20kHz │ ── gyro/accel ► │ Betaflight 4.5.2    │  │
+│  │ (rigid body,  │ ◄─ motor PWM ── │ (static lib: real   │  │
+│  │  motors, bat) │                 │  scheduler + PIDs)  │  │
+│  └──────┬────────┘                 └──────────┬──────────┘  │
+│         │  UDP protocol (versioned)           │ TCP 5761    │
+└─────────┼──────────────────────────────────── ┼────────────┘
+          │                                     │
+   Godot 4 client / Quest 3 (planned) /   Betaflight Configurator
+   Python gym (planned) / bbreplay (planned)   (MSP / CLI)
 ```
 
-- **Deterministic lockstep**: simulated time advances only with sim ticks —
-  identical inputs produce identical trajectories (required for RL and for
-  replaying real blackbox logs).
-- **Process boundary = license boundary**: the core is GPL-3.0 (contains
-  Betaflight); clients speak a documented UDP protocol (`protocol/`, MIT) and
-  carry no GPL code.
-- **Quest 3 / OpenXR path**: the core stays on a PC; a standalone headset is
-  just another UDP client over WiFi.
+- **In-process, not networked SITL.** The core links Betaflight's C internals
+  directly (the [SimITL](https://github.com/AJ92/SimITL) approach) and drives
+  its scheduler tick-by-tick, so simulated time only advances with sim steps.
+  That determinism is the whole point; stock Betaflight SITL free-runs on wall
+  clock and can't give reproducible rollouts.
+- **Process boundary = license boundary.** The core is GPL-3.0 (it contains
+  Betaflight); every client speaks a documented UDP protocol (`protocol/`, MIT)
+  and carries no GPL code.
+- **The tick rate (20 kHz) exceeds the gyro/PID rate (8 kHz)** on purpose — the
+  scheduler only services non-realtime tasks (RX, MSP) between gyro boundaries.
+
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the details, including the
+two lockstep scheduler patches and the OSD/CLI plumbing.
 
 ## Layout
 
 | Path | License | What |
 |------|---------|------|
-| `core/` | GPL-3.0 | propwash-core executable: sim loop, physics, BF glue, UDP server |
-| `extern/betaflight/` | GPL-3.0 | Betaflight submodule pinned @ 4.5.2 |
-| `extern/betaflightext/` | GPL-3.0 | Override/shim layer (custom SITL-style target) + recorded patches |
-| `tools/tester/` | GPL-3.0 | Headless integration test: boot, MSP identity, arm, hover, determinism |
-| `tools/bbreplay/` | GPL-3.0 | Blackbox log replay for sim-vs-real validation (planned) |
-| `protocol/` | MIT | Wire protocol: single header, no Betaflight includes |
-| `client-godot/` | MIT | Godot 4 frontend (planned) |
-| `python/` | MIT | `propwash_gym` gymnasium env (planned) |
+| `core/` | GPL-3.0 | propwash-core: sim loop, physics, Betaflight glue, UDP server, joystick |
+| `extern/betaflight/` | GPL-3.0 | Betaflight submodule, pinned @ tag `4.5.2` |
+| `extern/betaflightext/` | GPL-3.0 | Override layer (SITL-derived target, patched scheduler/cli, fake OSD displayport) + recorded diffs in `patches/` |
+| `protocol/` | MIT | Wire protocol — single header, no Betaflight includes (the boundary) |
+| `client-godot/` | MIT | Godot 4 frontend: FPV cinewhoop, OSD overlay, joystick/keyboard |
+| `tools/tester/` | GPL-3.0 | Headless tests: boot/MSP identity, hover, determinism, OSD, real-tune |
+| `tools/bfcli/` | MIT-ish | CLI-over-TCP: apply the pilot's `diff all`, bake eeprom, calibrate joystick |
+| `config/` | — | The real `cinelog35v3.diff` + SITL overrides |
+| `docs/` | — | Architecture, licensing, screenshots |
 
-## Build & fly
+## Build
+
+No external dependencies — just a C/C++ toolchain and CMake. (The joystick uses
+the Linux kernel `js` API directly; no SDL2.)
 
 ```bash
-git clone --recursive <repo>
+git clone --recursive https://github.com/<you>/propwash
+cd propwash
 cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build -j
-ctest --test-dir build              # headless hover + UDP end-to-end
+ctest --test-dir build            # headless: boot, hover, determinism, OSD, real-tune
 ```
 
-Requires: CMake ≥ 3.20, GCC/Clang with C11 + C++17, Linux (x86_64).
+Requires: CMake ≥ 3.20, GCC ≥ 12 or Clang, Linux x86_64. (Builds clean on
+GCC 16; the pinned Betaflight needs a couple of `-Wno-error` for newer GCC,
+already handled in `extern/CMakeLists.txt`.)
 
-**Fly it** (Godot 4.3+, e.g. `pacman -S godot`):
+If you cloned without `--recursive`: `git submodule update --init --recursive`.
+
+## Fly it
+
+Install Godot 4.3+ (`pacman -S godot`, `apt install godot`, or grab the
+[official binary](https://godotengine.org/download)), then:
 
 ```bash
-godot --path client-godot           # spawns build/propwash-core itself
+# one-time: bake your tune into an eeprom the client will use
+tools/bfcli/load_config.sh                 # writes ./eeprom.bin
+
+PROPWASH_EEPROM=$PWD/eeprom.bin godot --path client-godot
 ```
 
-- With a RadioMaster Pocket (EdgeTX USB Joystick mode) plugged in, the core
-  reads it directly (auto-detected by name) — ARM ch5, ANGLE ch6, same
-  switch plan as the real quad.
-- Without a radio: keyboard mode — arrows = right stick, W/S throttle,
-  A/D yaw, E arm, Q angle toggle, R reset.
-- Betaflight Configurator connects any time to TCP `127.0.0.1:5761`.
-- The real Betaflight OSD is overlaid on the FPV view.
+The Godot client spawns `build/propwash-core` itself. Controls:
 
-**Load the pilot's real tune** (or the placeholder until the quad's on USB):
+- **RadioMaster Pocket / any EdgeTX handset** in USB Joystick mode — auto-detected
+  by name, RC read directly by the core. Calibrate once:
+  `./build/propwash-core --js-calibrate`.
+- **No radio** — keyboard: arrows = right stick, `W`/`S` throttle, `A`/`D` yaw,
+  `E` arm, `Q` angle toggle, `R` reset.
+- **Betaflight Configurator** connects any time to TCP `127.0.0.1:5761` (MSP/CLI)
+  and tunes it live.
+- The **real Betaflight OSD** is overlaid on the FPV view.
+
+### Loading the pilot's real tune
+
+`config/cinelog35v3.diff` is a real `diff all` pulled off the FC. Refresh it any
+time the quad is on USB, then re-bake:
 
 ```bash
-tools/bfcli/load_config.sh                       # bakes config/ into eeprom.bin
-# or live, over the Configurator data path:
-python3 tools/bfcli/pw_cli.py apply config/cinelog35v3.diff --save
-python3 tools/bfcli/pw_cli.py dump               # read back `diff all`
+# pull from the FC (see the cinelog35-v3 bring-up repo for scripts/bf.py)
+python3 scripts/bf.py /dev/ttyACM0 cli "diff all" > config/cinelog35v3.diff
+tools/bfcli/load_config.sh
 ```
 
-Core standalone: `./build/propwash-core [--server|--realtime] [--port 9100]
-[--eeprom path] [--js /dev/input/jsN | --no-js]`.
+`config/sitl-overrides.txt` neutralises settings that describe the *physical*
+board and must not apply to a virtual gyro — critically `align_board_roll`
+(the real FC is mounted inverted; without this the sim flies upside-down).
 
-## Why C++ / why in-process
+### Core standalone
 
-The core links Betaflight's C internals directly (`rxRuntimeState`,
-`micros_passed`, `scheduler()`) — the SimITL approach — because it is the only
-way to get deterministic time. Stock Betaflight SITL (UDP 9002/9003/9004)
-free-runs on wall clock scaled by packet arrival; that is fine for interactive
-flying and useless for reproducible RL rollouts.
+```bash
+./build/propwash-core [--server|--realtime|--js-calibrate] [--port 9100] \
+                      [--eeprom path] [--js /dev/input/jsN | --no-js]
+```
+
+## Status
+
+Working: in-process Betaflight 4.5.2, deterministic lockstep, physics + stable
+hover, UDP protocol, Godot FPV client with the real OSD and a cinewhoop model,
+CLI/Configurator data path, real-tune loading, joystick calibration, autonomous
+gate fly-through. **7 headless self-tests** cover boot/MSP identity, hover,
+determinism, OSD render, real-tune hover, and the Godot client + fly-through.
+
+Planned: Python gym env (RL), blackbox replay (sim-vs-real system ID), Quest 3 /
+OpenXR build.
 
 ## Prior art & credits
 
-- [SimITL](https://github.com/AJ92/SimITL) (GPL-3.0) — in-process BF + physics model this project ports
+- [SimITL](https://github.com/AJ92/SimITL) (GPL-3.0) — in-process BF + the physics model this ports
 - [KwadSim / KwadSimServer](https://github.com/timower/KwadSim) (GPL-3.0) — the restartable-server pattern
 - [Flightmare](https://github.com/uzh-rpg/flightmare) (MIT) — physics/render decoupling, gym design
-- [Betaloop](https://github.com/Aeroloop/betaloop) — MSP virtual radio RC path
+- [Betaloop](https://github.com/Aeroloop/betaloop) — MSP virtual-radio RC path
+- [Betaflight](https://github.com/betaflight/betaflight) (GPL-3.0) — the firmware that actually flies it
+
+## License
+
+The core and everything that links Betaflight are **GPL-3.0**. `protocol/`,
+`client-godot/`, and `python/` are **MIT** — they only speak the socket
+protocol. See [`docs/LICENSING.md`](docs/LICENSING.md).

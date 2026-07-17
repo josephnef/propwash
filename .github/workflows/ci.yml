@@ -1,0 +1,56 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential
+
+      - name: Configure & build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build build -j"$(nproc)"
+
+      - name: Core tests (headless, no GPU / no joystick)
+        run: |
+          # the Godot client tests need a godot binary; run everything else
+          ctest --test-dir build --output-on-failure -E 'godot_client|flythrough'
+
+  godot-client:
+    runs-on: ubuntu-latest
+    continue-on-error: true   # informational: the core tests above are the gate
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install toolchain + Godot + Xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential unzip xvfb
+          curl -sL -o godot.zip \
+            https://github.com/godotengine/godot/releases/download/4.3-stable/Godot_v4.3-stable_linux.x86_64.zip
+          unzip -q godot.zip
+          sudo install -m755 Godot_v4.3-stable_linux.x86_64 /usr/local/bin/godot
+
+      - name: Configure & build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build build -j"$(nproc)"
+
+      - name: Godot client + fly-through (headless autotest)
+        run: |
+          ctest --test-dir build --output-on-failure -R 'godot_client|flythrough'
