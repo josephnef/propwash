@@ -7,12 +7,16 @@
 # physics lineage); Godot is y-up right-handed with -z forward. Conversion:
 # mirror the z axis (positions/velocities negate z; quaternions negate x,y).
 #
-# Controls (only used when the core has NO joystick — with the RadioMaster
-# Pocket plugged in, the core reads it directly and ignores our rc):
-#   arrows      right stick (roll / pitch)
-#   W/S         throttle up / down       A/D  yaw
-#   E           toggle ARM (ch5)         Q    toggle ANGLE (ch6, on by default)
-#   R           reset
+# Controls. RC source, in priority order:
+#   1. an RC handset (RadioMaster / EdgeTX in USB Joystick mode). On Linux the
+#      core reads it directly; on macOS (no kernel js API) the client reads it
+#      here via Godot's cross-platform Input and sends it as rc. Either way it
+#      wins — the server prefers a live handset over these client keys.
+#   2. keyboard, when no handset is connected:
+#        arrows    right stick (roll / pitch)
+#        W/S       throttle up / down       A/D  yaw
+#        E         toggle ARM (ch5)         Q    toggle ANGLE (ch6, on by default)
+#        R         reset
 extends Node3D
 
 # explicit preload: the class_name global cache doesn't exist on a first
@@ -41,6 +45,18 @@ var _rc := [0.0, 0.0, -1.0, 0.0, -1.0, 1.0, -1.0, -1.0]
 var _throttle := -1.0
 var _armed_sw := false
 var _angle_sw := true
+
+# RC handset (joystick) state. EdgeTX "Joystick (Channels)" mode presents
+# CH1-8 as HID axes 0-7 = AETR + switches, which Godot normalises to -1..1 —
+# the same convention the firmware's rcData wants, so axes pass straight to
+# channels. Layouts vary, so the axis->channel map and per-channel inversion
+# are overridable without recompiling:
+#   PROPWASH_JS_MAP="0,1,2,3,4,5,6,7"  (rc channel i reads joy axis map[i])
+#   PROPWASH_JS_INVERT="2"             (comma list of channels to negate)
+var _js_dev := -1
+var _js_logged := false
+var _js_axis_map := [0, 1, 2, 3, 4, 5, 6, 7]
+var _js_invert := [false, false, false, false, false, false, false, false]
 
 var _last_out := {}
 var _await_warned := false
@@ -82,6 +98,7 @@ func _ready() -> void:
 	if _demo == "acro":
 		# capture through the whole gate run
 		_shot_times = [4.0, 7.0, 9.0, 11.0, 13.0, 15.0, 17.0, 19.0]
+	_parse_js_env()
 	_build_world()
 	_spawn_core()
 	_udp.connect_to_host("127.0.0.1", CORE_PORT)
@@ -118,7 +135,7 @@ func _physics_process(delta: float) -> void:
 	elif _autotest:
 		_update_autotest_rc(delta)
 	else:
-		_update_keyboard_rc(delta)
+		_update_manual_rc(delta)
 
 	# --- sim-frame pose (convert Godot -> sim: negate z / negate qx,qy)
 	var sim_pos := Vector3(_pos.x, _pos.y, -_pos.z)
@@ -196,6 +213,67 @@ func _physics_process(delta: float) -> void:
 		_autotest_check(delta)
 
 
+# Manual flight: prefer a live RC handset, fall back to the keyboard. Checked
+# every frame so hot-plugging the handset just works.
+func _update_manual_rc(delta: float) -> void:
+	_js_dev = _pick_joystick()
+	if _js_dev >= 0:
+		_update_joystick_rc()
+	else:
+		if _js_logged:                       # handset was unplugged
+			_js_logged = false
+		_update_keyboard_rc(delta)
+
+
+# Pick an RC handset from the connected joysticks: prefer one that names itself
+# EdgeTX/OpenTX/RadioMaster/Betaflight/Taranis, else the first joystick.
+func _pick_joystick() -> int:
+	var pads := Input.get_connected_joypads()
+	if pads.is_empty():
+		return -1
+	for d in pads:
+		var n := Input.get_joy_name(d).to_lower()
+		if n.contains("edgetx") or n.contains("opentx") or n.contains("radiomaster") \
+				or n.contains("betaflight") or n.contains("taranis") or n.contains("frsky"):
+			return d
+	return pads[0]
+
+
+func _update_joystick_rc() -> void:
+	if not _js_logged:
+		var known := "" if Input.is_joy_known(_js_dev) else "  [generic HID]"
+		print("[pw][client] RC handset: '%s' (dev %d)%s" % [
+			Input.get_joy_name(_js_dev), _js_dev, known])
+		print("[pw][client] axis->ch map %s  invert %s  (PROPWASH_JS_MAP / PROPWASH_JS_INVERT to change)" % [
+			str(_js_axis_map), str(_js_invert)])
+		_js_logged = true
+	for ch in range(8):
+		var ax: int = _js_axis_map[ch]
+		var v := Input.get_joy_axis(_js_dev, ax)
+		if _js_invert[ch]:
+			v = -v
+		_rc[ch] = clampf(v, -1.0, 1.0)
+
+
+# Parse optional axis-map / inversion overrides for handsets whose USB layout
+# differs from the default EdgeTX Classic (axes 0-7 = CH1-8).
+func _parse_js_env() -> void:
+	var m := OS.get_environment("PROPWASH_JS_MAP")
+	if not m.is_empty():
+		var parts := m.split(",", false)
+		if parts.size() == 8:
+			for i in range(8):
+				_js_axis_map[i] = int(parts[i].strip_edges())
+		else:
+			push_warning("PROPWASH_JS_MAP needs 8 comma-separated axes; ignoring '%s'" % m)
+	var inv := OS.get_environment("PROPWASH_JS_INVERT")
+	if not inv.is_empty():
+		for tok in inv.split(",", false):
+			var ch := int(tok.strip_edges())
+			if ch >= 0 and ch < 8:
+				_js_invert[ch] = true
+
+
 func _update_keyboard_rc(delta: float) -> void:
 	_rc[0] = Input.get_axis("ui_left", "ui_right")           # roll
 	_rc[1] = Input.get_axis("ui_down", "ui_up")              # pitch
@@ -243,10 +321,18 @@ func _update_hud() -> void:
 	if _last_out.is_empty():
 		return
 	var o := _last_out
-	_hud.text = "%s   alt %5.1f m   vbat %4.1f V   thr %4.1f\nrpm %5.0f %5.0f %5.0f %5.0f   dis 0x%x\nE arm | Q angle | R reset | WASD+arrows fly (keyboard mode)" % [
+	var rc_line: String
+	if _js_dev >= 0:
+		# live channels help confirm the AETR+switch mapping / spot inversions
+		rc_line = "RC '%s'  A%+.2f E%+.2f T%+.2f R%+.2f  5:%+.2f 6:%+.2f 7:%+.2f 8:%+.2f" % [
+			Input.get_joy_name(_js_dev),
+			_rc[0], _rc[1], _rc[2], _rc[3], _rc[4], _rc[5], _rc[6], _rc[7]]
+	else:
+		rc_line = "E arm | Q angle | R reset | WASD+arrows fly (keyboard)"
+	_hud.text = "%s   alt %5.1f m   vbat %4.1f V   thr %4.1f\nrpm %5.0f %5.0f %5.0f %5.0f   dis 0x%x\n%s" % [
 		"ARMED" if o.armed else "DISARMED", _pos.y, o.vbat, _throttle,
 		o.motor_rpm[0], o.motor_rpm[1], o.motor_rpm[2], o.motor_rpm[3],
-		o.arming_disable]
+		o.arming_disable, rc_line]
 
 
 # --------------------------------------------------------------- autotest

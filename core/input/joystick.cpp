@@ -9,11 +9,62 @@
 
 #include <fcntl.h>
 #include <unistd.h>
-#include <sys/ioctl.h>
 #include <sys/stat.h>
+
+#if defined(__linux__)
+#include <sys/ioctl.h>
 #include <linux/joystick.h>
+#define PW_JS_LINUX 1
+#else
+#define PW_JS_LINUX 0
+#endif
 
 namespace pw {
+
+// ----------------------------------------------------------- portable bits
+// (no OS joystick API — calibration file parsing + axis scaling are shared)
+
+float Joystick::apply(int axis, int raw) const
+{
+    const float span = (float)(mHi[axis] - mLo[axis]);
+    if (span == 0.0f) return 0.0f;
+    float n = 2.0f * (raw - mLo[axis]) / span - 1.0f;
+    if (n < -1.0f) n = -1.0f;
+    if (n > 1.0f) n = 1.0f;
+    return n;
+}
+
+const char* Joystick::defaultCalPath()
+{
+    static char path[256];
+    const char* home = getenv("HOME");
+    snprintf(path, sizeof(path), "%s/.config/propwash/joystick.cal",
+             home ? home : ".");
+    return path;
+}
+
+bool Joystick::loadCalibration(const char* path)
+{
+    FILE* f = fopen(path, "r");
+    if (!f) return false;
+    char line[128];
+    int loaded = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#') continue;
+        int axis, lo, hi;
+        if (sscanf(line, "%d %d %d", &axis, &lo, &hi) == 3 && axis >= 0 && axis < 8) {
+            mLo[axis] = lo;
+            mHi[axis] = hi;
+            loaded++;
+        }
+    }
+    fclose(f);
+    if (loaded) printf("[pw][js] loaded calibration from %s (%d axes)\n", path, loaded);
+    return loaded > 0;
+}
+
+#if PW_JS_LINUX
+// ----------------------------------------------------- Linux kernel js API
 
 static bool nameContainsEdgeTX(const char* name)
 {
@@ -85,16 +136,6 @@ bool Joystick::open(const char* devPath)
     return false;
 }
 
-float Joystick::apply(int axis, int raw) const
-{
-    const float span = (float)(mHi[axis] - mLo[axis]);
-    if (span == 0.0f) return 0.0f;
-    float n = 2.0f * (raw - mLo[axis]) / span - 1.0f;
-    if (n < -1.0f) n = -1.0f;
-    if (n > 1.0f) n = 1.0f;
-    return n;
-}
-
 bool Joystick::poll()
 {
     if (mFd < 0) return false;
@@ -108,35 +149,6 @@ bool Joystick::poll()
         }
     }
     return changed;
-}
-
-const char* Joystick::defaultCalPath()
-{
-    static char path[256];
-    const char* home = getenv("HOME");
-    snprintf(path, sizeof(path), "%s/.config/propwash/joystick.cal",
-             home ? home : ".");
-    return path;
-}
-
-bool Joystick::loadCalibration(const char* path)
-{
-    FILE* f = fopen(path, "r");
-    if (!f) return false;
-    char line[128];
-    int loaded = 0;
-    while (fgets(line, sizeof(line), f)) {
-        if (line[0] == '#') continue;
-        int axis, lo, hi;
-        if (sscanf(line, "%d %d %d", &axis, &lo, &hi) == 3 && axis >= 0 && axis < 8) {
-            mLo[axis] = lo;
-            mHi[axis] = hi;
-            loaded++;
-        }
-    }
-    fclose(f);
-    if (loaded) printf("[pw][js] loaded calibration from %s (%d axes)\n", path, loaded);
-    return loaded > 0;
 }
 
 bool Joystick::calibrate(const char* path)
@@ -221,5 +233,33 @@ void Joystick::close()
         mFd = -1;
     }
 }
+
+#else
+// ------------------------------------------------- non-Linux stub backend
+// No kernel `js` device here (the Linux joystick API is Linux-only). On
+// macOS the RadioMaster/EdgeTX handset is read by the Godot client instead
+// (Godot's cross-platform Input API) and injected as RC over the wire — the
+// server's RC priority falls through to the client packet when the core has
+// no local joystick.
+
+bool Joystick::open(const char* devPath)
+{
+    (void)devPath;
+    return false;
+}
+
+bool Joystick::poll() { return false; }
+
+bool Joystick::calibrate(const char* path)
+{
+    (void)path;
+    fprintf(stderr, "[pw][js] --js-calibrate is Linux-only; on this platform "
+                    "the client reads the handset directly\n");
+    return false;
+}
+
+void Joystick::close() { mFd = -1; }
+
+#endif  // PW_JS_LINUX
 
 } // namespace pw

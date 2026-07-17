@@ -8,21 +8,35 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Install toolchain
+      - name: Install toolchain (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake build-essential
 
+      - name: Install toolchain (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # cmake ships on GitHub macOS runners; install only if missing.
+          # AppleClang builds the Betaflight SITL lib as-is; the macOS link
+          # path (extern/CMakeLists.txt) uses -dead_strip instead of the GNU
+          # pg.ld linker script.
+          cmake --version || brew install cmake
+
       - name: Configure & build
         run: |
           cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
-          cmake --build build -j"$(nproc)"
+          cmake --build build -j"$(getconf _NPROCESSORS_ONLN)"
 
       - name: Core tests (headless, no GPU / no joystick)
         run: |
@@ -30,14 +44,19 @@ jobs:
           ctest --test-dir build --output-on-failure -E 'godot_client|flythrough'
 
   godot-client:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     continue-on-error: true   # informational: the core tests above are the gate
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Install toolchain + Godot + Xvfb
+      - name: Install toolchain + Godot (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake build-essential unzip xvfb
@@ -46,10 +65,19 @@ jobs:
           unzip -q godot.zip
           sudo install -m755 Godot_v4.3-stable_linux.x86_64 /usr/local/bin/godot
 
+      - name: Install toolchain + Godot (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cmake --version || brew install cmake
+          # the cask drops a `godot` CLI symlink in the brew bin (on PATH),
+          # which CMake's find_program picks up
+          brew install --cask godot
+          godot --version
+
       - name: Configure & build
         run: |
           cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
-          cmake --build build -j"$(nproc)"
+          cmake --build build -j"$(getconf _NPROCESSORS_ONLN)"
 
       - name: Godot client + fly-through (headless autotest)
         run: |

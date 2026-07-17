@@ -1,7 +1,7 @@
 build/
 *.o
 *.a
-eeprom.bin
+*eeprom.bin
 __pycache__/
 *.pyc
 .cache/

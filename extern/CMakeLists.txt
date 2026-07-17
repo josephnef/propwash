@@ -83,12 +83,39 @@ target_compile_options(bf_sitl PRIVATE
   -O2
 )
 
-# Consumers (executables) must link with the parameter-group linker script
-# and these system libs. Modern linkers need --no-warn-rwx-segments quieted
-# for the custom section layout.
-set(BF_LINK_OPTIONS
-  "-T${BF_ROOT}/src/main/target/SITL/pg.ld"
-  "-Wl,--gc-sections"
-  -lm -lpthread -lrt
-  PARENT_SCOPE
-)
+# Consumers (executables) must link so the .pg_registry parameter-group
+# section is laid out contiguously and its boundary symbols resolve.
+if(APPLE)
+  # macOS/ld64: no GNU linker scripts. Betaflight's pg.h already routes the
+  # registry into the Mach-O section __DATA,__pg_registry and reads its bounds
+  # via ld64's synthesized section$start/section$end symbols (the __APPLE__
+  # branch). We must NOT force_load the archive: that would drag in objects
+  # (gps_lap_timer, light_led, pidaudio, i2c...) whose dependencies live in
+  # STM32 driver files excluded from the SITL source list, leaving undefined
+  # symbols. Normal selective linking pulls only the referenced objects — the
+  # same set Linux pulls — and the sim's init path transitively references
+  # every PG-registered module, so the registry stays complete.
+  #
+  # -dead_strip is the ld64 analogue of GNU --gc-sections and is REQUIRED: it
+  # prunes dead firmware functions (e.g. gyro_init's unused gyroReadRegister)
+  # that reference STM32 driver symbols excluded from the SITL build — without
+  # it those become undefined-symbol link errors. The PG registry survives
+  # dead_strip because pg.h tags every entry __attribute__((used)), which
+  # clang emits as .no_dead_strip (the Mach-O analogue of the pg.ld KEEP()).
+  # No -lrt (real-time calls live in libSystem here); pthreads are too.
+  set(BF_LINK_OPTIONS
+    "-Wl,-dead_strip"
+    -lm
+    PARENT_SCOPE
+  )
+else()
+  # GNU ld: the pg.ld linker script collects .pg_registry and provides the
+  # __pg_registry_start/end boundary symbols; --gc-sections + KEEP prune the
+  # rest without dropping the registry.
+  set(BF_LINK_OPTIONS
+    "-T${BF_ROOT}/src/main/target/SITL/pg.ld"
+    "-Wl,--gc-sections"
+    -lm -lpthread -lrt
+    PARENT_SCOPE
+  )
+endif()
