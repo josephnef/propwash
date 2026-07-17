@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -14,6 +15,35 @@
 namespace pw {
 
 using namespace SimITL;
+
+// Decode the Betaflight arming-disable bitmask to names (4.5.2 order), so the
+// pilot can see *why* it won't arm while setting up switches. ARM_SWITCH is
+// suppressed — it only ever lights as a consequence of another flag.
+static std::string armingBlockReason(uint32_t flags)
+{
+    static const char* names[] = {
+        "NO_GYRO", "FAILSAFE", "RX_FAILSAFE", "NOT_DISARMED", "BOXFAILSAFE",
+        "RUNAWAY_TAKEOFF", "CRASH_DETECTED", "THROTTLE", "ANGLE",
+        "BOOT_GRACE_TIME", "NOPREARM", "LOAD", "CALIBRATING", "CLI",
+        "CMS_MENU", "BST", "MSP", "PARALYZE", "GPS", "RESC", "DSHOT_TELEM",
+        "REBOOT_REQUIRED", "DSHOT_BITBANG", "ACC_CALIBRATION",
+        "MOTOR_PROTOCOL", "ARM_SWITCH",
+    };
+    if (flags == 0) return "(ready to arm)";
+    std::string out;
+    for (int i = 0; i < 25; i++) {  // bits below ARM_SWITCH
+        if (flags & (1u << i)) {
+            if (!out.empty()) out += ",";
+            out += names[i];
+        }
+    }
+    if (out.empty()) {
+        // only ARM_SWITCH (bit 25) left: everything else is clear, but the
+        // arm switch was already high when arming became allowed
+        return "flip ARM switch OFF then ON";
+    }
+    return out;
+}
 
 bool Server::start(uint16_t port)
 {
@@ -226,11 +256,20 @@ void Server::run(SimITL::Sim& sim, const StateInit& defaultInit, Joystick* js)
                 sendTo(&osd, sizeof(osd), PW_OSD);
             }
 
-            if (++stateInCount % 1024 == 0) {
-                printf("[pw][net] frames=%llu armed=%d dis=0x%x rc_src=%s\n",
-                       (unsigned long long)stateInCount, o.armed,
-                       o.arming_disable_flags,
-                       (js && js->isOpen()) ? "joystick" : (rcOverrideActive ? "override" : "client"));
+            // Log the 8 RC channels + decoded arm-block reason whenever the
+            // armed state or disable flags change (so flipping a switch gives
+            // immediate feedback), plus a periodic heartbeat.
+            static uint32_t lastFlags = 0xFFFFFFFFu;
+            static uint8_t lastArmed = 0xFF;
+            if (o.arming_disable_flags != lastFlags || o.armed != lastArmed
+                || stateInCount % 1024 == 0) {
+                lastFlags = o.arming_disable_flags;
+                lastArmed = o.armed;
+                printf("[pw][rc] AETR=%.2f/%.2f/%.2f/%.2f  ch5-8=%.2f/%.2f/%.2f/%.2f  "
+                       "armed=%d  block:%s\n",
+                       input.rcData[0], input.rcData[1], input.rcData[2], input.rcData[3],
+                       input.rcData[4], input.rcData[5], input.rcData[6], input.rcData[7],
+                       o.armed, armingBlockReason(o.arming_disable_flags).c_str());
             }
             break;
         }

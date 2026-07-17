@@ -43,6 +43,8 @@ var _angle_sw := true
 
 var _last_out := {}
 var _await_warned := false
+var _got_first_reply := false
+var _boot_elapsed := 0.0      # wall time since start, for the no-reply grace
 
 # autotest (PROPWASH_AUTOTEST=1): no keyboard/radio — arm at t=5.2 s, run
 # the reference hover controller, assert altitude/tilt, exit 0/1. This is
@@ -100,11 +102,16 @@ func _spawn_core() -> void:
 	var eeprom := OS.get_environment("PROPWASH_EEPROM")
 	if not eeprom.is_empty():
 		args += ["--eeprom", eeprom]
+	# autotest / demo drive RC from the script — a physically-connected Pocket
+	# would otherwise override it (joystick has priority) and hijack the run
+	if _autotest or _demo == "acro":
+		args += ["--no-js"]
 	_core_pid = OS.create_process(path, args)
 	print("propwash-core pid ", _core_pid)
 
 
 func _physics_process(delta: float) -> void:
+	_boot_elapsed += delta
 	if _demo == "acro":
 		_update_acro_demo_rc(delta)
 	elif _autotest:
@@ -132,11 +139,15 @@ func _physics_process(delta: float) -> void:
 			break
 		OS.delay_usec(10)
 	if not got:
-		if not _await_warned:
+		# don't cry wolf during the core's ~1-2 s boot (joystick enumerate +
+		# Betaflight init + UDP bind). Only warn once we've either seen a reply
+		# before (a real mid-flight dropout) or waited out the startup grace.
+		if not _await_warned and (_got_first_reply or _boot_elapsed > 4.0):
 			push_warning("no reply from propwash-core (is it running on udp:%d?)" % CORE_PORT)
 			_await_warned = true
 		return
 	_await_warned = false
+	_got_first_reply = true
 
 	var out := {}
 	while _udp.get_available_packet_count() > 0:      # drain, keep newest
