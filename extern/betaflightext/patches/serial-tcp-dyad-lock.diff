@@ -1,0 +1,126 @@
+--- extern/betaflight/src/main/drivers/serial_tcp.c	2026-07-17 21:28:36
++++ extern/betaflightext/src/main/drivers/serial_tcp.c	2026-07-17 23:03:38
+@@ -23,6 +23,26 @@
+  * Dominic Clifton - Serial port abstraction, Separation of common STM32 code for cleanflight, various cleanups.
+  * Hamasaki/Timecop - Initial baseflight code
+ */
++
++/*
++ * propwash: vendored from stock drivers/serial_tcp.c (BF 4.5.2), the ONLY
++ * change being dyad thread-safety. dyad is single-threaded by design, but
++ * propwash pumps dyad_update() on a dedicated worker thread (pw_sitl.c's
++ * tcpThread) while the Betaflight scheduler (the sim thread) calls dyad here
++ * from tcpReconfigure() (dyad_newStream/dyad_listenEx at init) and tcpDataOut()
++ * (dyad_write on every CLI/MSP response). Those concurrent, unsynchronised
++ * accesses to dyad's global stream list are a data race: on some hosts the
++ * listener stream is never serviced by dyad_update() — onAccept never fires,
++ * the kernel silently accepts the TCP connection into its listen backlog, and
++ * the CLI/MSP appears dead (bind succeeds, no data ever flows). It reproduced
++ * 100% on GitHub's macOS runners and passed locally purely on thread-timing
++ * luck. pw_dyad_lock/unlock (defined in pw_sitl.c) serialise every dyad call.
++ * See extern/betaflightext/patches/serial-tcp-dyad-lock.diff.
++ *
++ * NOTE: the onAccept/onData/onClose callbacks run *inside* dyad_update() (on
++ * the worker thread, which already holds the lock), so they must NOT re-lock —
++ * the mutex is non-recursive.
++ */
+ #include <stdbool.h>
+ #include <stdint.h>
+ #include <stdio.h>
+@@ -36,8 +56,14 @@
+ #include "common/utils.h"
+ 
+ #include "io/serial.h"
+-#include "serial_tcp.h"
++// full path (this vendored copy lives outside drivers/, and adding drivers/ to
++// the include path would shadow the system <time.h> with Betaflight's)
++#include "drivers/serial_tcp.h"
+ 
++// propwash: serialise dyad access against pw_sitl.c's tcpThread (dyad_update).
++extern void pw_dyad_lock(void);
++extern void pw_dyad_unlock(void);
++
+ #define BASE_PORT 5760
+ 
+ static const struct serialPortVTable tcpVTable; // Forward
+@@ -56,10 +82,13 @@
+ static void onClose(dyad_Event *e)
+ {
+     tcpPort_t* s = (tcpPort_t*)(e->udata);
+-    s->clientCount--;
+-    s->conn = NULL;
+     fprintf(stderr, "[CLS]UART%u: %d,%d\n", s->id + 1, s->connected, s->clientCount);
+-    if (s->clientCount == 0) {
++    // propwash: only clear the slot if the CURRENT client closed. A stale
++    // close event (from a client we already dropped in onAccept) must not wipe
++    // the new connection's slot. e->stream is the connection that closed.
++    if (s->conn == e->stream) {
++        s->conn = NULL;
++        s->clientCount = 0;
+         s->connected = false;
+     }
+ }
+@@ -68,14 +97,21 @@
+     tcpPort_t* s = (tcpPort_t*)(e->udata);
+     fprintf(stderr, "New connection on UART%u, %d\n", s->id + 1, s->clientCount);
+ 
+-    s->connected = true;
+-    if (s->clientCount > 0) {
+-        dyad_close(e->remote);
+-        return;
++    // propwash: newest client wins. Stock BF rejects a new connection while
++    // one already exists, but propwash's CLI/MSP reconnects constantly (the
++    // Configurator, and every test phase re-opens the CLI) and onClose — which
++    // frees the slot — can lag the reconnect on a slow/busy host. The port
++    // then stays permanently "full" and the CLI/MSP goes dead (this is why
++    // diff_roundtrip's post-save readback returned nothing on the macOS CI
++    // runner while a later raw probe worked). So drop any stale client and
++    // take the new connection instead of rejecting it.
++    if (s->conn != NULL) {
++        dyad_close(s->conn);
+     }
+-    s->clientCount++;
+-    fprintf(stderr, "[NEW]UART%u: %d,%d\n", s->id + 1, s->connected, s->clientCount);
++    s->connected = true;
++    s->clientCount = 1;
+     s->conn = e->remote;
++    fprintf(stderr, "[NEW]UART%u: %d,%d\n", s->id + 1, s->connected, s->clientCount);
+     dyad_setNoDelay(e->remote, 1);
+     dyad_setTimeout(e->remote, 120);
+     dyad_addListener(e->remote, DYAD_EVENT_DATA, onData, e->udata);
+@@ -106,11 +142,16 @@
+     s->clientCount = 0;
+     s->id = id;
+     s->conn = NULL;
++    // propwash: creating a stream and starting the listener mutates dyad's
++    // global stream list — must not race the worker thread's dyad_update().
++    pw_dyad_lock();
+     s->serv = dyad_newStream();
+     dyad_setNoDelay(s->serv, 1);
+     dyad_addListener(s->serv, DYAD_EVENT_ACCEPT, onAccept, s);
+ 
+-    if (dyad_listenEx(s->serv, NULL, BASE_PORT + id + 1, 10) == 0) {
++    int listenErr = dyad_listenEx(s->serv, NULL, BASE_PORT + id + 1, 10);
++    pw_dyad_unlock();
++    if (listenErr == 0) {
+         fprintf(stderr, "bind port %u for UART%u\n", (unsigned)BASE_PORT + id + 1, (unsigned)id + 1);
+     } else {
+         fprintf(stderr, "bind port %u for UART%u failed!!\n", (unsigned)BASE_PORT + id + 1, (unsigned)id + 1);
+@@ -229,6 +270,9 @@
+     tcpPort_t *s = (tcpPort_t *)instance;
+     if (s->conn == NULL) return;
+     pthread_mutex_lock(&s->txLock);
++    // propwash: dyad_write mutates the stream's write buffer — serialise
++    // against the worker thread's dyad_update().
++    pw_dyad_lock();
+ 
+     if (s->port.txBufferHead < s->port.txBufferTail) {
+         // send data till end of buffer
+@@ -241,6 +285,7 @@
+         dyad_write(s->conn, (const void*)&s->port.txBuffer[s->port.txBufferTail], chunk);
+     s->port.txBufferTail = s->port.txBufferHead;
+ 
++    pw_dyad_unlock();
+     pthread_mutex_unlock(&s->txLock);
+ }
+ 

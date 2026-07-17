@@ -85,7 +85,6 @@ drivers/rx/rx_pwm.c
 drivers/rx/rx_spi.c
 drivers/serial.c
 drivers/serial_softserial.c
-drivers/serial_tcp.c
 drivers/sound_beeper.c
 drivers/stack_check.c
 drivers/timer_common.c

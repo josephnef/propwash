@@ -26,6 +26,11 @@ using namespace SimITL;
 
 int main(int argc, char** argv)
 {
+    // Line-buffer stdout so boot/diagnostic logs are captured promptly even
+    // when redirected to a pipe/file (CI, test harnesses) — default full
+    // buffering otherwise loses everything on a SIGTERM without flush.
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+
     const char* eeprom = "eeprom.bin";
     const char* jsDev = nullptr;   // auto-detect
     bool useJs = true;

@@ -39,7 +39,21 @@ list(APPEND BF_SOURCES
   # displayport captures the 16x30 grid into osdScreen[] (replaces the stock
   # SPI max7456 displayport, excluded from bf_sources.txt).
   "${CMAKE_CURRENT_SOURCE_DIR}/betaflightext/src/main/io/displayport_fake.c"
+  # serial_tcp.c: stock TCP UART driver + dyad thread-safety. dyad is pumped
+  # on pw_sitl.c's worker thread but called from the sim thread here too; the
+  # unsynchronised race left the CLI/MSP listener unserviced on some hosts
+  # (100% on macOS CI). This copy serialises dyad via pw_dyad_lock/unlock —
+  # patches/serial-tcp-dyad-lock.diff (stock excluded from bf_sources.txt).
+  "${CMAKE_CURRENT_SOURCE_DIR}/betaflightext/src/main/drivers/serial_tcp.c"
 )
+
+if(APPLE)
+  # macOS links the BF lib without dead-stripping (see BF_LINK_OPTIONS below),
+  # so the dead reference GNU --gc-sections prunes on Linux stays and needs a
+  # stub. See pw_stubs.c for the full rationale.
+  list(APPEND BF_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/betaflightext/src/main/pw_stubs.c")
+endif()
 
 add_library(bf_sitl STATIC ${BF_SOURCES})
 
@@ -64,7 +78,9 @@ target_include_directories(bf_sitl PUBLIC
   "${BF_ROOT}/lib/main/dyad"
   "${BF_ROOT}/lib/main/google/olc"
   # for the overridden scheduler.c / cli.c, whose same-directory includes
-  # must resolve against the stock headers
+  # must resolve against the stock headers. (Not drivers/ — it contains a
+  # time.h that would shadow the system <time.h>; the vendored serial_tcp.c
+  # uses a "drivers/serial_tcp.h" path instead.)
   "${BF_ROOT}/src/main/scheduler"
   "${BF_ROOT}/src/main/cli"
 )
@@ -96,15 +112,16 @@ if(APPLE)
   # same set Linux pulls — and the sim's init path transitively references
   # every PG-registered module, so the registry stays complete.
   #
-  # -dead_strip is the ld64 analogue of GNU --gc-sections and is REQUIRED: it
-  # prunes dead firmware functions (e.g. gyro_init's unused gyroReadRegister)
-  # that reference STM32 driver symbols excluded from the SITL build — without
-  # it those become undefined-symbol link errors. The PG registry survives
-  # dead_strip because pg.h tags every entry __attribute__((used)), which
-  # clang emits as .no_dead_strip (the Mach-O analogue of the pg.ld KEEP()).
-  # No -lrt (real-time calls live in libSystem here); pthreads are too.
+  # Crucially we DON'T -dead_strip. It's the ld64 analogue of --gc-sections,
+  # but some ld64 versions strip pgRegistry_t records out of
+  # __DATA,__pg_registry despite their __attribute__((used)) — the config vars
+  # survive (the sim flies on defaults) but drop out of the registry, so
+  # `save`/load stops persisting them (diff_roundtrip / real_tune_hover fail on
+  # the CI runner while passing on a newer local linker). Keeping every object
+  # is the robust cross-linker choice; the price is the one dead cross-ref that
+  # --gc-sections prunes on Linux, satisfied here by pw_stubs.c. No -lrt
+  # (real-time calls live in libSystem here); pthreads are too.
   set(BF_LINK_OPTIONS
-    "-Wl,-dead_strip"
     -lm
     PARENT_SCOPE
   )

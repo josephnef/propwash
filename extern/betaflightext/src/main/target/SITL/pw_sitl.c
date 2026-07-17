@@ -178,16 +178,38 @@ int lockMainPID(void)
     return 0;
 }
 
+// propwash: dyad is single-threaded by design, but this worker owns the dyad
+// event pump while the Betaflight scheduler (the sim thread) also calls dyad
+// from serial_tcp.c — dyad_listen() at serial init and dyad_write() on every
+// CLI/MSP response. Those unsynchronised accesses to dyad's global stream list
+// race: the listener stream can be left unserviced so onAccept never fires and
+// the CLI/MSP goes dead (reproduced 100% on GitHub macOS runners, masked by
+// thread-timing locally). pwDyadMutex serialises every dyad call; serial_tcp.c
+// takes it via pw_dyad_lock/unlock below.
+static pthread_mutex_t pwDyadMutex = PTHREAD_MUTEX_INITIALIZER;
+
+void pw_dyad_lock(void)   { pthread_mutex_lock(&pwDyadMutex); }
+void pw_dyad_unlock(void) { pthread_mutex_unlock(&pwDyadMutex); }
+
 static void *tcpThread(void *data)
 {
     UNUSED(data);
 
     dyad_init();
     dyad_setTickInterval(0.2f);
-    dyad_setUpdateTimeout(0.01f);
+    // non-blocking poll so the lock is never held across a blocking select();
+    // the usleep below sets the effective poll rate and yields to the sim thread
+    dyad_setUpdateTimeout(0.0f);
 
     while (workerRunning) {
+        pw_dyad_lock();
         dyad_update();
+        pw_dyad_unlock();
+        // ~2 kHz poll: keeps CLI/MSP latency sub-ms without busy-spinning, and
+        // hands pwDyadMutex to the sim thread between polls (nanosleep via
+        // <time.h>, already used here — avoids <unistd.h>, which perturbs the
+        // macOS feature-test macros and hides clock_gettime/nanosleep)
+        nanosleep(&(struct timespec){0, 500000}, NULL);
     }
 
     dyad_shutdown();

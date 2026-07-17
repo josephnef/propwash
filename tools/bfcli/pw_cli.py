@@ -40,10 +40,34 @@ class Cli:
                 continue  # no data this poll; keep waiting until `settle`
         return out.decode(errors="replace")
 
-    def enter(self):
-        # a bare '#' on the MSP serial drops Betaflight into the CLI
-        self.sock.sendall(b"#\r\n")
-        return self._drain()
+    def enter(self, timeout=8.0):
+        # A bare '#' on the MSP serial drops Betaflight into the CLI. After a
+        # `save` the FC reboots (re-runs init + gyro calibration) and doesn't
+        # service the serial port for a moment; on a slow host (e.g. CI) the
+        # banner can lag well past a single fixed drain, so poll for the "# "
+        # prompt and re-poke '#' periodically in case it was dropped mid-reboot.
+        # A stray '#' at an existing CLI prompt is harmless (just echoed).
+        out = b""
+        end = time.time() + timeout
+        last_poke = 0.0
+        while time.time() < end:
+            now = time.time()
+            if now - last_poke > 0.5:
+                try:
+                    self.sock.sendall(b"#\r\n")
+                except OSError:
+                    break
+                last_poke = now
+            try:
+                d = self.sock.recv(4096)
+                if not d:
+                    break
+                out += d
+                if b"# " in out:            # CLI prompt reached — ready
+                    break
+            except socket.timeout:
+                continue
+        return out.decode(errors="replace")
 
     def cmd(self, line, settle=0.25):
         self.sock.sendall(line.encode() + b"\r\n")
