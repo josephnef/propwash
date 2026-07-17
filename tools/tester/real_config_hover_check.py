@@ -57,10 +57,13 @@ def main():
 
     try:
         # ---- 1. bake the real tune into the eeprom
-        loader = spawn(core, "--realtime", eeprom)
+        loerr = tempfile.mktemp(suffix=".loerr")
+        loader = spawn(core, "--realtime", eeprom, errpath=loerr)
         time.sleep(2.0)
         cli = Cli()
-        cli.enter()
+        lbanner = cli.enter()
+        lprobe = cli.cmd("get p_pitch", settle=0.4)   # does the LOADER CLI work?
+        print(f"[diag] loader enter={len(lbanner)}B  get p_pitch={lprobe.strip()[:50]!r}")
         n = 0
         for line in diff_commands(diff) + diff_commands(overrides):
             cli.cmd(line, settle=0.03)
