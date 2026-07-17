@@ -77,10 +77,20 @@ The sim runs the pilot's **actual** Betaflight config, not an approximation.
   `diff all`, `save` (persists to eeprom, reboots in-process), and the tune
   survives — verified by the `diff_roundtrip` test. The real Betaflight
   Configurator can also connect live to 5761 to tweak PIDs/rates.
-- **Config files**: `config/cinelog35v3.diff` (placeholder until the real
-  dump is pulled off the quad via `scripts/bf.py`) and `config/sitl-overrides.txt`
-  (near-empty: motor protocol is forced in `targetPreInit`, and DSHOT/RPM
-  settings simply don't exist in the SITL value table).
+- **Config files**: `config/cinelog35v3.diff` is the **real** `diff all`
+  pulled off the GEPRC_F722_AIO ("Cinelog35 V3", profiles "85%"/"100%", real
+  PIDs p_pitch=53 etc.). `config/sitl-overrides.txt` neutralises settings that
+  describe the physical board — critically `align_board_roll = 180` (the FC is
+  mounted inverted; the sim's virtual gyro is already airframe-aligned, so
+  leaving it would fly the quad upside-down). Motor protocol is forced to PWM
+  in `targetPreInit`; DSHOT/RPM settings don't exist in the SITL value table
+  and are rejected harmlessly.
+- **`ARMING_DISABLED_CLI`**: opening the CLI sets this flag; it clears only on
+  a clean `exit` (pw_cli sends it on close). So the load-then-fly flow bakes
+  the eeprom in one instance and flies a *fresh* one that never touches the
+  CLI — which is also how `load_config.sh` + normal launches work.
+- The server boots the firmware immediately (5761 up before any client), so
+  the Configurator / pw_cli can attach right away.
 - **One-shot bake**: `tools/bfcli/load_config.sh` writes the tune into an
   eeprom once; every later launch flies it.
 - **cli.c fix**: stock Betaflight guards `pgFind()==NULL` in `dumpPgValue`

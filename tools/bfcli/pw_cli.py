@@ -49,7 +49,15 @@ class Cli:
         self.sock.sendall(line.encode() + b"\r\n")
         return self._drain(settle)
 
-    def close(self):
+    def close(self, leave=True):
+        # leave CLI mode so the firmware clears ARMING_DISABLED_CLI; without
+        # this the FC stays "in CLI" after the socket closes and won't arm
+        if leave:
+            try:
+                self.sock.sendall(b"exit\r\n")
+                self._drain(0.2)
+            except OSError:
+                pass  # already rebooted (e.g. after `save`)
         self.sock.close()
 
 

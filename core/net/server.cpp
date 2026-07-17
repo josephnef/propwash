@@ -104,6 +104,10 @@ void Server::run(SimITL::Sim& sim, const StateInit& defaultInit, Joystick* js)
         }
     };
 
+    // Boot the firmware immediately so MSP/CLI (TCP 5761) is up before any
+    // client connects — the Configurator and pw_cli.py can attach right away.
+    boot();
+
     uint8_t buf[2048];
 
     for (;;) {

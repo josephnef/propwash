@@ -55,6 +55,13 @@ add_test(NAME osd_render
   COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/tester/osd_check.py $<TARGET_FILE:propwash-core>)
 set_tests_properties(osd_render PROPERTIES TIMEOUT 60)
 
+# The payoff: bake the pilot's REAL diff into an eeprom, then a fresh
+# instance flies a hover with the pilot's actual PIDs/rates.
+add_test(NAME real_tune_hover
+  COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/tester/real_config_hover_check.py
+    $<TARGET_FILE:propwash-core>)
+set_tests_properties(real_tune_hover PROPERTIES TIMEOUT 90)
+
 # Godot client autotest (runs only if a godot 4 binary is available).
 # PROPWASH_AUTOTEST=1 arms + hovers via the real GDScript client, headless.
 find_program(GODOT_BIN NAMES godot godot4 Godot_v4.3-stable_linux.x86_64

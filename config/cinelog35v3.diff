@@ -1,38 +1,203 @@
-# CineLog35 V3 — Betaflight 4.5.2 configuration for propwash.
+# CineLog35 V3 — REAL Betaflight 4.5.2 config, pulled from the FC
+# (GEPRC_F722_AIO) over USB via ../cinelog35-v3/scripts/bf.py "diff all".
 #
-# ⚠ PLACEHOLDER. This is a representative config built from the documented
-# switch plan and safety settings (cinelog35-v3 docs/CONFIG.md), NOT the
-# real `diff all` off the quad. Replace it with the genuine dump when the
-# FC is on USB:
+# Refresh:  python3 ../cinelog35-v3/scripts/bf.py /dev/ttyACM0 cli "diff all"
 #
-#     python3 ../cinelog35-v3/scripts/bf.py /dev/ttyACM0 cli "diff all" \
-#         > config/cinelog35v3.diff
-#
-# Load into the sim:  tools/bfcli/pw_cli.py apply config/cinelog35v3.diff --save
-# (propwash also force-applies config/sitl-overrides.txt for settings that
-#  cannot work on the simulator — see that file.)
+# Applied into the sim with tools/bfcli/pw_cli.py; settings that don't exist
+# in SITL (dshot_bidir, gps_*, motor_output_reordering, ...) are rejected
+# harmlessly. config/sitl-overrides.txt then neutralises physical-mounting
+# settings (board alignment) that must not apply to the virtual gyro.
 
-# ---- safety (deliberate; see docs/CONFIG.md, do not soften) ----
-set failsafe_procedure = DROP
-set failsafe_switch_mode = KILL
-set small_angle = 180
+# version
+# Betaflight / STM32F7X2 (S7X2) 4.5.2 Apr  8 2025 / 02:34:33 (024f8e13d) MSP API: 1.46
+# config rev: 2f948c9
 
-# ---- switch plan: ARM ch5, ANGLE ch6, BEEPER ch7, FAILSAFE(kill) ch8 ----
-# aux <idx> <boxId> <auxCh> <start> <end> <logic> <linkedTo>
-# boxIds: 0=ARM 1=ANGLE 13=BEEPER 27=FAILSAFE
+# start the command batch
+batch start
+
+# reset configuration to default settings
+defaults nosave
+
+board_name GEPRC_F722_AIO
+manufacturer_id GEPR
+mcu_id 0047001f3335511430383430
+signature
+
+# name: Cinelog35 V3
+
+# feature
+feature TELEMETRY
+feature OSD
+
+# serial
+serial 0 131073 115200 57600 0 115200
+serial 1 64 115200 57600 0 115200
+
+# beeper
+beeper -ON_USB
+
+# beacon
+beacon RX_LOST
+beacon RX_SET
+
+# aux
 aux 0 0 0 1700 2100 0 0
 aux 1 1 1 1700 2100 0 0
 aux 2 13 2 1700 2100 0 0
 aux 3 27 3 1700 2100 0 0
 
-# ---- rates (moderate cinewhoop, Actual rates) ----
-set rates_type = ACTUAL
-set roll_rc_rate = 7
-set pitch_rc_rate = 7
-set yaw_rc_rate = 7
-set roll_expo = 40
-set pitch_expo = 40
-set yaw_expo = 40
+# master
+set gyro_lpf1_static_hz = 225
+set gyro_lpf2_static_hz = 450
+set gyro_notch1_hz = 236
+set gyro_notch1_cutoff = 232
+set dyn_notch_count = 1
+set dyn_notch_q = 600
+set gyro_lpf1_dyn_min_hz = 225
+set gyro_lpf1_dyn_max_hz = 450
+set acc_calibration = -54,-2,2,1
+set rc_smoothing_auto_factor = 60
+set dshot_idle_value = 600
+set dshot_bidir = ON
+set motor_output_reordering = 2,3,0,1,4,5,6,7
+set failsafe_switch_mode = KILL
+set align_board_roll = 180
+set align_board_yaw = 0
+set vbat_max_cell_voltage = 440
+set beeper_dshot_beacon_tone = 3
+set small_angle = 180
+set gps_sbas_mode = AUTO
+set gps_ublox_use_galileo = ON
+set gps_set_home_point_once = ON
+set gps_rescue_min_sats = 5
+set deadband = 5
+set yaw_deadband = 5
+set pid_process_denom = 2
+set simplified_gyro_filter_multiplier = 90
+set osd_link_quality_pos = 2275
+set osd_rssi_dbm_pos = 2307
+set osd_tim_2_pos = 2179
+set osd_flymode_pos = 2104
+set osd_throttle_pos = 2136
+set osd_craft_name_pos = 2611
+set osd_gps_sats_pos = 1287
+set osd_home_dir_pos = 121
+set osd_home_dist_pos = 1223
+set osd_altitude_pos = 17639
+set osd_debug_pos = 363
+set osd_avg_cell_voltage_pos = 2563
+set debug_mode = GYRO_SCALED
+set craft_name = Cinelog35 V3
+set pilot_name = Cinelog35 V3
+
+profile 0
+
+# profile 0
+set profile_name = 85%
+set dterm_lpf1_type = PT2
+set dterm_lpf2_type = PT2
+set anti_gravity_gain = 100
+set iterm_relax_type = GYRO
+set iterm_relax_cutoff = 12
+set pidsum_limit = 1000
+set throttle_boost = 0
+set p_pitch = 53
+set i_pitch = 115
+set d_pitch = 42
+set f_pitch = 143
+set p_roll = 38
+set i_roll = 81
+set d_roll = 25
+set f_roll = 101
+set p_yaw = 38
+set i_yaw = 81
+set f_yaw = 101
+set angle_p_gain = 80
+set d_min_roll = 23
+set d_min_pitch = 40
+set d_max_advance = 22
+set motor_output_limit = 85
+set feedforward_averaging = 2_POINT
+set feedforward_smooth_factor = 65
+set feedforward_jitter_factor = 10
+set feedforward_boost = 14
+set feedforward_max_rate_limit = 80
+set simplified_i_gain = 120
+set simplified_d_gain = 80
+set simplified_pi_gain = 85
+set simplified_dmax_gain = 15
+set simplified_feedforward_gain = 85
+set simplified_pitch_d_gain = 150
+set simplified_pitch_pi_gain = 135
+set tpa_rate = 30
+set tpa_breakpoint = 1650
+
+profile 1
+
+# profile 1
+set profile_name = 100%
+set dterm_lpf1_type = PT2
+set dterm_lpf2_type = PT2
+set anti_gravity_gain = 100
+set iterm_relax_type = GYRO
+set iterm_relax_cutoff = 12
+set pidsum_limit = 1000
+set throttle_boost = 0
+set p_pitch = 53
+set i_pitch = 115
+set d_pitch = 42
+set f_pitch = 143
+set p_roll = 38
+set i_roll = 81
+set d_roll = 25
+set f_roll = 101
+set p_yaw = 38
+set i_yaw = 81
+set f_yaw = 101
+set angle_p_gain = 80
+set d_min_roll = 23
+set d_min_pitch = 40
+set d_max_advance = 22
+set feedforward_averaging = 2_POINT
+set feedforward_smooth_factor = 65
+set feedforward_jitter_factor = 10
+set feedforward_boost = 14
+set feedforward_max_rate_limit = 80
+set simplified_i_gain = 120
+set simplified_d_gain = 80
+set simplified_pi_gain = 85
+set simplified_dmax_gain = 15
+set simplified_feedforward_gain = 85
+set simplified_pitch_d_gain = 150
+set simplified_pitch_pi_gain = 135
+set tpa_rate = 30
+set tpa_breakpoint = 1650
+
+profile 2
+
+profile 3
+
+# restore original profile selection
+profile 0
+
+rateprofile 0
+
+# rateprofile 0
+set roll_rc_rate = 4
+set pitch_rc_rate = 4
+set yaw_rc_rate = 4
 set roll_srate = 60
 set pitch_srate = 60
 set yaw_srate = 60
+
+rateprofile 1
+
+rateprofile 2
+
+rateprofile 3
+
+# restore original rateprofile selection
+rateprofile 0
+
+# save configuration
+save

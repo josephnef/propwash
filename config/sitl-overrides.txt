@@ -1,17 +1,18 @@
-# SITL-specific neutralisation applied on top of a real FC diff.
+# SITL-specific neutralisation applied AFTER a real FC diff, for settings
+# that describe the physical board and cannot apply to the virtual sim.
 #
-# In practice almost nothing is needed here, because:
-#
-#  - Motor protocol: propwash forces PWM in targetPreInit() (pw_sitl.c),
-#    which runs after every config load, before motor init. So even when the
-#    pilot's real `diff all` says `motor_pwm_protocol = DSHOT600`, the sim
-#    boots on PWM regardless — no CLI override required (and setting it at
-#    runtime over the CLI is disruptive, so we don't).
-#
-#  - DSHOT/RPM-filter settings (dshot_bidir, rpm_filter_harmonics, ...) do
-#    not exist in the SITL value table at all — the features are undef'd — so
-#    those lines in a real diff are simply rejected as "INVALID NAME" and
-#    have no effect. Nothing to override.
-#
-# This file is intentionally empty of executable commands. It stays in the
-# pipeline as the documented hook for any future SITL-only fix-ups.
+#  - Board alignment: the real FC is mounted inverted (align_board_roll = 180
+#    in the diff). That rotation compensates for how the gyro chip sits in
+#    the airframe. propwash's virtual gyro already feeds airframe-frame data,
+#    so leaving align_board_roll = 180 would rotate correct data by 180° and
+#    the quad would fly inverted / refuse to self-level. Zero it.
+set align_board_roll = 0
+set align_board_yaw = 0
+
+# Notes (no action needed here):
+#  - Motor protocol: forced to PWM in targetPreInit() every boot, so the
+#    diff's DSHOT600 + dshot_bidir/dshot_idle_value are overridden anyway
+#    (and dshot_* don't exist in the SITL value table -> rejected).
+#  - motor_output_reordering, gps_*, beeper hardware, osd chip position: some
+#    exist, some are rejected as INVALID NAME; none affect flight in the sim.
+#  - acc_calibration is the real chip's bias; harmless small offsets in sim.
