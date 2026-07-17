@@ -425,11 +425,17 @@ func _build_world() -> void:
 	bmat.albedo_color = Color(0.15, 0.15, 0.18)
 	bm.material = bmat
 	body.mesh = bm
+	# the FPV camera is "inside" the quad — you don't see your own frame in
+	# real FPV. Put the body on its own visual layer and cull it from the cam
+	# (a future chase/3rd-person cam can still show it).
+	body.set_layer_mask_value(1, false)
+	body.set_layer_mask_value(20, true)
 	_drone.add_child(body)
 
 	var cam := Camera3D.new()
 	cam.fov = 100
 	cam.near = 0.02
+	cam.set_cull_mask_value(20, false)   # don't render the drone's own body
 	cam.position = Vector3(0, 0.03, 0)   # FPV cam sits above the body
 	# sim +z (forward) maps to Godot -z, which is exactly where Camera3D
 	# looks by default — only the FPV uptilt is needed
