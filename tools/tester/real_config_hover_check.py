@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""The M3 payoff check: load the pilot's REAL diff into the sim over the CLI,
-then fly a hover with the pilot's actual PIDs/rates running the loop.
+"""The M3 payoff check: bake the pilot's REAL diff into an eeprom, prove a
+fresh instance boots it, then fly a hover with the pilot's actual PIDs/rates.
 
-  1. spawn propwash-core --server (fresh eeprom)
-  2. apply config/cinelog35v3.diff + config/sitl-overrides.txt over TCP 5761,
-     save (reboots BF in-process; the UDP server keeps running)
-  3. drive an angle-mode hover over the protocol and assert the quad holds
-     altitude and stays upright
+Three short-lived instances (each uses a proven pattern, no CLI-vs-arm clash):
+  1. loader   (--realtime): apply diff + overrides over the CLI, save.
+  2. readback (--realtime): fresh boot, CLI `get p_pitch` == 53 (real PID).
+  3. fly      (--server):   fresh boot, NO CLI, drive an angle-mode hover.
 
-Exit 0 = the real tune loads and hovers.
+Exit 0 = the real tune persists and hovers.
 """
+import math
 import os
 import socket
 import struct
@@ -19,7 +19,7 @@ import tempfile
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bfcli"))
-from pw_cli import Cli  # noqa: E402
+from pw_cli import Cli, diff_commands  # noqa: E402
 
 MAGIC = 0x48535750
 HDR = struct.Struct("<IBBH")
@@ -28,9 +28,19 @@ SOUT = struct.Struct("<IQ4f3f3f3f3f4f4BBIIBff")
 PW_STATE_IN, PW_STATE_OUT = 3, 4
 
 
-def load_lines(path):
-    return [l.strip() for l in open(path)
-            if l.strip() and not l.strip().startswith("#")]
+def spawn(core, mode, eeprom, port=None):
+    args = [core, mode, "--no-js", "--eeprom", eeprom]
+    if port:
+        args += ["--port", str(port)]
+    return subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def stop(proc):
+    proc.terminate()
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.kill()
 
 
 def main():
@@ -43,43 +53,45 @@ def main():
     if os.path.exists(eeprom):
         os.remove(eeprom)
 
-    # ---- phase 1: bake the real tune into the eeprom (separate instance,
-    # CLI used here only; a fresh instance flies so no ARMING_DISABLED_CLI)
-    loader = subprocess.Popen([core, "--realtime", "--no-js", "--eeprom", eeprom],
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(2.0)
-    cli = Cli()
-    cli.enter()
-    n = 0
-    for line in load_lines(diff) + load_lines(overrides):
-        cli.cmd(line, settle=0.03)
-        n += 1
-    cli.cmd("save", settle=1.5)
-    cli.close()
-    time.sleep(1.0)
-    cli = Cli()
-    cli.enter()
-    pid = cli.cmd("get p_pitch", settle=0.4)
-    name = cli.cmd("get craft_name", settle=0.4)
-    cli.close()
-    loader.terminate()
     try:
-        loader.wait(timeout=3)
-    except subprocess.TimeoutExpired:
-        loader.kill()
-    time.sleep(0.5)
-    print(f"baked real tune into eeprom: {n} CLI lines")
-    print("  p_pitch  ->", next((l for l in pid.replace("\r", "").split("\n") if "p_pitch" in l and "=" in l), "?"))
-    print("  craft    ->", next((l for l in name.replace("\r", "").split("\n") if "craft_name" in l and "=" in l), "?"))
-
-    # ---- phase 2: fresh instance boots the baked eeprom and flies (no CLI)
-    proc = subprocess.Popen([core, "--server", "--no-js", "--port", str(port),
-                             "--eeprom", eeprom],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    try:
+        # ---- 1. bake the real tune into the eeprom
+        loader = spawn(core, "--realtime", eeprom)
         time.sleep(2.0)
+        cli = Cli()
+        cli.enter()
+        n = 0
+        for line in diff_commands(diff) + diff_commands(overrides):
+            cli.cmd(line, settle=0.03)
+            n += 1
+        cli.cmd("save", settle=1.5)
+        cli.close()
+        stop(loader)
+        time.sleep(0.5)
+        print(f"1. baked real tune: {n} CLI lines saved to eeprom")
 
-        # ---- fly a hover with the pilot's PIDs
+        # ---- 2. fresh instance proves the eeprom holds the real tune
+        rb = spawn(core, "--realtime", eeprom)
+        time.sleep(2.0)
+        cli = Cli()
+        cli.enter()
+        pid = cli.cmd("get p_pitch", settle=0.4).replace("\r", "")
+        align = cli.cmd("get align_board_roll", settle=0.4).replace("\r", "")
+        cli.close()
+        stop(rb)
+        time.sleep(0.5)
+        pline = next((l for l in pid.split("\n") if "p_pitch =" in l), "")
+        aline = next((l for l in align.split("\n") if "align_board_roll =" in l), "")
+        print(f"2. fresh boot from eeprom: {pline.strip()} | {aline.strip()}")
+        if "53" not in pline:
+            print("FAIL: eeprom did not persist the real tune (p_pitch != 53)")
+            return 1
+        if "= 0" not in aline:
+            print("FAIL: align_board_roll not neutralised (would fly inverted)")
+            return 1
+
+        # ---- 3. fly a hover with the pilot's PIDs (no CLI on this instance)
+        fly = spawn(core, "--server", eeprom, port)
+        time.sleep(2.0)
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(2.0)
         addr = ("127.0.0.1", port)
@@ -101,7 +113,6 @@ def main():
             payload = SIN.pack(f, dt, *rc, *pos, *rot, *angvel, *linvel,
                                0.0002, *([0] * 4), *([0] * 4), 16.8, contact)
             s.sendto(HDR.pack(MAGIC, 1, PW_STATE_IN, len(payload)) + payload, addr)
-
             while True:
                 d, _ = s.recvfrom(2048)
                 if HDR.unpack(d[:8])[2] == PW_STATE_OUT:
@@ -110,7 +121,6 @@ def main():
             (_, _, qw, qx, qy, qz, avx, avy, avz, lvx, lvy, lvz,
              px, py, pz, ax, ay, az, r0, r1, r2, r3, s0, s1, s2, s3,
              armed, dis, mode, beep, vbat, amps) = o
-
             rot = (qw, qx, qy, qz)
             angvel = [avx, avy, avz]
             linvel = [lvx, lvy, lvz]
@@ -120,7 +130,6 @@ def main():
                 if linvel[1] < 0.0:
                     linvel[1] = 0.0
                 angvel = [0.0] * 3
-
             if armed:
                 armed_seen = True
                 u = -0.3 + 0.5 * (TARGET - pos[1]) - 0.4 * linvel[1]
@@ -128,29 +137,21 @@ def main():
                 throttle = max(throttle - 2.0 * dt, min(throttle + 2.0 * dt, u))
             else:
                 throttle = -1.0
-
             if t >= T_ARM + 8.0:
                 alts.append(pos[1])
-                up = 1 - 2 * (qx * qx + qz * qz)  # world-y of body-up
-                tilts.append(up)
-
+                tilts.append(1 - 2 * (qx * qx + qz * qz))
             if f % 500 == 0:
-                print(f"t={t:5.1f} alt={pos[1]:5.2f} thr={throttle:5.2f} armed={armed} dis=0x{dis:x} vbat={vbat:.1f}")
+                print(f"   t={t:5.1f} alt={pos[1]:5.2f} thr={throttle:5.2f} armed={armed} dis=0x{dis:x} vbat={vbat:.1f}")
+        stop(fly)
 
-        import math
         lo, hi = min(alts), max(alts)
         tilt_deg = math.degrees(math.acos(max(-1, min(1, min(tilts)))))
-        print(f"\nhover: alt [{lo:.2f}, {hi:.2f}] target {TARGET}, max tilt {tilt_deg:.2f} deg")
+        print(f"3. hover: alt [{lo:.2f}, {hi:.2f}] target {TARGET}, max tilt {tilt_deg:.2f} deg")
         ok = (armed_seen and abs(sum(alts) / len(alts) - TARGET) < 0.6
               and hi - lo < 1.2 and tilt_deg < 8.0)
         print("REAL-TUNE HOVER PASS" if ok else "REAL-TUNE HOVER FAIL")
         return 0 if ok else 1
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            proc.kill()
         if os.path.exists(eeprom):
             os.remove(eeprom)
 

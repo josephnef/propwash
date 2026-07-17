@@ -22,7 +22,6 @@ CPID=$!
 trap 'kill $CPID 2>/dev/null' EXIT
 sleep 2
 
-python3 "$HERE/pw_cli.py" apply "$DIFF" --save
-python3 "$HERE/pw_cli.py" apply "$OVERRIDES" --save
+python3 "$HERE/pw_cli.py" bake "$DIFF" "$OVERRIDES"
 
 echo "done. run:  $CORE --eeprom $EEPROM"

@@ -53,9 +53,14 @@ var _at_alts: Array[float] = []
 var _at_armed_seen := false
 var _osd_glyphs := 0
 
+# screenshot capture (PROPWASH_SHOTS=/dir): save frames at set times
+var _shot_dir := ""
+var _shots_taken := {}
+
 
 func _ready() -> void:
 	_autotest = OS.get_environment("PROPWASH_AUTOTEST") == "1"
+	_shot_dir = OS.get_environment("PROPWASH_SHOTS")
 	_build_world()
 	_spawn_core()
 	_udp.connect_to_host("127.0.0.1", CORE_PORT)
@@ -73,7 +78,11 @@ func _spawn_core() -> void:
 	if not FileAccess.file_exists(path):
 		push_warning("propwash-core not found at %s — start it manually" % path)
 		return
-	_core_pid = OS.create_process(path, ["--port", str(CORE_PORT)])
+	var args := ["--port", str(CORE_PORT)]
+	var eeprom := OS.get_environment("PROPWASH_EEPROM")
+	if not eeprom.is_empty():
+		args += ["--eeprom", eeprom]
+	_core_pid = OS.create_process(path, args)
 	print("propwash-core pid ", _core_pid)
 
 
@@ -215,8 +224,24 @@ func _update_autotest_rc(delta: float) -> void:
 	_rc[2] = _throttle
 
 
+func _maybe_shoot() -> void:
+	if _shot_dir.is_empty():
+		return
+	# capture at a few representative moments (seconds)
+	for at in [3.0, 8.0, 12.0, 16.0]:
+		var key := str(at)
+		if _at_time >= at and not _shots_taken.has(key):
+			_shots_taken[key] = true
+			await RenderingServer.frame_post_draw
+			var img := get_viewport().get_texture().get_image()
+			var path := "%s/propwash_t%02d.png" % [_shot_dir, int(at)]
+			img.save_png(path)
+			print("[shot] ", path)
+
+
 func _autotest_check(delta: float) -> void:
 	_at_time += delta
+	_maybe_shoot()
 	if not _last_out.is_empty() and _last_out.armed:
 		_at_armed_seen = true
 	if _at_time >= 13.0:

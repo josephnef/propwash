@@ -32,8 +32,9 @@ bool Server::start(uint16_t port)
         return false;
     }
 
-    // periodic timeout so the process stays responsive
-    timeval tv {1, 0};
+    // short recv timeout: when idle (no client), the loop still ticks the
+    // firmware so MSP/CLI/Configurator stays responsive (5 ms ~= 200 Hz)
+    timeval tv {0, 5000};
     setsockopt(mFd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     printf("[pw][net] protocol server on udp:%u\n", port);
@@ -114,6 +115,16 @@ void Server::run(SimITL::Sim& sim, const StateInit& defaultInit, Joystick* js)
         sockaddr_in src {};
         socklen_t srcLen = sizeof(src);
         ssize_t n = recvfrom(mFd, buf, sizeof(buf), 0, (sockaddr*)&src, &srcLen);
+
+        if (n < 0) {
+            // recv timeout: no client packet. Keep the firmware's scheduler
+            // (hence MSP/CLI/Configurator) alive with a small idle tick using
+            // the last-known input. Only fires when no client is driving —
+            // when one is, packets arrive faster than the timeout.
+            input.delta = 0.005f;
+            sim.update(input);
+            continue;
+        }
         if (n < (ssize_t)sizeof(PwHeader)) continue;
 
         PwHeader hdr;

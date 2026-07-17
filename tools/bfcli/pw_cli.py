@@ -61,6 +61,26 @@ class Cli:
         self.sock.close()
 
 
+def diff_commands(path):
+    """Applicable CLI lines from a diff file: skip comments, and skip
+    `batch start/end` + the trailing `save`. Batch mode makes `save` refuse
+    once any line errors (a real FC diff contains settings that don't exist
+    in SITL — dshot_bidir, gps_*, board_name, ... — which would otherwise
+    block the save). `defaults nosave` is kept so we start from a clean base.
+    """
+    out = []
+    with open(path) as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            low = line.lower()
+            if low.startswith("batch ") or low == "save":
+                continue
+            out.append(line)
+    return out
+
+
 def apply_diff(args):
     cli = Cli(args.host, args.port)
     banner = cli.enter()
@@ -68,11 +88,7 @@ def apply_diff(args):
         print("warning: no CLI banner seen", file=sys.stderr)
 
     applied, rejected = 0, []
-    with open(args.file) as f:
-        for raw in f:
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
+    for line in diff_commands(args.file):
             resp = cli.cmd(line, settle=0.1)
             applied += 1
             low = resp.lower()
@@ -88,6 +104,28 @@ def apply_diff(args):
     for line, resp in rejected:
         print(f"  REJECTED: {line}\n            -> {resp[:120]}")
     return 1 if rejected else 0
+
+
+def bake(args):
+    """Apply a diff then overrides in ONE CLI session and save once. Order
+    matters: overrides (e.g. align_board_roll = 0) must land after the diff
+    (align_board_roll = 180) so they win. Rejections of SITL-absent settings
+    are warnings, not failures.
+    """
+    cli = Cli(args.host, args.port)
+    cli.enter()
+    applied, rejected = 0, 0
+    files = [args.diff] + (list(args.overrides) if args.overrides else [])
+    for path in files:
+        for line in diff_commands(path):
+            resp = cli.cmd(line, settle=0.05).lower()
+            applied += 1
+            if "unknown" in resp or "invalid" in resp or "error" in resp:
+                rejected += 1
+    cli.cmd("save", settle=1.5)
+    cli.close()  # sends exit; save already rebooted so it's a no-op
+    print(f"baked: {applied} applied, {rejected} rejected (SITL-absent), saved")
+    return 0
 
 
 def dump(args):
@@ -118,6 +156,11 @@ def main():
     a.add_argument("file")
     a.add_argument("--save", action="store_true")
     a.set_defaults(func=apply_diff)
+
+    bk = sub.add_parser("bake")
+    bk.add_argument("diff")
+    bk.add_argument("overrides", nargs="*")
+    bk.set_defaults(func=bake)
 
     d = sub.add_parser("dump")
     d.set_defaults(func=dump)
