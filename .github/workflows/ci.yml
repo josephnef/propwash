@@ -38,11 +38,6 @@ jobs:
           cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
           cmake --build build -j"$(getconf _NPROCESSORS_ONLN)"
 
-      - name: DIAG CLI over TCP (temporary, macOS)
-        if: runner.os == 'macOS'
-        run: |
-          python3 tools/tester/_diag_cli.py build/propwash-core
-
       - name: Core tests (headless, no GPU / no joystick)
         run: |
           # the Godot client tests need a godot binary; run everything else
