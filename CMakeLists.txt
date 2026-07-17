@@ -72,4 +72,12 @@ if(GODOT_BIN)
   set_tests_properties(godot_client PROPERTIES
     TIMEOUT 120
     ENVIRONMENT "PROPWASH_AUTOTEST=1;PROPWASH_CORE=$<TARGET_FILE:propwash-core>")
+
+  # Autonomous gate fly-through (angle mode): arms, cruises forward through
+  # all three gates holding altitude, asserts it flew past the last gate.
+  add_test(NAME flythrough
+    COMMAND ${GODOT_BIN} --headless --path ${CMAKE_SOURCE_DIR}/client-godot)
+  set_tests_properties(flythrough PROPERTIES
+    TIMEOUT 120
+    ENVIRONMENT "PROPWASH_DEMO=acro;PROPWASH_CORE=$<TARGET_FILE:propwash-core>")
 endif()

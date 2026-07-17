@@ -53,14 +53,32 @@ var _at_alts: Array[float] = []
 var _at_armed_seen := false
 var _osd_glyphs := 0
 
+# demo flight (PROPWASH_DEMO=acro): fly forward through the gates in ACRO
+# mode (self-level OFF) using a cascaded PD controller — attitude error and
+# body rate drive the acro rate sticks. Signs tuned empirically (Godot<->
+# firmware conventions): +14deg setpoint flew -z (into the gates) once the
+# pitch sign was flipped; ramping + rate damping keep it from tumbling.
+var _demo := ""
+const ACRO_KP := 1.4          # attitude(rad) -> rate stick
+const ACRO_KD := 0.10         # body rate(rad/s) damping
+const ACRO_PITCH_SIGN := 1.0  # loop stability (regulation was stable at +1)
+const ACRO_ROLL_SIGN := 1.0
+const GATE_ALT := 1.0         # gate centre height
+var _des_pitch := 0.0         # ramped setpoint (rad)
+
 # screenshot capture (PROPWASH_SHOTS=/dir): save frames at set times
 var _shot_dir := ""
 var _shots_taken := {}
+var _shot_times := [3.0, 8.0, 12.0, 16.0]
 
 
 func _ready() -> void:
 	_autotest = OS.get_environment("PROPWASH_AUTOTEST") == "1"
+	_demo = OS.get_environment("PROPWASH_DEMO")
 	_shot_dir = OS.get_environment("PROPWASH_SHOTS")
+	if _demo == "acro":
+		# capture through the whole gate run
+		_shot_times = [4.0, 7.0, 9.0, 11.0, 13.0, 15.0, 17.0, 19.0]
 	_build_world()
 	_spawn_core()
 	_udp.connect_to_host("127.0.0.1", CORE_PORT)
@@ -87,7 +105,9 @@ func _spawn_core() -> void:
 
 
 func _physics_process(delta: float) -> void:
-	if _autotest:
+	if _demo == "acro":
+		_update_acro_demo_rc(delta)
+	elif _autotest:
 		_update_autotest_rc(delta)
 	else:
 		_update_keyboard_rc(delta)
@@ -227,8 +247,7 @@ func _update_autotest_rc(delta: float) -> void:
 func _maybe_shoot() -> void:
 	if _shot_dir.is_empty():
 		return
-	# capture at a few representative moments (seconds)
-	for at in [3.0, 8.0, 12.0, 16.0]:
+	for at in _shot_times:
 		var key := str(at)
 		if _at_time >= at and not _shots_taken.has(key):
 			_shots_taken[key] = true
@@ -237,6 +256,69 @@ func _maybe_shoot() -> void:
 			var path := "%s/propwash_t%02d.png" % [_shot_dir, int(at)]
 			img.save_png(path)
 			print("[shot] ", path)
+
+
+# Autonomous fly-through: ANGLE mode (self-level ON) so the firmware holds
+# attitude; the demo just commands a forward lean (pitch stick = target
+# angle) and an altitude-hold throttle to cruise the drone through the gates
+# (forward = Godot -z). Reliable and reproducible; acro freestyle is meant to
+# be hand-flown with the Pocket, not scripted open-loop.
+func _update_acro_demo_rc(delta: float) -> void:
+	_at_time += delta
+	_maybe_shoot()
+
+	var armed: bool = not _last_out.is_empty() and _last_out.armed
+	if armed:
+		_at_armed_seen = true
+
+	# --- flight plan: forward-lean stick (angle mode), ramped so the climb
+	# settles before cruising. Negative pitch stick leans forward (-z).
+	var goal_lean := 0.0
+	var target_alt := 1.6
+	if _at_time < 5.2:
+		pass                                  # on the pad, wait to arm
+	elif _at_time < 8.5:
+		goal_lean = 0.0                       # climb + settle, hover level
+	elif _at_time < 18.0:
+		goal_lean = 0.32                      # cruise forward (-z) through gates
+	else:
+		goal_lean = -0.15                     # flare/brake
+
+	_des_pitch = move_toward(_des_pitch, goal_lean, 0.8 * delta)
+
+	# --- altitude hold
+	var alt := _pos.y
+	var vy := _linvel.y
+	var u := -0.2 + 0.55 * (target_alt - alt) - 0.35 * vy
+	if armed:
+		_throttle = clampf(u, -1.0, 0.7)
+	else:
+		_throttle = -1.0
+
+	_rc[0] = 0.0                              # roll centred
+	_rc[1] = _des_pitch                       # pitch = target lean (angle mode)
+	_rc[2] = _throttle
+	_rc[3] = 0.0                              # no yaw
+	_rc[4] = 1.0 if _at_time >= 5.2 else -1.0 # ARM ch5
+	_rc[5] = 1.0                              # ANGLE ch6 ON (self-level)
+
+	# track that it stayed airborne through the cruise (gates are y~1)
+	if _at_time >= 9.0 and _at_time <= 17.0:
+		_at_alts.append(_pos.y)
+
+	if _at_time >= 22.0:
+		var min_alt := 1e9
+		for a in _at_alts:
+			min_alt = minf(min_alt, a)
+		# forward = -z; gates at z = -6/-14/-22. Pass = flew past the last
+		# gate while staying airborne (never near the ground) and near centre.
+		var flew_through := _pos.z < -30.0
+		var stayed_up := _at_alts.size() > 0 and min_alt > 0.7
+		var on_line := absf(_pos.x) < 3.0
+		var ok := _at_armed_seen and flew_through and stayed_up and on_line
+		print("[demo] fly-through: end=%s min_alt=%.2f armed=%s" % [str(_pos), min_alt, str(_at_armed_seen)])
+		print("[demo] %s" % ("PASS" if ok else "FAIL"))
+		get_tree().quit(0 if ok else 1)
 
 
 func _autotest_check(delta: float) -> void:
