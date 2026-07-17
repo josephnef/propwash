@@ -25,31 +25,48 @@ def main():
     fo, fe = open(out, "wb"), open(err, "wb")
     proc = subprocess.Popen([core, "--realtime", "--no-js", "--eeprom", eeprom],
                             stdout=fo, stderr=fe)
+    def probe(tag):
+        try:
+            raw = socket.create_connection(("127.0.0.1", 5761), timeout=2.0)
+            raw.settimeout(1.5)
+            raw.sendall(b"#\r\n")
+            time.sleep(0.3)
+            try:
+                b = raw.recv(4096)
+            except socket.timeout:
+                b = b"(timeout)"
+            raw.sendall(b"get p_pitch\r\n")
+            time.sleep(0.3)
+            try:
+                g = raw.recv(4096)
+            except socket.timeout:
+                g = b"(timeout)"
+            raw.close()
+            print(f"[diag] {tag}: enter={b[:40]!r}  get={g[:80]!r}")
+        except OSError as e:
+            print(f"[diag] {tag}: connect failed: {e}")
+
     try:
         time.sleep(2.0)
         print(f"[diag] core alive={proc.poll() is None}")
-        # can we even open a raw TCP socket to 5761?
-        for attempt in range(8):
-            try:
-                raw = socket.create_connection(("127.0.0.1", 5761), timeout=2.0)
-                print(f"[diag] attempt {attempt}: raw TCP connect OK")
-                raw.settimeout(1.0)
-                raw.sendall(b"#\r\n")
-                try:
-                    data = raw.recv(4096)
-                    print(f"[diag]   after '#': {len(data)}B {data[:80]!r}")
-                except socket.timeout:
-                    print("[diag]   after '#': (timeout, no bytes)")
-                raw.sendall(b"get p_pitch\r\n")
-                try:
-                    data = raw.recv(4096)
-                    print(f"[diag]   get p_pitch: {data[:120]!r}")
-                except socket.timeout:
-                    print("[diag]   get p_pitch: (timeout, no bytes)")
-                raw.close()
-            except OSError as e:
-                print(f"[diag] attempt {attempt}: connect failed: {e}")
-            time.sleep(1.0)
+        probe("fresh")
+
+        # reproduce diff_roundtrip EXACTLY via pw_cli.Cli: set + save (drain
+        # 1.5s, connection open through the in-process reboot), clean close,
+        # sleep, reconnect, get. This is where the real tests break.
+        cli = Cli()
+        cli.enter()
+        cli.cmd("set p_pitch = 99", settle=0.1)
+        cli.cmd("save", settle=1.5)
+        cli.close()
+        print("[diag] applied set + save via Cli (like diff_roundtrip)")
+        time.sleep(1.5)
+        cli = Cli()
+        cli.enter()
+        r = cli.cmd("get p_pitch", settle=0.4)
+        cli.close()
+        print(f"[diag] post-save get p_pitch via Cli: {r.strip()[:80]!r}")
+        probe("post-save raw")
     finally:
         proc.terminate()
         try:
