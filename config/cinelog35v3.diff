@@ -1,0 +1,38 @@
+# CineLog35 V3 — Betaflight 4.5.2 configuration for propwash.
+#
+# ⚠ PLACEHOLDER. This is a representative config built from the documented
+# switch plan and safety settings (cinelog35-v3 docs/CONFIG.md), NOT the
+# real `diff all` off the quad. Replace it with the genuine dump when the
+# FC is on USB:
+#
+#     python3 ../cinelog35-v3/scripts/bf.py /dev/ttyACM0 cli "diff all" \
+#         > config/cinelog35v3.diff
+#
+# Load into the sim:  tools/bfcli/pw_cli.py apply config/cinelog35v3.diff --save
+# (propwash also force-applies config/sitl-overrides.txt for settings that
+#  cannot work on the simulator — see that file.)
+
+# ---- safety (deliberate; see docs/CONFIG.md, do not soften) ----
+set failsafe_procedure = DROP
+set failsafe_switch_mode = KILL
+set small_angle = 180
+
+# ---- switch plan: ARM ch5, ANGLE ch6, BEEPER ch7, FAILSAFE(kill) ch8 ----
+# aux <idx> <boxId> <auxCh> <start> <end> <logic> <linkedTo>
+# boxIds: 0=ARM 1=ANGLE 13=BEEPER 27=FAILSAFE
+aux 0 0 0 1700 2100 0 0
+aux 1 1 1 1700 2100 0 0
+aux 2 13 2 1700 2100 0 0
+aux 3 27 3 1700 2100 0 0
+
+# ---- rates (moderate cinewhoop, Actual rates) ----
+set rates_type = ACTUAL
+set roll_rc_rate = 7
+set pitch_rc_rate = 7
+set yaw_rc_rate = 7
+set roll_expo = 40
+set pitch_expo = 40
+set yaw_expo = 40
+set roll_srate = 60
+set pitch_srate = 60
+set yaw_srate = 60

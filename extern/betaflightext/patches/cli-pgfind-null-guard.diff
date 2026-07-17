@@ -1,0 +1,20 @@
+--- extern/betaflight/src/main/cli/cli.c	2026-07-16 21:03:04.645568954 +0300
++++ extern/betaflightext/src/main/cli/cli.c	2026-07-17 13:58:55.363278692 +0300
+@@ -760,12 +760,13 @@
+ static const char *dumpPgValue(const char *cmdName, const clivalue_t *value, dumpFlags_t dumpMask, const char *headingStr)
+ {
+     const pgRegistry_t *pg = pgFind(value->pgn);
+-#ifdef DEBUG
++    // propwash: unconditional guard (upstream gates this on DEBUG). SITL
++    // undefs whole features (OSD, VTX, ...) while their settings remain in
++    // the value table, so pgFind can return NULL here — dereferencing it in
++    // `diff`/`dump`/`save` segfaults. Skip values whose PG isn't registered.
+     if (!pg) {
+-        cliPrintLinef("VALUE %s ERROR", value->name);
+-        return headingStr; // if it's not found, the pgn shouldn't be in the value table!
++        return headingStr;
+     }
+-#endif
+ 
+     const char *format = "set %s = ";
+     const char *defaultFormat = "#set %s = ";

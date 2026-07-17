@@ -40,6 +40,15 @@ add_test(NAME udp_e2e
   COMMAND bash ${CMAKE_SOURCE_DIR}/tools/tester/run_e2e.sh $<TARGET_FILE:propwash-core>)
 set_tests_properties(udp_e2e PROPERTIES TIMEOUT 120)
 
+# CLI/Configurator data path: apply the pilot's diff over TCP 5761, save,
+# reboot in-process, verify the tune survives (the M3 core deliverable).
+add_test(NAME diff_roundtrip
+  COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/bfcli/diff_roundtrip_check.py
+    $<TARGET_FILE:propwash-core>
+    ${CMAKE_SOURCE_DIR}/config/cinelog35v3.diff
+    ${CMAKE_SOURCE_DIR}/config/sitl-overrides.txt)
+set_tests_properties(diff_roundtrip PROPERTIES TIMEOUT 60)
+
 # Godot client autotest (runs only if a godot 4 binary is available).
 # PROPWASH_AUTOTEST=1 arms + hovers via the real GDScript client, headless.
 find_program(GODOT_BIN NAMES godot godot4 Godot_v4.3-stable_linux.x86_64

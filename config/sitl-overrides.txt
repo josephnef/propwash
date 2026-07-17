@@ -1,0 +1,17 @@
+# SITL-specific neutralisation applied on top of a real FC diff.
+#
+# In practice almost nothing is needed here, because:
+#
+#  - Motor protocol: propwash forces PWM in targetPreInit() (pw_sitl.c),
+#    which runs after every config load, before motor init. So even when the
+#    pilot's real `diff all` says `motor_pwm_protocol = DSHOT600`, the sim
+#    boots on PWM regardless — no CLI override required (and setting it at
+#    runtime over the CLI is disruptive, so we don't).
+#
+#  - DSHOT/RPM-filter settings (dshot_bidir, rpm_filter_harmonics, ...) do
+#    not exist in the SITL value table at all — the features are undef'd — so
+#    those lines in a real diff are simply rejected as "INVALID NAME" and
+#    have no effect. Nothing to override.
+#
+# This file is intentionally empty of executable commands. It stays in the
+# pipeline as the documented hook for any future SITL-only fix-ups.

@@ -5,7 +5,6 @@ build/build_config.c
 build/debug.c
 build/debug_pin.c
 build/version.c
-cli/cli.c
 cli/settings.c
 cms/cms.c
 cms/cms_menu_blackbox.c

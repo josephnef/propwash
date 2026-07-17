@@ -31,6 +31,10 @@ endforeach()
 list(APPEND BF_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/betaflightext/src/main/target/SITL/pw_sitl.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/betaflightext/src/main/scheduler/scheduler.c"
+  # cli.c: unconditional pgFind() null guard so diff/dump/save don't segfault
+  # on values whose feature (and PG) is undef'd in SITL —
+  # patches/cli-pgfind-null-guard.diff (stock excluded from bf_sources.txt).
+  "${CMAKE_CURRENT_SOURCE_DIR}/betaflightext/src/main/cli/cli.c"
 )
 
 add_library(bf_sitl STATIC ${BF_SOURCES})
@@ -51,9 +55,10 @@ target_include_directories(bf_sitl PUBLIC
   "${BF_ROOT}/src/main/target/SITL"
   "${BF_ROOT}/lib/main/dyad"
   "${BF_ROOT}/lib/main/google/olc"
-  # for the overridden scheduler.c, whose same-directory includes must
-  # resolve against the stock scheduler headers
+  # for the overridden scheduler.c / cli.c, whose same-directory includes
+  # must resolve against the stock headers
   "${BF_ROOT}/src/main/scheduler"
+  "${BF_ROOT}/src/main/cli"
 )
 
 target_compile_options(bf_sitl PRIVATE
