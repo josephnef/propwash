@@ -28,11 +28,13 @@ SOUT = struct.Struct("<IQ4f3f3f3f3f4f4BBIIBff")
 PW_STATE_IN, PW_STATE_OUT = 3, 4
 
 
-def spawn(core, mode, eeprom, port=None):
+def spawn(core, mode, eeprom, port=None, errpath=None):
     args = [core, mode, "--no-js", "--eeprom", eeprom]
     if port:
         args += ["--port", str(port)]
-    return subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    err = open(errpath, "wb") if errpath else subprocess.DEVNULL
+    out = open(errpath + ".out", "wb") if errpath else subprocess.DEVNULL
+    return subprocess.Popen(args, stdout=out, stderr=err)
 
 
 def stop(proc):
@@ -70,21 +72,35 @@ def main():
         print(f"1. baked real tune: {n} CLI lines saved to eeprom")
 
         # ---- 2. fresh instance proves the eeprom holds the real tune
-        rb = spawn(core, "--realtime", eeprom)
+        rberr = tempfile.mktemp(suffix=".rberr")
+        rb = spawn(core, "--realtime", eeprom, errpath=rberr)
         time.sleep(2.0)
         cli = Cli()
-        cli.enter()
+        banner = cli.enter()
         pid = cli.cmd("get p_pitch", settle=0.4).replace("\r", "")
         align = cli.cmd("get align_board_roll", settle=0.4).replace("\r", "")
         cli.close()
-        stop(rb)
-        time.sleep(0.5)
         pline = next((l for l in pid.split("\n") if "p_pitch =" in l), "")
         aline = next((l for l in align.split("\n") if "align_board_roll =" in l), "")
         print(f"2. fresh boot from eeprom: {pline.strip()} | {aline.strip()}")
         if "53" not in pline:
             print("FAIL: eeprom did not persist the real tune (p_pitch != 53)")
+            # -------- DIAGNOSTIC (temporary) --------
+            print(f"[diag] rb alive={rb.poll() is None}  eeprom={eeprom} "
+                  f"size={os.path.getsize(eeprom) if os.path.exists(eeprom) else 'MISSING'}")
+            print(f"[diag] enter banner ({len(banner)}B): {banner!r}")
+            print(f"[diag] raw p_pitch ({len(pid)}B): {pid!r}")
+            print(f"[diag] raw align  ({len(align)}B): {align!r}")
+            for suffix, label in ((".out", "stdout"), ("", "stderr")):
+                p = rberr + suffix
+                if os.path.exists(p):
+                    with open(p, "r", errors="replace") as f:
+                        print(f"[diag] readback core {label}:\n{f.read()[-2000:]}")
+            stop(rb)
+            time.sleep(0.5)
             return 1
+        stop(rb)
+        time.sleep(0.5)
         if "= 0" not in aline:
             print("FAIL: align_board_roll not neutralised (would fly inverted)")
             return 1
