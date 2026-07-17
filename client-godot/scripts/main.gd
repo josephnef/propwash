@@ -27,6 +27,7 @@ var _frame_id := 0
 
 var _drone: Node3D
 var _hud: Label
+var _osd: Label       # 16x30 Betaflight OSD overlay, monospace, centered
 
 # client-owned pose state (fed back to the core each frame)
 var _pos := Vector3(0, 0.0, 0)
@@ -50,6 +51,7 @@ var _autotest := false
 var _at_time := 0.0
 var _at_alts: Array[float] = []
 var _at_armed_seen := false
+var _osd_glyphs := 0
 
 
 func _ready() -> void:
@@ -109,7 +111,11 @@ func _physics_process(delta: float) -> void:
 
 	var out := {}
 	while _udp.get_available_packet_count() > 0:      # drain, keep newest
-		var d := PwProtocol.unpack_state_out(_udp.get_packet())
+		var raw := _udp.get_packet()
+		if raw.size() >= 8 and raw[5] == PwProtocol.PW_OSD:
+			_update_osd(PwProtocol.unpack_osd(raw))
+			continue
+		var d := PwProtocol.unpack_state_out(raw)
 		if not d.is_empty():
 			out = d
 	if out.is_empty():
@@ -173,6 +179,16 @@ func _unhandled_key_input(event: InputEvent) -> void:
 				_armed_sw = false
 
 
+func _update_osd(lines: PackedStringArray) -> void:
+	if lines.size() != 16:
+		return
+	if _osd:
+		_osd.text = "\n".join(lines)
+	if _autotest:
+		for ln in lines:
+			_osd_glyphs += ln.strip_edges().length()
+
+
 func _update_hud() -> void:
 	if _last_out.is_empty():
 		return
@@ -215,8 +231,8 @@ func _autotest_check(delta: float) -> void:
 		for a in _at_alts:
 			lo = minf(lo, a)
 			hi = maxf(hi, a)
-		var ok := _at_armed_seen and _at_alts.size() > 0 and lo > 1.5 and hi < 2.5
-		print("[autotest] hover band [%.2f, %.2f] armed_seen=%s" % [lo, hi, str(_at_armed_seen)])
+		var ok := _at_armed_seen and _at_alts.size() > 0 and lo > 1.5 and hi < 2.5 and _osd_glyphs > 0
+		print("[autotest] hover band [%.2f, %.2f] armed_seen=%s osd_glyphs=%d" % [lo, hi, str(_at_armed_seen), _osd_glyphs])
 		print("[autotest] %s" % ("PASS" if ok else "FAIL"))
 		get_tree().quit(0 if ok else 1)
 
@@ -301,3 +317,16 @@ func _build_world() -> void:
 	_hud.add_theme_font_size_override("font_size", 15)
 	ui.add_child(_hud)
 	_hud.text = "connecting to propwash-core..."
+
+	# OSD overlay — the real Betaflight 16x30 character grid, centered like
+	# FPV goggles. Uses a monospace font so columns line up.
+	_osd = Label.new()
+	_osd.set_anchors_preset(Control.PRESET_CENTER)
+	_osd.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_osd.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	_osd.add_theme_font_override("font", ThemeDB.fallback_font)
+	_osd.add_theme_font_size_override("font_size", 20)
+	_osd.add_theme_color_override("font_color", Color(1, 1, 1))
+	_osd.add_theme_color_override("font_outline_color", Color(0, 0, 0))
+	_osd.add_theme_constant_override("outline_size", 4)
+	ui.add_child(_osd)

@@ -203,6 +203,14 @@ void Server::run(SimITL::Sim& sim, const StateInit& defaultInit, Joystick* js)
             o.amperage = (float)st.batteryState.amperage;
             sendTo(&o, sizeof(o), PW_STATE_OUT);
 
+            // OSD grid, throttled to ~15 Hz (it changes far slower than the
+            // physics tick and is a full 480-byte packet)
+            if (stateInCount % 8 == 0) {
+                PwOsd osd {};
+                memcpy(osd.chars, out.osd, sizeof(osd.chars));
+                sendTo(&osd, sizeof(osd), PW_OSD);
+            }
+
             if (++stateInCount % 1024 == 0) {
                 printf("[pw][net] frames=%llu armed=%d dis=0x%x rc_src=%s\n",
                        (unsigned long long)stateInCount, o.armed,

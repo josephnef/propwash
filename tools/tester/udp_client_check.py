@@ -62,11 +62,13 @@ def main():
 
         t0 = time.perf_counter()
         sock.sendto(pkt, addr)
-        data, _ = sock.recvfrom(2048)
+        # the server also emits PW_OSD packets; skip anything but STATE_OUT
+        while True:
+            data, _ = sock.recvfrom(2048)
+            magic, ver, typ, plen = HDR.unpack(data[:8])
+            if magic == MAGIC and typ == PW_STATE_OUT:
+                break
         latencies.append(time.perf_counter() - t0)
-
-        magic, ver, typ, plen = HDR.unpack(data[:8])
-        assert magic == MAGIC and typ == PW_STATE_OUT, "bad reply"
         o = SOUT.unpack(data[8:8 + SOUT.size])
         (frame_id, sim_us,
          qw, qx, qy, qz,

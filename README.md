@@ -70,6 +70,16 @@ godot --path client-godot           # spawns build/propwash-core itself
 - Without a radio: keyboard mode — arrows = right stick, W/S throttle,
   A/D yaw, E arm, Q angle toggle, R reset.
 - Betaflight Configurator connects any time to TCP `127.0.0.1:5761`.
+- The real Betaflight OSD is overlaid on the FPV view.
+
+**Load the pilot's real tune** (or the placeholder until the quad's on USB):
+
+```bash
+tools/bfcli/load_config.sh                       # bakes config/ into eeprom.bin
+# or live, over the Configurator data path:
+python3 tools/bfcli/pw_cli.py apply config/cinelog35v3.diff --save
+python3 tools/bfcli/pw_cli.py dump               # read back `diff all`
+```
 
 Core standalone: `./build/propwash-core [--server|--realtime] [--port 9100]
 [--eeprom path] [--js /dev/input/jsN | --no-js]`.

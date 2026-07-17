@@ -126,7 +126,6 @@ io/dashboard.c
 io/displayport_crsf.c
 io/displayport_frsky_osd.c
 io/displayport_hott.c
-io/displayport_max7456.c
 io/displayport_msp.c
 io/displayport_srxl.c
 io/frsky_osd.c

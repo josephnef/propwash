@@ -49,6 +49,12 @@ add_test(NAME diff_roundtrip
     ${CMAKE_SOURCE_DIR}/config/sitl-overrides.txt)
 set_tests_properties(diff_roundtrip PROPERTIES TIMEOUT 60)
 
+# OSD: confirm the real Betaflight OSD renders through the fake displayport
+# and streams to the client as PW_OSD.
+add_test(NAME osd_render
+  COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/tester/osd_check.py $<TARGET_FILE:propwash-core>)
+set_tests_properties(osd_render PROPERTIES TIMEOUT 60)
+
 # Godot client autotest (runs only if a godot 4 binary is available).
 # PROPWASH_AUTOTEST=1 arms + hovers via the real GDScript client, headless.
 find_program(GODOT_BIN NAMES godot godot4 Godot_v4.3-stable_linux.x86_64

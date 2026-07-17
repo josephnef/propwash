@@ -52,6 +52,9 @@ namespace SimITL{
 
       #include "build/debug.h"
 
+      // OSD character grid captured by the fake max7456 displayport
+      #include "displayport_fake.h"
+
       #undef ENABLE_STATE
 
       //custom macro with bf namespaces

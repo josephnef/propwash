@@ -112,6 +112,13 @@ namespace SimITL{
       simState.flightModeFlags = (int)BF::flightModeFlags;
       simState.beep = BF::isBeeperOn();
       simState.stateOutput.beep = simState.beep ? 1U : 0U;
+      // capture the OSD character grid (fake max7456 displayport)
+      for (int y = 0; y < 16; y++) {
+        for (int x = 0; x < 30; x++) {
+          simState.stateOutput.osd[y * 30 + x] = BF::osdScreen[y][x];
+        }
+      }
+
       simState.microsPassed = BF::pw_micros_passed;
       simState.motorsState[0].pwm = BF::pw_motors_pwm[0] / 1000.0f;
       simState.motorsState[1].pwm = BF::pw_motors_pwm[1] / 1000.0f;

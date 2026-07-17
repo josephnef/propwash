@@ -57,6 +57,25 @@ static func pack_command(cmd: int) -> PackedByteArray:
 	return b.data_array
 
 
+# PW_OSD: 16 rows x 30 cols of Betaflight OSD character codes. Returns the
+# printable text as 16 lines (non-printable codes -> space).
+static func unpack_osd(pkt: PackedByteArray) -> PackedStringArray:
+	var b := StreamPeerBuffer.new()
+	b.big_endian = false
+	b.data_array = pkt
+	if b.get_u32() != MAGIC or b.get_u8() != VERSION or b.get_u8() != PW_OSD:
+		return PackedStringArray()
+	b.get_u16()  # payload_len
+	var lines := PackedStringArray()
+	for y in range(16):
+		var s := ""
+		for x in range(30):
+			var c := b.get_u8()
+			s += char(c) if (c >= 32 and c < 127) else " "
+		lines.append(s)
+	return lines
+
+
 # PwStateOut (114 bytes): frame_id u32, sim_time u64, quat wxyz, angvel,
 # linvel, pos, accel, motor_rpm 4f, motor_status 4u8, armed u8,
 # arming u32, mode u32, beeper u8, vbat f32, amperage f32

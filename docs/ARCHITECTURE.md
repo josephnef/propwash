@@ -68,6 +68,39 @@ corrected on contact), plus `contact` so the physics damps toward the
 client's resolution. The core owns everything between RC input and rigid
 body state.
 
+## Loading the pilot's tune (M3)
+
+The sim runs the pilot's **actual** Betaflight config, not an approximation.
+
+- **CLI/Configurator path**: `tools/bfcli/pw_cli.py` speaks the Betaflight CLI
+  over TCP 5761 (the same data path the Configurator GUI uses). `apply` a
+  `diff all`, `save` (persists to eeprom, reboots in-process), and the tune
+  survives — verified by the `diff_roundtrip` test. The real Betaflight
+  Configurator can also connect live to 5761 to tweak PIDs/rates.
+- **Config files**: `config/cinelog35v3.diff` (placeholder until the real
+  dump is pulled off the quad via `scripts/bf.py`) and `config/sitl-overrides.txt`
+  (near-empty: motor protocol is forced in `targetPreInit`, and DSHOT/RPM
+  settings simply don't exist in the SITL value table).
+- **One-shot bake**: `tools/bfcli/load_config.sh` writes the tune into an
+  eeprom once; every later launch flies it.
+- **cli.c fix**: stock Betaflight guards `pgFind()==NULL` in `dumpPgValue`
+  behind `#ifdef DEBUG`. SITL undefs whole features (OSD/VTX/...) while their
+  settings stay in the value table, so `diff`/`dump`/`save` dereferenced NULL
+  and segfaulted. Vendored cli.c makes the guard unconditional
+  (`patches/cli-pgfind-null-guard.diff`).
+
+## OSD (M3)
+
+The real Betaflight OSD renders. `target.h` (a `#include_next` wrapper over
+stock SITL) re-enables `USE_OSD`+`USE_MAX7456`; the AUTO device selection in
+`fc/init.c` then binds a **fake max7456 displayport** (`io/displayport_fake.c`,
+ported from SimITL) that captures the 16x30 character grid into `osdScreen[]`
+instead of driving SPI. `bf.cpp` copies that grid into the sim state each
+tick; the server streams it as `PW_OSD` (~15 Hz); the Godot client renders it
+as a centered monospace overlay, FPV-goggle style. The `osd_render` test
+confirms `osd.c`/`osd_warnings.c` produce real content (e.g. the `ARMSWITCH`
+warning) end-to-end.
+
 ## Verification layers
 
 1. `tools/tester/msp_check.py` — MSP over TCP 5761: firmware identifies as

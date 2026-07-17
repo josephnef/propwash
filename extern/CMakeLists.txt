@@ -35,6 +35,10 @@ list(APPEND BF_SOURCES
   # on values whose feature (and PG) is undef'd in SITL —
   # patches/cli-pgfind-null-guard.diff (stock excluded from bf_sources.txt).
   "${CMAKE_CURRENT_SOURCE_DIR}/betaflightext/src/main/cli/cli.c"
+  # OSD: the target.h wrapper re-enables USE_OSD + USE_MAX7456; this fake
+  # displayport captures the 16x30 grid into osdScreen[] (replaces the stock
+  # SPI max7456 displayport, excluded from bf_sources.txt).
+  "${CMAKE_CURRENT_SOURCE_DIR}/betaflightext/src/main/io/displayport_fake.c"
 )
 
 add_library(bf_sitl STATIC ${BF_SOURCES})
@@ -51,6 +55,10 @@ target_compile_definitions(bf_sitl PUBLIC
 )
 
 target_include_directories(bf_sitl PUBLIC
+  # propwash target/ MUST precede the stock target dir: its target.h wrapper
+  # is found first and #include_next pulls the stock header beneath it
+  "${CMAKE_CURRENT_SOURCE_DIR}/betaflightext/src/main/target/SITL"
+  "${CMAKE_CURRENT_SOURCE_DIR}/betaflightext/src/main/io"
   "${BF_ROOT}/src/main"
   "${BF_ROOT}/src/main/target/SITL"
   "${BF_ROOT}/lib/main/dyad"
@@ -65,6 +73,10 @@ target_compile_options(bf_sitl PRIVATE
   -std=gnu17
   -Wall -Wextra
   -Wno-error
+  # GCC 14+ makes these hard errors; BF's CMS menus rely on the enum/uint8_t*
+  # pun and on implicit int<->enum, so downgrade for the vendored firmware
+  -Wno-error=incompatible-pointer-types
+  -Wno-incompatible-pointer-types
   -Wno-unterminated-string-initialization
   -fno-common
   -ffunction-sections -fdata-sections
