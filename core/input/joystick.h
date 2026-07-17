@@ -36,13 +36,35 @@ class Joystick {
     /** Normalised channel values -1..1, axes 0-7. */
     const float* channels() const { return mChannels; }
 
+    /**
+     * Load per-axis calibration (raw lo/hi) from a file. Without it the raw
+     * axis is used unscaled, which fails when an axis (typically throttle)
+     * is inverted or doesn't span the full range. \return true if loaded.
+     */
+    bool loadCalibration(const char* path);
+
+    /**
+     * Interactive timed calibration: records each axis' extremes, then the
+     * resting position (throttle-down / sticks-centred / switches-disarmed)
+     * so the low/disarmed end always maps to -1. Writes the file. Blocking.
+     */
+    bool calibrate(const char* path);
+
+    /** Default calibration path: $HOME/.config/propwash/joystick.cal */
+    static const char* defaultCalPath();
+
     void close();
     ~Joystick() { close(); }
 
   private:
+    float apply(int axis, int raw) const;
+
     int mFd = -1;
     char mName[128] = {0};
     float mChannels[8] = {0, 0, -1.0f, 0, -1.0f, -1.0f, -1.0f, -1.0f};
+    // per-axis mapping: raw==lo -> -1, raw==hi -> +1 (lo>hi inverts)
+    int mLo[8] = {-32767, -32767, -32767, -32767, -32767, -32767, -32767, -32767};
+    int mHi[8] = { 32767,  32767,  32767,  32767,  32767,  32767,  32767,  32767};
 };
 
 } // namespace pw

@@ -30,6 +30,7 @@ int main(int argc, char** argv)
     const char* jsDev = nullptr;   // auto-detect
     bool useJs = true;
     bool realtime = false;
+    bool calibrate = false;
     double duration = 0.0;
     uint16_t port = 9100;
 
@@ -42,6 +43,8 @@ int main(int argc, char** argv)
             jsDev = argv[++i];
         } else if (!strcmp(argv[i], "--no-js")) {
             useJs = false;
+        } else if (!strcmp(argv[i], "--js-calibrate")) {
+            calibrate = true;
         } else if (!strcmp(argv[i], "--realtime")) {
             realtime = true;
         } else if (!strcmp(argv[i], "--duration") && i + 1 < argc) {
@@ -50,10 +53,22 @@ int main(int argc, char** argv)
             realtime = false;
         } else {
             fprintf(stderr,
-                "usage: %s [--server|--realtime] [--port N] [--eeprom path] "
-                "[--js /dev/input/jsN | --no-js] [--duration s]\n", argv[0]);
+                "usage: %s [--server|--realtime|--js-calibrate] [--port N] "
+                "[--eeprom path] [--js /dev/input/jsN | --no-js] [--duration s]\n",
+                argv[0]);
             return 2;
         }
+    }
+
+    // Joystick calibration: standalone, writes the cal file and exits.
+    if (calibrate) {
+        pw::Joystick jc;
+        if (!jc.open(jsDev)) {
+            fprintf(stderr, "[pw] no joystick found to calibrate\n");
+            return 1;
+        }
+        printf("[pw] calibrating '%s'\n", jc.name());
+        return jc.calibrate(pw::Joystick::defaultCalPath()) ? 0 : 1;
     }
 
     StateInit init {};
@@ -64,6 +79,7 @@ int main(int argc, char** argv)
     pw::Joystick js;
     if (useJs) {
         if (js.open(jsDev)) {
+            js.loadCalibration(pw::Joystick::defaultCalPath());
             printf("[pw] RC source: joystick '%s'\n", js.name());
         } else {
             printf("[pw] no joystick found — RC comes from the client\n");
