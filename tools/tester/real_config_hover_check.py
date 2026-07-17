@@ -91,6 +91,19 @@ def main():
             print(f"[diag] enter banner ({len(banner)}B): {banner!r}")
             print(f"[diag] raw p_pitch ({len(pid)}B): {pid!r}")
             print(f"[diag] raw align  ({len(align)}B): {align!r}")
+            # retry probe: is the CLI merely slow to come up, or permanently dead?
+            for attempt in range(6):
+                time.sleep(1.5)
+                try:
+                    c2 = Cli()
+                    b2 = c2.enter()
+                    r2 = c2.cmd("get p_pitch", settle=0.6)
+                    c2.close()
+                    print(f"[diag] retry {attempt}: banner={len(b2)}B resp={r2.strip()[:60]!r}")
+                    if "p_pitch" in r2:
+                        break
+                except OSError as e:
+                    print(f"[diag] retry {attempt}: connect failed: {e}")
             for suffix, label in ((".out", "stdout"), ("", "stderr")):
                 p = rberr + suffix
                 if os.path.exists(p):
