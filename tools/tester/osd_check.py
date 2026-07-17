@@ -35,6 +35,7 @@ def main():
         addr = ("127.0.0.1", port)
         grid = None
 
+        best = 0
         for f in range(500):
             arm = 1.0 if f > 60 else -1.0
             rc = [0, 0, -1, 0, arm, 1.0, -1, -1]
@@ -47,7 +48,13 @@ def main():
                     d, _ = s.recvfrom(2048)
                     _, _, typ, _ = HDR.unpack(d[:8])
                     if typ == PW_OSD:
-                        grid = d[8:8 + 480]
+                        g = d[8:8 + 480]
+                        # keep the grid with the most content: the OSD refreshes
+                        # asynchronously, so any single packet may be mid-clear
+                        n = sum(1 for c in g if 32 < c < 127)
+                        if n >= best:
+                            best = n
+                            grid = g
             except socket.timeout:
                 pass
 
@@ -55,7 +62,7 @@ def main():
             print("FAIL: no PW_OSD packet received")
             return 1
 
-        printable = sum(1 for c in grid if 32 < c < 127)
+        printable = best
         print("=== OSD 16x30 (from real Betaflight OSD) ===")
         for y in range(16):
             row = grid[y * 30:(y + 1) * 30]
