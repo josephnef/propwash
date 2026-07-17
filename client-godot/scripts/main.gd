@@ -20,6 +20,7 @@ extends Node3D
 const PwProtocol = preload("res://scripts/protocol.gd")
 
 const CORE_PORT := 9100
+const REST_H := 0.12   # drone body height when resting on the ground (gear)
 
 var _udp := PacketPeerUDP.new()
 var _core_pid := -1
@@ -30,7 +31,7 @@ var _hud: Label
 var _osd: Label       # 16x30 Betaflight OSD overlay, monospace, centered
 
 # client-owned pose state (fed back to the core each frame)
-var _pos := Vector3(0, 0.0, 0)
+var _pos := Vector3(0, REST_H, 0)   # start resting on the pad, not clipping ground
 var _rot := Quaternion.IDENTITY   # sim frame
 var _angvel := Vector3.ZERO       # sim frame
 var _linvel := Vector3.ZERO       # sim frame
@@ -125,7 +126,7 @@ func _physics_process(delta: float) -> void:
 	# angular velocity is a pseudovector: mirror(z) maps it to (-x, -y, +z)
 	var sim_av := Vector3(-_angvel.x, -_angvel.y, _angvel.z)
 	var sim_lv := Vector3(_linvel.x, _linvel.y, -_linvel.z)
-	var contact := _pos.y <= 0.001
+	var contact := _pos.y <= REST_H + 0.01
 
 	var pkt := PwProtocol.pack_state_in(_frame_id, delta, _rc,
 			sim_pos, sim_rot, sim_av, sim_lv, 16.8, contact)
@@ -171,14 +172,22 @@ func _physics_process(delta: float) -> void:
 	var av: Vector3 = out.angvel
 	_angvel = Vector3(-av.x, -av.y, av.z)
 
+	var armed: bool = out.get("armed", false)
 	_pos += _linvel * delta
 
-	# --- ground plane (client owns collision)
-	if _pos.y <= 0.0:
-		_pos.y = 0.0
-		if _linvel.y < 0.0:
-			_linvel.y = 0.0
-		_angvel = Vector3.ZERO
+	# --- ground plane (client owns collision), body rests at REST_H
+	if _pos.y <= REST_H:
+		_pos.y = REST_H
+		if armed:
+			if _linvel.y < 0.0:
+				_linvel.y = 0.0
+			_angvel = Vector3.ZERO
+		else:
+			# disarmed on the pad: sit still and settle level, don't drift
+			# with physics noise (a real quad just sits there)
+			_linvel = Vector3.ZERO
+			_angvel = Vector3.ZERO
+			_rot = _rot.slerp(Quaternion.IDENTITY, 0.2)
 
 	_drone.transform = Transform3D(Basis(_rot), _pos)
 	_update_hud()
@@ -420,7 +429,8 @@ func _build_world() -> void:
 
 	var cam := Camera3D.new()
 	cam.fov = 100
-	cam.near = 0.05
+	cam.near = 0.02
+	cam.position = Vector3(0, 0.03, 0)   # FPV cam sits above the body
 	# sim +z (forward) maps to Godot -z, which is exactly where Camera3D
 	# looks by default — only the FPV uptilt is needed
 	cam.rotation_degrees = Vector3(20, 0, 0)
