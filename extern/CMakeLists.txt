@@ -39,6 +39,12 @@ list(APPEND BF_SOURCES
   # displayport captures the 16x30 grid into osdScreen[] (replaces the stock
   # SPI max7456 displayport, excluded from bf_sources.txt).
   "${CMAKE_CURRENT_SOURCE_DIR}/betaflightext/src/main/io/displayport_fake.c"
+  # serial_tcp.c: stock TCP UART driver + dyad thread-safety. dyad is pumped
+  # on pw_sitl.c's worker thread but called from the sim thread here too; the
+  # unsynchronised race left the CLI/MSP listener unserviced on some hosts
+  # (100% on macOS CI). This copy serialises dyad via pw_dyad_lock/unlock —
+  # patches/serial-tcp-dyad-lock.diff (stock excluded from bf_sources.txt).
+  "${CMAKE_CURRENT_SOURCE_DIR}/betaflightext/src/main/drivers/serial_tcp.c"
 )
 
 if(APPLE)
@@ -72,7 +78,9 @@ target_include_directories(bf_sitl PUBLIC
   "${BF_ROOT}/lib/main/dyad"
   "${BF_ROOT}/lib/main/google/olc"
   # for the overridden scheduler.c / cli.c, whose same-directory includes
-  # must resolve against the stock headers
+  # must resolve against the stock headers. (Not drivers/ — it contains a
+  # time.h that would shadow the system <time.h>; the vendored serial_tcp.c
+  # uses a "drivers/serial_tcp.h" path instead.)
   "${BF_ROOT}/src/main/scheduler"
   "${BF_ROOT}/src/main/cli"
 )
