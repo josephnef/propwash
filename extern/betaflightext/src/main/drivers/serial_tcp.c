@@ -82,10 +82,13 @@ static void onData(dyad_Event *e)
 static void onClose(dyad_Event *e)
 {
     tcpPort_t* s = (tcpPort_t*)(e->udata);
-    s->clientCount--;
-    s->conn = NULL;
     fprintf(stderr, "[CLS]UART%u: %d,%d\n", s->id + 1, s->connected, s->clientCount);
-    if (s->clientCount == 0) {
+    // propwash: only clear the slot if the CURRENT client closed. A stale
+    // close event (from a client we already dropped in onAccept) must not wipe
+    // the new connection's slot. e->stream is the connection that closed.
+    if (s->conn == e->stream) {
+        s->conn = NULL;
+        s->clientCount = 0;
         s->connected = false;
     }
 }
@@ -94,14 +97,21 @@ static void onAccept(dyad_Event *e)
     tcpPort_t* s = (tcpPort_t*)(e->udata);
     fprintf(stderr, "New connection on UART%u, %d\n", s->id + 1, s->clientCount);
 
-    s->connected = true;
-    if (s->clientCount > 0) {
-        dyad_close(e->remote);
-        return;
+    // propwash: newest client wins. Stock BF rejects a new connection while
+    // one already exists, but propwash's CLI/MSP reconnects constantly (the
+    // Configurator, and every test phase re-opens the CLI) and onClose — which
+    // frees the slot — can lag the reconnect on a slow/busy host. The port
+    // then stays permanently "full" and the CLI/MSP goes dead (this is why
+    // diff_roundtrip's post-save readback returned nothing on the macOS CI
+    // runner while a later raw probe worked). So drop any stale client and
+    // take the new connection instead of rejecting it.
+    if (s->conn != NULL) {
+        dyad_close(s->conn);
     }
-    s->clientCount++;
-    fprintf(stderr, "[NEW]UART%u: %d,%d\n", s->id + 1, s->connected, s->clientCount);
+    s->connected = true;
+    s->clientCount = 1;
     s->conn = e->remote;
+    fprintf(stderr, "[NEW]UART%u: %d,%d\n", s->id + 1, s->connected, s->clientCount);
     dyad_setNoDelay(e->remote, 1);
     dyad_setTimeout(e->remote, 120);
     dyad_addListener(e->remote, DYAD_EVENT_DATA, onData, e->udata);
