@@ -190,6 +190,7 @@ func _physics_process(delta: float) -> void:
 			_rot = _rot.slerp(Quaternion.IDENTITY, 0.2)
 
 	_drone.transform = Transform3D(Basis(_rot), _pos)
+	_spin_props(delta)
 	_update_hud()
 	if _autotest:
 		_autotest_check(delta)
@@ -364,6 +365,128 @@ func _autotest_check(delta: float) -> void:
 		get_tree().quit(0 if ok else 1)
 
 
+var _props: Array[Node3D] = []   # 4 prop meshes, spun by motor RPM
+var _prop_angle := 0.0
+
+
+# Spin the props from the firmware's motor RPM (PW_STATE_OUT.motor_rpm) and
+# fade the blur discs in with RPM. At real RPM the blades strobe, which reads
+# as a translucent disc — exactly the real O3 look.
+func _spin_props(delta: float) -> void:
+	if _props.is_empty():
+		return
+	var rpm := [0.0, 0.0, 0.0, 0.0]
+	if not _last_out.is_empty() and _last_out.has("motor_rpm"):
+		rpm = _last_out.motor_rpm
+	# a single shared visual rate (scaled down; true RPM would just alias)
+	var avg: float = (rpm[0] + rpm[1] + rpm[2] + rpm[3]) / 4.0
+	_prop_angle += (avg / 60.0) * TAU * delta * 0.05   # 5% so blades stay visible
+	for i in range(_props.size()):
+		_props[i].rotation.y = _prop_angle * (1.0 if (_props[i].scale.x > 0) else -1.0)
+
+
+# A procedural CineLog35-style 3.5" ducted cinewhoop: centre plate, 4 ducts
+# with motors + props, a top battery, and the O3 camera pod up front. Forward
+# is -z. Motor layout matches the physics profile (+/-54 mm), ~89 mm props.
+func _build_drone_model(root: Node3D) -> void:
+	var carbon := StandardMaterial3D.new()
+	carbon.albedo_color = Color(0.09, 0.09, 0.11)
+	carbon.metallic = 0.3
+	carbon.roughness = 0.5
+	var duct_mat := StandardMaterial3D.new()
+	duct_mat.albedo_color = Color(0.06, 0.06, 0.07)
+	duct_mat.roughness = 0.7
+
+	# centre frame plate
+	var plate := MeshInstance3D.new()
+	var pm := BoxMesh.new()
+	pm.size = Vector3(0.075, 0.008, 0.11)
+	pm.material = carbon
+	plate.mesh = pm
+	root.add_child(plate)
+
+	# battery on top
+	var batt := MeshInstance3D.new()
+	var btm := BoxMesh.new()
+	btm.size = Vector3(0.035, 0.022, 0.075)
+	var bmat := StandardMaterial3D.new()
+	bmat.albedo_color = Color(0.55, 0.15, 0.15)
+	btm.material = bmat
+	batt.mesh = btm
+	batt.position = Vector3(0, 0.02, 0.005)
+	root.add_child(batt)
+
+	# O3 camera pod up front (what the FPV cam looks out of)
+	var pod := MeshInstance3D.new()
+	var podm := BoxMesh.new()
+	podm.size = Vector3(0.021, 0.028, 0.02)
+	podm.material = carbon
+	pod.mesh = podm
+	pod.position = Vector3(0, 0.038, -0.03)
+	pod.rotation_degrees = Vector3(25, 0, 0)
+	root.add_child(pod)
+
+	# 4 ducts + motors + props at the motor positions (Godot: forward = -z)
+	var motors := [
+		Vector3( 0.054, 0.0, -0.054),  # front-right
+		Vector3(-0.054, 0.0, -0.054),  # front-left
+		Vector3( 0.054, 0.0,  0.054),  # rear-right
+		Vector3(-0.054, 0.0,  0.054),  # rear-left
+	]
+	var spin_dir := [1.0, -1.0, -1.0, 1.0]
+	for i in range(4):
+		var p: Vector3 = motors[i]
+
+		# duct ring (torus lip) — the hallmark of a ducted whoop
+		var duct := MeshInstance3D.new()
+		var tm := TorusMesh.new()
+		tm.inner_radius = 0.044
+		tm.outer_radius = 0.05
+		tm.material = duct_mat
+		duct.mesh = tm
+		duct.position = p + Vector3(0, 0.006, 0)
+		root.add_child(duct)
+
+		# motor bell
+		var motor := MeshInstance3D.new()
+		var mm := CylinderMesh.new()
+		mm.top_radius = 0.012
+		mm.bottom_radius = 0.013
+		mm.height = 0.016
+		mm.material = carbon
+		motor.mesh = mm
+		motor.position = p + Vector3(0, 0.004, 0)
+		root.add_child(motor)
+
+		# prop — a translucent disc (spinning blur) with 3 faint blades
+		var prop := Node3D.new()
+		prop.position = p + Vector3(0, 0.014, 0)
+		prop.scale = Vector3(spin_dir[i], 1, 1)  # cheap CW/CCW hint
+		var disc := MeshInstance3D.new()
+		var dm := CylinderMesh.new()
+		dm.top_radius = 0.043
+		dm.bottom_radius = 0.043
+		dm.height = 0.001
+		var dmat := StandardMaterial3D.new()
+		dmat.albedo_color = Color(0.7, 0.7, 0.75, 0.12)
+		dmat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+		dm.material = dmat
+		disc.mesh = dm
+		prop.add_child(disc)
+		for b in range(3):
+			var blade := MeshInstance3D.new()
+			var blm := BoxMesh.new()
+			blm.size = Vector3(0.084, 0.004, 0.01)
+			var blmat := StandardMaterial3D.new()
+			blmat.albedo_color = Color(0.15, 0.15, 0.17)
+			blm.material = blmat
+			blade.mesh = blm
+			blade.rotation_degrees = Vector3(0, b * 120.0, 0)
+			prop.add_child(blade)
+		root.add_child(prop)
+		_props.append(prop)
+
+
 # ------------------------------------------------------------------ world
 func _add_box(pos: Vector3, size: Vector3, color: Color) -> void:
 	var mi := MeshInstance3D.new()
@@ -418,28 +541,16 @@ func _build_world() -> void:
 	# drone + FPV camera
 	_drone = Node3D.new()
 	add_child(_drone)
-	var body := MeshInstance3D.new()
-	var bm := BoxMesh.new()
-	bm.size = Vector3(0.15, 0.05, 0.15)
-	var bmat := StandardMaterial3D.new()
-	bmat.albedo_color = Color(0.15, 0.15, 0.18)
-	bm.material = bmat
-	body.mesh = bm
-	# the FPV camera is "inside" the quad — you don't see your own frame in
-	# real FPV. Put the body on its own visual layer and cull it from the cam
-	# (a future chase/3rd-person cam can still show it).
-	body.set_layer_mask_value(1, false)
-	body.set_layer_mask_value(20, true)
-	_drone.add_child(body)
+	_build_drone_model(_drone)
 
+	# FPV camera where the DJI O3 sits on a CineLog35: front-top of the frame,
+	# looking forward (-z) with ~25 deg uptilt. The front ducts + props are
+	# just below the view, exactly like real cinewhoop footage.
 	var cam := Camera3D.new()
-	cam.fov = 100
-	cam.near = 0.02
-	cam.set_cull_mask_value(20, false)   # don't render the drone's own body
-	cam.position = Vector3(0, 0.03, 0)   # FPV cam sits above the body
-	# sim +z (forward) maps to Godot -z, which is exactly where Camera3D
-	# looks by default — only the FPV uptilt is needed
-	cam.rotation_degrees = Vector3(20, 0, 0)
+	cam.fov = 105
+	cam.near = 0.005
+	cam.position = Vector3(0, 0.045, -0.02)
+	cam.rotation_degrees = Vector3(25, 0, 0)
 	_drone.add_child(cam)
 	cam.current = true
 
