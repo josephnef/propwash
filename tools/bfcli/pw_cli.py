@@ -20,8 +20,21 @@ import time
 
 
 class Cli:
-    def __init__(self, host="127.0.0.1", port=5761, timeout=2.0):
-        self.sock = socket.create_connection((host, port), timeout=timeout)
+    def __init__(self, host="127.0.0.1", port=5761, timeout=2.0, connect_timeout=12.0):
+        # Retry the connection: a freshly spawned core needs a moment to boot
+        # BF and bind the CLI port, and booting from a baked eeprom (the real
+        # tune) is slower still — enough that a single attempt times out on a
+        # slow host (the Windows CI runner). Retry until it accepts or we give
+        # up, so callers don't have to guess a fixed startup sleep.
+        deadline = time.time() + connect_timeout
+        while True:
+            try:
+                self.sock = socket.create_connection((host, port), timeout=timeout)
+                break
+            except OSError:
+                if time.time() >= deadline:
+                    raise
+                time.sleep(0.2)
         # short recv timeout so _drain polls at the settle granularity rather
         # than blocking for the whole connection timeout after the last byte
         self.sock.settimeout(0.05)
