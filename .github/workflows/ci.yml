@@ -105,6 +105,11 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     continue-on-error: true   # informational: the core tests above are the gate
+    env:
+      # single pin for both runners — they used to drift (Linux pinned by URL,
+      # macOS on an unpinned brew cask), which matters now that the client has
+      # scene/import files whose format is version-sensitive
+      GODOT_VERSION: "4.7.1"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -116,17 +121,21 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake build-essential unzip xvfb
           curl -sL -o godot.zip \
-            https://github.com/godotengine/godot/releases/download/4.3-stable/Godot_v4.3-stable_linux.x86_64.zip
+            "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip"
           unzip -q godot.zip
-          sudo install -m755 Godot_v4.3-stable_linux.x86_64 /usr/local/bin/godot
+          sudo install -m755 "Godot_v${GODOT_VERSION}-stable_linux.x86_64" /usr/local/bin/godot
+          godot --version
 
       - name: Install toolchain + Godot (macOS)
         if: runner.os == 'macOS'
         run: |
           cmake --version || brew install cmake
-          # the cask drops a `godot` CLI symlink in the brew bin (on PATH),
-          # which CMake's find_program picks up
-          brew install --cask godot
+          # pinned zip, not `brew install --cask godot`: the cask is unpinned and
+          # would silently drift away from the Linux runner's version
+          curl -sL -o godot.zip \
+            "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_macos.universal.zip"
+          unzip -q godot.zip
+          sudo install -m755 Godot.app/Contents/MacOS/Godot /usr/local/bin/godot
           godot --version
 
       - name: Configure & build

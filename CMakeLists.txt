@@ -64,7 +64,8 @@ set_tests_properties(real_tune_hover PROPERTIES TIMEOUT 90)
 
 # Godot client autotest (runs only if a godot 4 binary is available).
 # PROPWASH_AUTOTEST=1 arms + hovers via the real GDScript client, headless.
-find_program(GODOT_BIN NAMES godot godot4 Godot_v4.3-stable_linux.x86_64
+find_program(GODOT_BIN NAMES godot godot4
+  Godot_v4.7.1-stable_linux.x86_64 Godot_v4.3-stable_linux.x86_64
   PATHS /tmp)
 if(GODOT_BIN)
   add_test(NAME godot_client
