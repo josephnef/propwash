@@ -111,7 +111,9 @@ void Server::sendTo(const void* payload, uint16_t len, uint8_t type)
     dst.sin_family = AF_INET;
     dst.sin_addr.s_addr = mClientAddr;
     dst.sin_port = mClientPort;
-    sendto(mFd, buf, sizeof(hdr) + len, 0, (sockaddr*)&dst, sizeof(dst));
+    // Winsock's sendto takes a `const char*` buffer (POSIX takes const void*,
+    // which accepts the cast too).
+    sendto(mFd, (const char*)buf, sizeof(hdr) + len, 0, (sockaddr*)&dst, sizeof(dst));
 }
 
 static void applyInit(const PwInit& p, StateInit& s)
@@ -171,7 +173,7 @@ void Server::run(SimITL::Sim& sim, const StateInit& defaultInit, Joystick* js)
     for (;;) {
         sockaddr_in src {};
         socklen_t srcLen = sizeof(src);
-        ssize_t n = recvfrom(mFd, buf, sizeof(buf), 0, (sockaddr*)&src, &srcLen);
+        ssize_t n = recvfrom(mFd, (char*)buf, sizeof(buf), 0, (sockaddr*)&src, &srcLen);
 
         if (n < 0) {
             // recv timeout: no client packet. Keep the firmware's scheduler
