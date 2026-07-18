@@ -3,14 +3,15 @@
  *
  * Betaflight's drivers/serial_tcp.h does `#include <netinet/in.h>`, but only
  * vestigially — its tcpPort_t struct uses no netinet types (just dyad_Stream*,
- * pthread mutexes, and byte buffers). MinGW-w64 has no <netinet/in.h>, so this
- * shim satisfies the include on Windows and forwards to Winsock for the
- * sockaddr_in family in case anything ever needs it.
+ * pthread mutexes, and byte buffers), and dyad itself talks to Winsock through
+ * its own guarded includes. MinGW-w64 has no <netinet/in.h>, so this shim just
+ * satisfies the include.
  *
- * This directory is added to the bf_sitl include path only on WIN32
+ * It is deliberately EMPTY: forwarding to <winsock2.h> would drag in
+ * <windows.h> / <winbase.h>, whose COMMPROP baud macros (BAUD_9600, ...)
+ * collide with Betaflight's baudRate_e enum in io/serial.h.
+ *
+ * This directory is on the bf_sitl include path only on WIN32
  * (see extern/CMakeLists.txt), so POSIX builds keep the real header.
  */
 #pragma once
-
-#include <winsock2.h>
-#include <ws2tcpip.h>

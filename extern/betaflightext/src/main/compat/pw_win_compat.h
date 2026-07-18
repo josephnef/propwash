@@ -9,6 +9,13 @@
  */
 
 /*
+ * <string.h>: some firmware files (e.g. lib/main/google/olc/olc.c) call
+ * strlen() but only #include <memory.h>, relying on glibc/libc++ pulling in
+ * <string.h> transitively — which MinGW's <memory.h> does not.
+ */
+#include <string.h>
+
+/*
  * ffs(): GNU/POSIX "find first set". Betaflight calls it (fc/core.c, cli.c) to
  * turn the arming-disable bitmask into a bit index; MinGW-w64 declares it in no
  * header (implicit-declaration error). It's always available as a GCC builtin,
