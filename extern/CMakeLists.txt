@@ -100,6 +100,11 @@ if(WIN32)
   # (ffs, string.h, ...). SHELL: keeps the two tokens together, un-deduplicated.
   target_compile_options(bf_sitl PRIVATE
     "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/betaflightext/src/main/compat/pw_win_compat.h")
+  # Winsock: dyad (in this lib) and the UDP server (in pw_sim, which links this
+  # PUBLIC) call it. Declaring it as a PUBLIC dependency here — rather than a
+  # bare -lws2_32 in BF_LINK_OPTIONS — lets CMake order it correctly after the
+  # referencing objects (a raw flag can land before bf_sitl and get dropped).
+  target_link_libraries(bf_sitl PUBLIC ws2_32)
 endif()
 
 target_compile_options(bf_sitl PRIVATE
@@ -144,12 +149,13 @@ if(APPLE)
   )
 elseif(WIN32)
   # MinGW-w64 GNU ld: same pg.ld linker script as Linux (it already handles the
-  # PE page-alignment case). Winsock (-lws2_32) for dyad + the UDP server;
-  # winpthreads (-lpthread) for the tcp worker. No -lrt (in the MinGW CRT).
+  # PE page-alignment case). winpthreads (-lpthread) for the tcp worker; no -lrt
+  # (in the MinGW CRT). Winsock (ws2_32) is a PUBLIC dep of bf_sitl (above), so
+  # it flows to consumers in the right link order.
   set(BF_LINK_OPTIONS
     "-T${BF_ROOT}/src/main/target/SITL/pg.ld"
     "-Wl,--gc-sections"
-    -lm -lpthread -lws2_32
+    -lm -lpthread
     PARENT_SCOPE
   )
 else()
