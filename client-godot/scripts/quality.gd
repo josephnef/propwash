@@ -12,7 +12,7 @@ extends RefCounted
 const TIERS := {
 	"low": {
 		"msaa": Viewport.MSAA_2X,
-		"scale_3d": 0.78,           # the single biggest fill-rate lever
+		"scale_3d": 1.0,           # native. never render below the panel.
 		"shadow_atlas": 2048,
 		"shadow_filter": RenderingServer.SHADOW_QUALITY_HARD,
 		"shadow_splits": DirectionalLight3D.SHADOW_PARALLEL_2_SPLITS,
@@ -32,7 +32,7 @@ const TIERS := {
 	},
 	"medium": {
 		"msaa": Viewport.MSAA_2X,
-		"scale_3d": 0.85,
+		"scale_3d": 1.0,
 		"shadow_atlas": 4096,
 		"shadow_filter": RenderingServer.SHADOW_QUALITY_SOFT_LOW,
 		"shadow_splits": DirectionalLight3D.SHADOW_PARALLEL_4_SPLITS,

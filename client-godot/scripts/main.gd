@@ -110,6 +110,8 @@ const TICK_MAX := 240   # don't melt a CPU on an exotic 360/500 Hz panel
 #   PROPWASH_QUALITY=low|medium|high|auto   (default auto)
 const PwQuality = preload("res://scripts/quality.gd")
 const QUALITY_ENV := "PROPWASH_QUALITY"
+# opt-in only; the default is always native resolution
+const SCALE_ENV := "PROPWASH_SCALE"
 var _tier := "medium"
 var _q := {}
 # A real RenderingDevice is the only reliable signal that Forward+ effects will
@@ -206,7 +208,7 @@ func _resolve_quality() -> void:
 	print("[pw][gfx] tier=%s renderer=%s %.0fHz %.1fMP=%.0fMP/s scale3d=%.2f msaa=%d" % [
 			_tier, "forward+" if _has_rd else "compatibility", refresh,
 			pixels / 1_000_000.0, pixels * refresh / 1_000_000.0,
-			_q.scale_3d, _q.msaa])
+			get_viewport().scaling_3d_scale, _q.msaa])
 
 
 func _apply_quality() -> void:
@@ -215,12 +217,18 @@ func _apply_quality() -> void:
 	vp.msaa_3d = _q.msaa
 	vp.screen_space_aa = Viewport.SCREEN_SPACE_AA_DISABLED
 	vp.use_debanding = true
-	# FSR (spatial), not bilinear: bilinear upscaling turns thin high-contrast
-	# geometry -- gate tubes, prop blades, stripe boundaries -- into stair-steps.
-	# FSR1 is edge-adaptive. Deliberately FSR1 and not FSR2, which is temporal
-	# and would reintroduce exactly the ghosting that ruled out TAA.
-	vp.scaling_3d_mode = Viewport.SCALING_3D_MODE_FSR
-	vp.scaling_3d_scale = _q.scale_3d
+	# Native resolution. Rendering the 3D below panel resolution and upscaling is
+	# not an acceptable default here: the OSD and HUD stay native on their own
+	# layer, so the world looks soft next to crisp text, and on a display someone
+	# chose deliberately that is the wrong trade to make silently. Frames get
+	# found by cutting scene cost, not by cutting pixels.
+	# PROPWASH_SCALE is an explicit escape hatch for a GPU that cannot cope.
+	var scale: float = _q.scale_3d
+	var pin := OS.get_environment(SCALE_ENV)
+	if pin.is_valid_float():
+		scale = clampf(pin.to_float(), 0.5, 1.0)
+	vp.scaling_3d_mode = Viewport.SCALING_3D_MODE_FSR   # only used if scale < 1
+	vp.scaling_3d_scale = scale
 
 	# These are read once at boot, so ProjectSettings.set_setting() at runtime is
 	# a no-op -- they have to go through RenderingServer. This is the trap that
