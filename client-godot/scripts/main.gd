@@ -917,9 +917,9 @@ func _build_sky_and_sun() -> void:
 	e.fog_light_energy = 1.0
 	e.fog_sun_scatter = 0.2
 	e.fog_depth_begin = 40.0
-	e.fog_depth_end = 520.0
+	e.fog_depth_end = 900.0
 	e.fog_depth_curve = 1.1
-	e.fog_aerial_perspective = 0.6   # tint by the sky cubemap
+	e.fog_aerial_perspective = 0.45   # tint by the sky cubemap
 	e.fog_sky_affect = 0.0           # PhysicalSky already has its own haze
 
 	_apply_quality_to_env(e, sun)   # tier-dependent: shadows, glow, ssao, ssil, volfog
@@ -946,36 +946,99 @@ func _build_ground() -> void:
 # A ring of low-poly conifers at 80-300 m in ONE draw call. No assets, and it is
 # the largest single cue that this is a place rather than a plane -- parallax
 # against distant objects is most of what sells outdoor flight.
+# A single cone and a single sphere read as exactly what they are. Real trees at
+# distance are irregular clustered foliage masses sitting on a visible trunk, and
+# the giveaway is silhouette variety, not polygon count. So: several distinct
+# meshes, each assembled from overlapping jittered blobs, scattered by its own
+# MultiMesh. Still only TREE_VARIANTS draw calls for the whole treeline.
+const TREE_VARIANTS := 6
+const TRUNK_COLOR := Color(0.085, 0.062, 0.045)
+
+
 func _build_treeline() -> void:
-	# Two species, because a ring of identical cones reads as paper cutouts. Both
-	# use per-instance colour so the band has tonal depth rather than one flat
-	# silhouette. Still one draw call each.
-	var conifer := CylinderMesh.new()
-	conifer.top_radius = 0.0
-	conifer.bottom_radius = 1.0
-	conifer.height = 1.0
-	conifer.radial_segments = 12
-	conifer.rings = 1
-
-	var broadleaf := SphereMesh.new()
-	broadleaf.radius = 0.5
-	broadleaf.height = 1.0
-	broadleaf.radial_segments = 12
-	broadleaf.rings = 7
-
-	_scatter_trees(conifer, int(_q.trees * 0.58), 0.26, 0.40, Color(0.150, 0.205, 0.115))
-	_scatter_trees(broadleaf, int(_q.trees * 0.42), 0.55, 0.85, Color(0.185, 0.235, 0.125))
-
-
-func _scatter_trees(mesh: Mesh, count: int, wmin: float, wmax: float, tint: Color) -> void:
 	var rng := RandomNumberGenerator.new()
-	rng.seed = WORLD_SEED + count   # fixed: the world must be identical every run
+	rng.seed = WORLD_SEED
+	var per := int(_q.trees / float(TREE_VARIANTS))
+	for v in TREE_VARIANTS:
+		var conifer := v < 3
+		var mesh := _make_tree_mesh(rng, conifer)
+		var tint := Color(0.115, 0.165, 0.085) if conifer else Color(0.150, 0.195, 0.100)
+		_scatter_trees(mesh, per, 0.30 if conifer else 0.62, tint)
 
-	var mat := StandardMaterial3D.new()
-	mat.albedo_color = tint
-	mat.roughness = 0.95
-	mat.vertex_color_use_as_albedo = true
-	mesh.material = mat
+
+# One tree: a tapered trunk plus 3-6 overlapping foliage blobs, each offset,
+# squashed and rotated differently. The overlap is the point — it breaks the
+# primitive silhouette that made the old cone/sphere pair look like clip art.
+func _make_tree_mesh(rng: RandomNumberGenerator, conifer: bool) -> ArrayMesh:
+	var foliage := SurfaceTool.new()
+	foliage.begin(Mesh.PRIMITIVE_TRIANGLES)
+
+	var blobs := rng.randi_range(3, 5) if conifer else rng.randi_range(3, 6)
+	for i in blobs:
+		var t := float(i) / float(maxi(blobs - 1, 1))   # 0 at base, 1 at tip
+		var src: Mesh
+		if conifer:
+			var cone := CylinderMesh.new()
+			cone.top_radius = 0.0
+			cone.bottom_radius = 1.0
+			cone.height = 1.0
+			cone.radial_segments = 9
+			cone.rings = 1
+			src = cone
+		else:
+			var sph := SphereMesh.new()
+			sph.radius = 0.5
+			sph.height = 1.0
+			sph.radial_segments = 9
+			sph.rings = 5
+			src = sph
+
+		# conifers taper toward the tip; broadleaf clusters bunch near the crown
+		var w: float = lerpf(1.0, 0.35, t) if conifer else rng.randf_range(0.55, 1.0)
+		var h: float = lerpf(0.55, 0.40, t) if conifer else rng.randf_range(0.45, 0.75)
+		var y: float = lerpf(0.38, 1.00, t) if conifer else rng.randf_range(0.50, 0.95)
+		var jitter := Vector3(rng.randf_range(-0.16, 0.16), 0.0,
+				rng.randf_range(-0.16, 0.16)) * (0.4 if conifer else 1.0)
+		var basis := Basis(Vector3.UP, rng.randf() * TAU).scaled(Vector3(w, h, w))
+		foliage.append_from(src, 0, Transform3D(basis, Vector3(0, y, 0) + jitter))
+
+	foliage.generate_normals()
+	var mesh: ArrayMesh = foliage.commit()
+	var fmat := StandardMaterial3D.new()
+	fmat.albedo_color = Color(0.42, 0.46, 0.34)   # multiplies the instance tint
+	fmat.roughness = 0.95
+	fmat.vertex_color_use_as_albedo = true   # per-instance tint varies the band
+	mesh.surface_set_material(0, fmat)
+
+	# trunk: visible below the canopy, which is most of what says "tree" in a
+	# silhouette against the sky
+	var trunk := SurfaceTool.new()
+	trunk.begin(Mesh.PRIMITIVE_TRIANGLES)
+	var tm := CylinderMesh.new()
+	tm.top_radius = 0.035
+	tm.bottom_radius = 0.075
+	tm.height = 0.9
+	tm.radial_segments = 6
+	tm.rings = 1
+	# trunk spans local y 0..0.9, so local y=0 is the base of the tree and the
+	# instance can simply be planted at ground level
+	trunk.append_from(tm, 0, Transform3D(Basis.IDENTITY, Vector3(0, 0.45, 0)))
+	trunk.generate_normals()
+	var tmesh: ArrayMesh = trunk.commit()
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES,
+			tmesh.surface_get_arrays(0))
+	var tmat := StandardMaterial3D.new()
+	tmat.albedo_color = TRUNK_COLOR
+	tmat.roughness = 1.0
+	mesh.surface_set_material(1, tmat)
+	return mesh
+
+
+func _scatter_trees(mesh: Mesh, count: int, width: float, tint: Color) -> void:
+	var rng := RandomNumberGenerator.new()
+	# fixed and per-variant: the world must be identical every run, but each
+	# variant must land somewhere different
+	rng.seed = WORLD_SEED + count * 7919 + int(width * 1000.0)
 
 	var mm := MultiMesh.new()
 	mm.transform_format = MultiMesh.TRANSFORM_3D
@@ -987,9 +1050,11 @@ func _scatter_trees(mesh: Mesh, count: int, wmin: float, wmax: float, tint: Colo
 		# denser near the inner edge so it reads as a receding mass, not a ring
 		var rad: float = 95.0 + pow(rng.randf(), 1.7) * 380.0
 		var h := rng.randf_range(5.0, 13.0)
-		var w := h * rng.randf_range(wmin, wmax)
+		var w := h * width * rng.randf_range(0.85, 1.2)
+		# mesh base is at local y=0, so plant directly on the ground; the old
+		# h*0.5 offset was for a centred primitive and left these hovering
 		var t := Transform3D(Basis.IDENTITY.scaled(Vector3(w, h, w)),
-				Vector3(cos(ang) * rad, h * 0.5, sin(ang) * rad))
+				Vector3(cos(ang) * rad, 0.0, sin(ang) * rad))
 		mm.set_instance_transform(i, t)
 		var v := rng.randf_range(0.72, 1.28)
 		mm.set_instance_color(i, Color(tint.r * v, tint.g * v, tint.b * v * 0.95))
