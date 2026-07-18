@@ -125,6 +125,12 @@ The Godot client spawns `build/propwash-core` itself. Controls:
   the monitor: a 240 Hz screen runs a 240 Hz lockstep, while 60/100 Hz setups
   stay on the 100 Hz baseline and pay exactly what they always have (clamped to
   100–240). Pin it with `PROPWASH_TICK=<hz>` if you'd rather choose yourself.
+- **Quality tiers** — `low`/`medium`/`high`, auto-selected from what the GPU
+  actually has to sustain (width × height × refresh), so a 240 Hz panel keeps its
+  framerate and a 60 Hz one gets the prettier version. Measured spread at
+  2940×1846: 326 / 117 / 51 fps. Override with `PROPWASH_QUALITY=<tier>`. If
+  render rate falls far below the lockstep rate for a few seconds, the client
+  gives the tick rate back rather than let a heavy scene starve the sim.
 
 ### Loading the pilot's real tune
 

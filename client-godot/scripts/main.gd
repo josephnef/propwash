@@ -105,6 +105,33 @@ const TICK_ENV := "PROPWASH_TICK"
 const TICK_MIN := 100   # the long-tested baseline; never go below it
 const TICK_MAX := 240   # don't melt a CPU on an exotic 360/500 Hz panel
 
+# Quality tiers. Auto-selected from the monitor's frame budget so a high-refresh
+# setup keeps its framerate and a 60 Hz one gets the pretty version.
+#   PROPWASH_QUALITY=low|medium|high|auto   (default auto)
+const PwQuality = preload("res://scripts/quality.gd")
+const QUALITY_ENV := "PROPWASH_QUALITY"
+var _tier := "medium"
+var _q := {}
+# A real RenderingDevice is the only reliable signal that Forward+ effects will
+# actually run: ProjectSettings still reports "forward_plus" even after
+# fallback_to_opengl3 has quietly dropped us onto the Compatibility renderer.
+var _has_rd := true
+
+# Lockstep watchdog. Heavy art threatening framerate is not just a smoothness
+# problem here: _physics_process blocks waiting on the core, and Godot will run
+# up to max_physics_steps_per_frame of those per rendered frame, so a GPU-bound
+# scene can starve the lockstep and change flight behaviour. If render rate
+# falls far below the tick rate for a sustained period, give the tick rate back.
+const WATCHDOG_RATIO := 0.6
+const WATCHDOG_GRACE := 3.0    # seconds below threshold before acting
+var _wd_low_for := 0.0
+var _wd_fps := 60.0
+
+# The screen we actually ended up on. Re-reading Window.current_screen after the
+# fullscreen transition reports the primary again on macOS, so both the tick
+# rate and the quality tier read this instead of asking twice.
+var _active_screen := 0
+
 
 func _ready() -> void:
 	_autotest = OS.get_environment("PROPWASH_AUTOTEST") == "1"
@@ -115,6 +142,7 @@ func _ready() -> void:
 		_shot_times = [4.0, 7.0, 9.0, 11.0, 13.0, 15.0, 17.0, 19.0]
 	_parse_js_env()
 	_setup_display()
+	_resolve_quality()   # before _build_world: tree count is baked at build time
 	_build_world()
 	_spawn_core()
 	_udp.connect_to_host("127.0.0.1", CORE_PORT)
@@ -123,6 +151,99 @@ func _ready() -> void:
 func _exit_tree() -> void:
 	if _core_pid > 0:
 		OS.kill(_core_pid)
+
+
+func _resolve_quality() -> void:
+	var headless := DisplayServer.get_name() == "headless" or _autotest
+	_has_rd = RenderingServer.get_rendering_device() != null
+	var refresh := 0.0
+	var pixels := 0.0
+	if not headless:
+		refresh = DisplayServer.screen_get_refresh_rate(_active_screen)
+		var sz := DisplayServer.screen_get_size(_active_screen)
+		pixels = float(sz.x) * float(sz.y)
+	_tier = PwQuality.resolve(OS.get_environment(QUALITY_ENV), refresh, pixels, headless)
+	# Compatibility renderer is the floor, not a separate tier: the Forward+-only
+	# effects above medium would silently do nothing there.
+	if not _has_rd and _tier == "high":
+		_tier = "medium"
+	_q = PwQuality.TIERS[_tier]
+	if headless:
+		return   # nothing to configure; the dummy driver renders nothing
+	_apply_quality()
+	print("[pw][gfx] tier=%s renderer=%s %.0fHz %.1fMP=%.0fMP/s scale3d=%.2f msaa=%d" % [
+			_tier, "forward+" if _has_rd else "compatibility", refresh,
+			pixels / 1_000_000.0, pixels * refresh / 1_000_000.0,
+			_q.scale_3d, _q.msaa])
+
+
+func _apply_quality() -> void:
+	var vp := get_viewport()
+	# Live per-Viewport properties.
+	vp.msaa_3d = _q.msaa
+	vp.screen_space_aa = Viewport.SCREEN_SPACE_AA_DISABLED
+	vp.use_debanding = true
+	vp.scaling_3d_mode = Viewport.SCALING_3D_MODE_BILINEAR
+	vp.scaling_3d_scale = _q.scale_3d
+
+	# These are read once at boot, so ProjectSettings.set_setting() at runtime is
+	# a no-op -- they have to go through RenderingServer. This is the trap that
+	# makes naive preset systems appear to work while doing nothing.
+	RenderingServer.directional_shadow_atlas_set_size(_q.shadow_atlas, true)
+	RenderingServer.directional_soft_shadow_filter_set_quality(_q.shadow_filter)
+
+
+# Applied after the sun/environment exist, from _build_sky_and_sun.
+func _apply_quality_to_env(e: Environment, sun: DirectionalLight3D) -> void:
+	sun.light_angular_distance = _q.sun_angular
+	sun.directional_shadow_mode = _q.shadow_splits
+	sun.directional_shadow_blend_splits = _q.shadow_blend
+	sun.directional_shadow_max_distance = _q.shadow_max_dist
+
+	e.glow_enabled = _q.glow
+	if _q.glow:
+		e.glow_intensity = 0.5
+		e.glow_strength = 1.0
+		e.glow_bloom = 0.05
+		e.glow_blend_mode = Environment.GLOW_BLEND_MODE_SOFTLIGHT
+		e.glow_hdr_threshold = 1.0
+
+	# Forward+ only -- gated on a real RenderingDevice, not on the project
+	# setting, which still claims forward_plus after the OpenGL3 fallback.
+	e.ssao_enabled = _q.ssao and _has_rd
+	if e.ssao_enabled:
+		e.ssao_radius = 0.6        # small: this geometry is cm-scale
+		e.ssao_intensity = 1.5
+		e.ssao_power = 1.5
+	e.ssil_enabled = _q.ssil and _has_rd
+	e.volumetric_fog_enabled = _q.volfog and _has_rd
+	if e.volumetric_fog_enabled:
+		e.volumetric_fog_density = 0.008
+		e.volumetric_fog_albedo = Color(0.80, 0.85, 0.90)
+		e.volumetric_fog_anisotropy = 0.4   # forward scatter -> sun shafts
+		e.volumetric_fog_length = 128.0
+		# default temporal reprojection is tuned for slow cameras; on a quad at
+		# 30 m/s and 800 deg/s it smears trails behind the fog volume
+		e.volumetric_fog_temporal_reprojection_enabled = false
+
+
+# Give the tick rate back if the GPU can't keep up -- see WATCHDOG_RATIO.
+func _watchdog(delta: float) -> void:
+	if _autotest or DisplayServer.get_name() == "headless":
+		return
+	_wd_fps = lerpf(_wd_fps, 1.0 / maxf(delta, 0.0001), 0.05)
+	var tick := Engine.physics_ticks_per_second
+	if tick <= TICK_MIN or _wd_fps >= float(tick) * WATCHDOG_RATIO:
+		_wd_low_for = 0.0
+		return
+	_wd_low_for += delta
+	if _wd_low_for < WATCHDOG_GRACE:
+		return
+	_wd_low_for = 0.0
+	var next: int = maxi(TICK_MIN, int(tick * 0.75))
+	Engine.physics_ticks_per_second = next
+	print("[pw][gfx] %.0f fps under a %d Hz lockstep — dropping to %d Hz to keep"
+			% [_wd_fps, tick, next] + " the sim in step")
 
 
 func _setup_display() -> void:
@@ -143,7 +264,8 @@ func _setup_display() -> void:
 				screen, DisplayServer.get_screen_count(),
 				DisplayServer.screen_get_size(screen)])
 	# whichever screen we ended up on, windowed or not
-	_match_tick_rate(win.current_screen)
+	_active_screen = screen if screen >= 0 else win.current_screen
+	_match_tick_rate(_active_screen)
 
 
 # Screen to go fullscreen on, or -1 to stay windowed where we are.
@@ -208,6 +330,10 @@ func _spawn_core() -> void:
 		args += ["--no-js"]
 	_core_pid = OS.create_process(path, args)
 	print("propwash-core pid ", _core_pid)
+
+
+func _process(delta: float) -> void:
+	_watchdog(delta)
 
 
 func _physics_process(delta: float) -> void:
@@ -707,14 +833,10 @@ func _build_sky_and_sun() -> void:
 	# the quad had effectively no self-shadowing and peter-panned off the ground
 	sun.shadow_bias = 0.035
 	sun.shadow_normal_bias = 1.5
-	sun.light_angular_distance = 0.5   # real penumbra instead of a hard cut
-	sun.directional_shadow_mode = DirectionalLight3D.SHADOW_PARALLEL_4_SPLITS
-	sun.directional_shadow_blend_splits = true
 	# the quad flies low and close, so bias the cascades hard toward the near field
 	sun.directional_shadow_split_1 = 0.05
 	sun.directional_shadow_split_2 = 0.15
 	sun.directional_shadow_split_3 = 0.40
-	sun.directional_shadow_max_distance = 60.0   # the flight box; beyond it fog carries the scene
 	sun.directional_shadow_fade_start = 0.9
 	add_child(sun)
 
@@ -767,6 +889,7 @@ func _build_sky_and_sun() -> void:
 	e.fog_aerial_perspective = 0.6   # tint by the sky cubemap
 	e.fog_sky_affect = 0.0           # PhysicalSky already has its own haze
 
+	_apply_quality_to_env(e, sun)   # tier-dependent: shadows, glow, ssao, ssil, volfog
 	env.environment = e
 	add_child(env)
 
@@ -805,8 +928,8 @@ func _build_treeline() -> void:
 	broadleaf.radial_segments = 12
 	broadleaf.rings = 7
 
-	_scatter_trees(conifer, 520, 0.26, 0.40, Color(0.150, 0.205, 0.115))
-	_scatter_trees(broadleaf, 380, 0.55, 0.85, Color(0.185, 0.235, 0.125))
+	_scatter_trees(conifer, int(_q.trees * 0.58), 0.26, 0.40, Color(0.150, 0.205, 0.115))
+	_scatter_trees(broadleaf, int(_q.trees * 0.42), 0.55, 0.85, Color(0.185, 0.235, 0.125))
 
 
 func _scatter_trees(mesh: Mesh, count: int, wmin: float, wmax: float, tint: Color) -> void:
