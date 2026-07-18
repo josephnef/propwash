@@ -91,8 +91,13 @@ if(WIN32)
   # POSIX builds keep the real header.
   target_include_directories(bf_sitl PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/betaflightext/src/main/compat")
+  # dyad.h wrapper: must precede the stock lib/main/dyad so "dyad.h" resolves
+  # to it; it #include_next's the stock header then undefs the Windows baud
+  # macros that clash with baudRate_e.
+  target_include_directories(bf_sitl BEFORE PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/betaflightext/src/main/compat/dyad")
   # Force-include a compat header supplying POSIX/GNU libc bits MinGW lacks
-  # (ffs, ...). SHELL: keeps the two tokens together and un-deduplicated.
+  # (ffs, string.h, ...). SHELL: keeps the two tokens together, un-deduplicated.
   target_compile_options(bf_sitl PRIVATE
     "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/betaflightext/src/main/compat/pw_win_compat.h")
 endif()
