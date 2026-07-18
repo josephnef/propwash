@@ -117,6 +117,14 @@ The Godot client spawns `build/propwash-core` itself. Controls:
 - **Betaflight Configurator** connects any time to TCP `127.0.0.1:5761` (MSP/CLI)
   and tunes it live.
 - The **real Betaflight OSD** is overlaid on the FPV view.
+- **Second monitor** — if one is attached the sim opens fullscreen on it, leaving
+  the primary free for the Configurator and logs. Override with
+  `PROPWASH_SCREEN=off` (stay windowed) or `PROPWASH_SCREEN=<index>` (0-based).
+- **High-refresh displays** — the client drives the core in lockstep, one packet
+  per physics frame, so the pose update rate *is* the physics rate. It follows
+  the monitor: a 240 Hz screen runs a 240 Hz lockstep, while 60/100 Hz setups
+  stay on the 100 Hz baseline and pay exactly what they always have (clamped to
+  100–240). Pin it with `PROPWASH_TICK=<hz>` if you'd rather choose yourself.
 
 ### Loading the pilot's real tune
 

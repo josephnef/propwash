@@ -90,6 +90,21 @@ var _shot_dir := ""
 var _shots_taken := {}
 var _shot_times := [3.0, 8.0, 12.0, 16.0]
 
+# multi-monitor: with a second screen attached, fly fullscreen on it and leave
+# the primary free for the Configurator / CLI / logs — the usual bench setup.
+# Borderless (MODE_FULLSCREEN), not macOS's native fullscreen Space, which
+# would shunt the sim onto its own Space and animate on every focus change.
+#   PROPWASH_SCREEN=off   stay windowed on the primary (old behaviour)
+#   PROPWASH_SCREEN=2     force a screen index (0-based)
+const SCREEN_ENV := "PROPWASH_SCREEN"
+
+# Lockstep rate is raised to match the monitor, never blindly — see
+# _match_tick_rate. A 60 Hz setup must not pay for frames it cannot show.
+#   PROPWASH_TICK=<hz>    pin the rate (0 keeps the project default)
+const TICK_ENV := "PROPWASH_TICK"
+const TICK_MIN := 100   # the long-tested baseline; never go below it
+const TICK_MAX := 240   # don't melt a CPU on an exotic 360/500 Hz panel
+
 
 func _ready() -> void:
 	_autotest = OS.get_environment("PROPWASH_AUTOTEST") == "1"
@@ -99,6 +114,7 @@ func _ready() -> void:
 		# capture through the whole gate run
 		_shot_times = [4.0, 7.0, 9.0, 11.0, 13.0, 15.0, 17.0, 19.0]
 	_parse_js_env()
+	_setup_display()
 	_build_world()
 	_spawn_core()
 	_udp.connect_to_host("127.0.0.1", CORE_PORT)
@@ -107,6 +123,72 @@ func _ready() -> void:
 func _exit_tree() -> void:
 	if _core_pid > 0:
 		OS.kill(_core_pid)
+
+
+func _setup_display() -> void:
+	# --headless has no real DisplayServer, and the autotests assert on stdout,
+	# not pixels — never grab a screen out from under them, and leave the tick
+	# rate at the project default so CI stays comparable run to run.
+	if DisplayServer.get_name() == "headless" or _autotest:
+		return
+	var win := get_window()
+	var screen := _target_screen()
+	if screen >= 0:
+		# order matters: move while still windowed, then go fullscreen. Setting
+		# the mode first makes the move a no-op on some platforms — the window
+		# already owns the old screen's fullscreen surface.
+		win.current_screen = screen
+		win.mode = Window.MODE_FULLSCREEN
+		print("[pw][display] fullscreen on screen %d/%d %s" % [
+				screen, DisplayServer.get_screen_count(),
+				DisplayServer.screen_get_size(screen)])
+	# whichever screen we ended up on, windowed or not
+	_match_tick_rate(win.current_screen)
+
+
+# Screen to go fullscreen on, or -1 to stay windowed where we are.
+func _target_screen() -> int:
+	var want := OS.get_environment(SCREEN_ENV)
+	if want == "off":
+		return -1
+	var n := DisplayServer.get_screen_count()
+	if want.is_valid_int():
+		var forced := int(want)
+		if forced < 0 or forced >= n:
+			push_warning("%s=%s out of range (%d screen(s)) — staying windowed"
+					% [SCREEN_ENV, want, n])
+			return -1
+		return forced
+	if n < 2:
+		return -1   # single screen: windowed, as before
+	var primary := DisplayServer.get_primary_screen()
+	for i in n:
+		if i != primary:
+			return i
+	return -1
+
+
+# Lockstep rate follows the monitor. The client sends one PW_STATE_IN per
+# physics frame, so this is also the pose update rate — below the refresh it
+# shows as a staircase. It costs CPU (and core work) per tick, so only spend
+# that when the panel can actually display it: a 60 Hz screen stays at the
+# 100 Hz baseline it has always run, a 240 Hz one goes to 240.
+func _match_tick_rate(screen: int) -> void:
+	var pin := OS.get_environment(TICK_ENV)
+	if pin.is_valid_int():
+		var forced := int(pin)
+		if forced > 0:
+			Engine.physics_ticks_per_second = forced
+			print("[pw][display] lockstep pinned to %d Hz" % forced)
+		return   # 0/invalid: leave the project default alone
+	var refresh := DisplayServer.screen_get_refresh_rate(screen)
+	if refresh <= 0.0:
+		return   # some drivers report -1; keep the default rather than guess
+	var hz := clampi(int(round(refresh)), TICK_MIN, TICK_MAX)
+	if hz == Engine.physics_ticks_per_second:
+		return
+	Engine.physics_ticks_per_second = hz
+	print("[pw][display] %.0f Hz screen -> %d Hz lockstep" % [refresh, hz])
 
 
 func _spawn_core() -> void:
@@ -201,10 +283,12 @@ func _physics_process(delta: float) -> void:
 			_angvel = Vector3.ZERO
 		else:
 			# disarmed on the pad: sit still and settle level, don't drift
-			# with physics noise (a real quad just sits there)
+			# with physics noise (a real quad just sits there). The settle
+				# below is frame-rate independent: 0.2 per tick at the original
+				# 100 Hz, same wall-clock rate at 240.
 			_linvel = Vector3.ZERO
 			_angvel = Vector3.ZERO
-			_rot = _rot.slerp(Quaternion.IDENTITY, 0.2)
+			_rot = _rot.slerp(Quaternion.IDENTITY, 1.0 - pow(0.8, delta * 100.0))
 
 	_drone.transform = Transform3D(Basis(_rot), _pos)
 	_spin_props(delta)
@@ -305,6 +389,9 @@ func _unhandled_key_input(event: InputEvent) -> void:
 				_angvel = Vector3.ZERO
 				_throttle = -1.0
 				_armed_sw = false
+				# a teleport, not motion — without this the interpolator
+				# smears the drone from where it was back to the pad
+				_drone.reset_physics_interpolation()
 
 
 func _update_osd(lines: PackedStringArray) -> void:
