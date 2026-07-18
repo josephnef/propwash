@@ -24,6 +24,10 @@ const TIERS := {
 		"ssil": false,               # Forward+ only
 		"volfog": false,             # Forward+ only
 		"trees": 260,
+		# goggle feed: the cheap effects are on at every tier, because the feed
+		# treatment IS the look and must never silently vanish
+		"goggle_block": false,
+		"goggle_rs": 0.0,
 	},
 	"medium": {
 		"msaa": Viewport.MSAA_2X,
@@ -39,6 +43,8 @@ const TIERS := {
 		"ssil": false,
 		"volfog": false,
 		"trees": 900,
+		"goggle_block": true,
+		"goggle_rs": 0.0,
 	},
 	"high": {
 		"msaa": Viewport.MSAA_4X,
@@ -54,6 +60,8 @@ const TIERS := {
 		"ssil": true,
 		"volfog": true,
 		"trees": 1400,
+		"goggle_block": true,
+		"goggle_rs": 1.0,
 	},
 }
 

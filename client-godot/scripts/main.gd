@@ -127,6 +127,38 @@ const WATCHDOG_GRACE := 3.0    # seconds below threshold before acting
 var _wd_low_for := 0.0
 var _wd_fps := 60.0
 
+# DJI O3 goggle-feed treatment (shaders/goggle.gdshader). Set PROPWASH_GOGGLE=off
+# to see the raw render. Effects that are basically free run at every tier — the
+# feed treatment IS the look, so it must not silently disappear on a fast panel.
+const GOGGLE_ENV := "PROPWASH_GOGGLE"
+var _goggle: ColorRect
+var _goggle_mat: ShaderMaterial
+var _block_env := 0.0        # codec stress envelope: fast attack, slow decay
+var _feed_time := 0.0
+
+# Auto-exposure, done analytically rather than with CameraAttributesPractical.
+# That is Forward+-only (so it vanishes under the fallback) and, more to the
+# point, WELL damped — whereas DJI's AE is characteristically under-damped: it
+# overshoots and settles, and that hunt is the recognisable behaviour. Measuring
+# real luminance would mean get_image() every frame, a GPU->CPU stall that would
+# wreck the high-refresh path, so this is computed from sky fraction and sun
+# alignment, both of which are known exactly.
+# Range is deliberately narrow. DJI's AE is good: it keeps the image properly
+# exposed and only hunts a little when the framing swings between ground and
+# sky. A wide range reads as a broken camera, which is what a first attempt at
+# 1.1*sky_frac produced -- it stopped down hard every time the horizon dropped
+# and turned the whole scene navy.
+const AE_OMEGA := 5.0
+const AE_ZETA := 0.55        # under 1.0 -> slight overshoot, then settles
+const AE_BASE := 1.35        # matches the static tonemap_exposure from Stage 1
+const AE_SKY := 0.22         # how much a sky-filled frame stops down
+const AE_SUN := 0.55         # extra stop-down looking near the sun
+var _ae := AE_BASE
+var _ae_vel := 0.0
+var _env: Environment
+var _sun: DirectionalLight3D
+var _cam: Camera3D
+
 # The screen we actually ended up on. Re-reading Window.current_screen after the
 # fullscreen transition reports the primary again on macOS, so both the tick
 # rate and the quality tier read this instead of asking twice.
@@ -334,6 +366,7 @@ func _spawn_core() -> void:
 
 func _process(delta: float) -> void:
 	_watchdog(delta)
+	_update_goggle(delta)
 
 
 func _physics_process(delta: float) -> void:
@@ -892,6 +925,8 @@ func _build_sky_and_sun() -> void:
 	_apply_quality_to_env(e, sun)   # tier-dependent: shadows, glow, ssao, ssil, volfog
 	env.environment = e
 	add_child(env)
+	_env = e      # the exposure hunt drives tonemap_exposure each frame
+	_sun = sun
 
 
 func _build_ground() -> void:
@@ -966,6 +1001,65 @@ func _scatter_trees(mesh: Mesh, count: int, wmin: float, wmax: float, tint: Colo
 	add_child(mmi)
 
 
+func _build_goggle_layer() -> void:
+	if DisplayServer.get_name() == "headless" or _autotest:
+		return   # nothing is rasterised; the tests read stdout
+	if OS.get_environment(GOGGLE_ENV) == "off":
+		return
+	var mat := ShaderMaterial.new()
+	mat.shader = load("res://shaders/goggle.gdshader")
+	mat.set_shader_parameter("block_enable", 1.0 if _q.goggle_block else 0.0)
+	mat.set_shader_parameter("rs_amt", _q.goggle_rs)
+	_goggle_mat = mat
+
+	var rect := ColorRect.new()
+	rect.set_anchors_preset(Control.PRESET_FULL_RECT)
+	rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	rect.material = mat
+	var layer := CanvasLayer.new()
+	layer.layer = 0
+	add_child(layer)
+	layer.add_child(rect)
+	_goggle = rect
+
+
+# Feed the shader what only the sim knows, and run the exposure hunt.
+func _update_goggle(delta: float) -> void:
+	if _goggle_mat == null:
+		return
+	_feed_time += delta
+
+	# Codec stress from angular rate: fast attack, slow decay, so a whip-pan
+	# mushes the frame and it recovers over roughly ten frames — which is what
+	# a real H.264 link does when the bitrate budget blows out.
+	var rate := _angvel.length()
+	var target := clampf((rate - 1.2) / 6.0, 0.0, 1.0)
+	if target > _block_env:
+		_block_env = lerpf(_block_env, target, 0.5)
+	else:
+		_block_env = lerpf(_block_env, target, 0.06)
+
+	_goggle_mat.set_shader_parameter("angvel", _angvel)
+	_goggle_mat.set_shader_parameter("block_strength", _block_env)
+	_goggle_mat.set_shader_parameter("time_seed", _feed_time * 60.0)
+
+	_update_auto_exposure(delta)
+
+
+func _update_auto_exposure(delta: float) -> void:
+	if _env == null or _cam == null or _sun == null:
+		return
+	var fwd := -_cam.global_transform.basis.z
+	var sky_frac := clampf(0.5 + fwd.y * 1.2, 0.0, 1.0)
+	var sun_align := maxf(0.0, fwd.dot(-_sun.global_transform.basis.z))
+	var target := AE_BASE / (1.0 + AE_SKY * sky_frac + AE_SUN * pow(sun_align, 8.0))
+	# under-damped second-order follower -> overshoot then settle, like DJI's AE
+	_ae_vel += (target - _ae) * AE_OMEGA * AE_OMEGA * delta \
+			- 2.0 * AE_ZETA * AE_OMEGA * _ae_vel * delta
+	_ae += _ae_vel * delta
+	_env.tonemap_exposure = clampf(_ae, 0.85, 1.6)
+
+
 func _build_world() -> void:
 	_build_sky_and_sun()
 	_build_ground()
@@ -998,9 +1092,17 @@ func _build_world() -> void:
 	cam.rotation_degrees = Vector3(25, 0, 0)
 	_drone.add_child(cam)
 	cam.current = true
+	_cam = cam
 
-	# HUD
+	# Layer 0: the goggle-feed pass over the 3D render.
+	_build_goggle_layer()
+
+	# Layer 1: OSD and HUD, ABOVE the feed pass and untouched by it. On a real
+	# DJI system the Betaflight OSD is drawn by the goggles from MSP-DisplayPort
+	# data, not encoded into the video, so it is never distorted, blocked,
+	# sharpened or noised — it is crisp at panel resolution.
 	var ui := CanvasLayer.new()
+	ui.layer = 1
 	add_child(ui)
 	_hud = Label.new()
 	_hud.position = Vector2(12, 8)
@@ -1009,14 +1111,18 @@ func _build_world() -> void:
 	_hud.text = "connecting to propwash-core..."
 
 	# OSD overlay — the real Betaflight 16x30 character grid, centered like
-	# FPV goggles. Uses a monospace font so columns line up.
+	# FPV goggles.
 	_osd = Label.new()
 	_osd.set_anchors_preset(Control.PRESET_CENTER)
 	_osd.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_osd.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	_osd.add_theme_font_override("font", ThemeDB.fallback_font)
+	# ThemeDB.fallback_font is PROPORTIONAL despite the old comment here claiming
+	# monospace, so the fixed 16x30 grid never actually lined up into columns.
+	var mono := SystemFont.new()
+	mono.font_names = ["Menlo", "Consolas", "DejaVu Sans Mono", "Courier New", "monospace"]
+	_osd.add_theme_font_override("font", mono)
 	_osd.add_theme_font_size_override("font_size", 20)
 	_osd.add_theme_color_override("font_color", Color(1, 1, 1))
 	_osd.add_theme_color_override("font_outline_color", Color(0, 0, 0))
-	_osd.add_theme_constant_override("outline_size", 4)
+	_osd.add_theme_constant_override("outline_size", 2)   # DJI's is a tight shadow
 	ui.add_child(_osd)
