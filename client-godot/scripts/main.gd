@@ -661,55 +661,199 @@ func _build_drone_model(root: Node3D) -> void:
 
 
 # ------------------------------------------------------------------ world
+const GATE_COLOR := Color(0.85, 0.30, 0.06)
+const GROUND_SIZE := 1000.0   # the flythrough asserts z < -30; the old 60x60
+                              # plane ended exactly there, so the test passed by
+                              # flying off the last polygon
+const WORLD_SEED := 0x9E3779B9   # fixed: the world must be identical every run
+
+# Materials are shared per colour. _add_box used to allocate a fresh BoxMesh AND
+# StandardMaterial3D on every call -- 71 unique pairs for what is really two
+# distinct looks.
+var _mat_cache := {}
+
+
+func _shared_material(color: Color, rough: float, metal: float) -> StandardMaterial3D:
+	var key := "%s|%.2f|%.2f" % [color.to_html(), rough, metal]
+	if _mat_cache.has(key):
+		return _mat_cache[key]
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = color
+	mat.roughness = rough
+	mat.metallic = metal
+	_mat_cache[key] = mat
+	return mat
+
+
 func _add_box(pos: Vector3, size: Vector3, color: Color) -> void:
 	var mi := MeshInstance3D.new()
 	var mesh := BoxMesh.new()
 	mesh.size = size
-	var mat := StandardMaterial3D.new()
-	mat.albedo_color = color
-	mesh.material = mat
+	mesh.material = _shared_material(color, 0.55, 0.0)
 	mi.mesh = mesh
 	mi.position = pos
 	add_child(mi)
 
 
-func _build_world() -> void:
-	# light + sky
+func _build_sky_and_sun() -> void:
+	# Sun lower than the old -55 deg: longer shadows read as shape, and a low sun
+	# is what an evening flying session actually looks like.
 	var sun := DirectionalLight3D.new()
-	sun.rotation_degrees = Vector3(-55, -30, 0)
+	sun.rotation_degrees = Vector3(-42, -35, 0)
+	sun.light_energy = 1.5
+	sun.light_color = Color(1.0, 0.97, 0.92)
 	sun.shadow_enabled = true
+	# shadow_bias defaults to 0.1 -- comparable to the whole 0.11 m airframe, so
+	# the quad had effectively no self-shadowing and peter-panned off the ground
+	sun.shadow_bias = 0.035
+	sun.shadow_normal_bias = 1.5
+	sun.light_angular_distance = 0.5   # real penumbra instead of a hard cut
+	sun.directional_shadow_mode = DirectionalLight3D.SHADOW_PARALLEL_4_SPLITS
+	sun.directional_shadow_blend_splits = true
+	# the quad flies low and close, so bias the cascades hard toward the near field
+	sun.directional_shadow_split_1 = 0.05
+	sun.directional_shadow_split_2 = 0.15
+	sun.directional_shadow_split_3 = 0.40
+	sun.directional_shadow_max_distance = 60.0   # the flight box; beyond it fog carries the scene
+	sun.directional_shadow_fade_start = 0.9
 	add_child(sun)
 
 	var env := WorldEnvironment.new()
 	var e := Environment.new()
+
 	var sky := Sky.new()
-	sky.sky_material = ProceduralSkyMaterial.new()
+	var psm := PhysicalSkyMaterial.new()   # real Rayleigh/Mie, sun disk matches the light
+	psm.rayleigh_coefficient = 2.0
+	psm.mie_coefficient = 0.005
+	psm.mie_eccentricity = 0.8
+	psm.turbidity = 10.0
+	psm.sun_disk_scale = 1.0
+	psm.ground_color = Color(0.22, 0.25, 0.18)
+	# the sky is the brightest thing in a daylit outdoor scene; at 1.0 against a
+	# sunlit field it rendered as dusk-navy with the field over-exposed
+	psm.energy_multiplier = 2.2
+	sky.sky_material = psm
 	e.background_mode = Environment.BG_SKY
 	e.sky = sky
+
+	# sky-sourced ambient AND reflection: nearly free, and it is what stops every
+	# material reading as flat gouraud plastic
+	e.ambient_light_source = Environment.AMBIENT_SOURCE_SKY
+	e.ambient_light_sky_contribution = 1.0
+	e.reflected_light_source = Environment.REFLECTION_SOURCE_SKY
+
+	# Tonemapping is the single biggest item here. The default is LINEAR at
+	# exposure 1.0, which is why everything looked washed out. AgX rolls off
+	# highlights and desaturates near white much closer to what a small-sensor
+	# camera ISP does; ACES tends to crush and over-saturate greens, and this
+	# scene is mostly green.
+	e.tonemap_mode = Environment.TONE_MAPPER_AGX
+	e.tonemap_exposure = 1.35
+	e.tonemap_white = 6.0
+	e.adjustment_enabled = true
+	e.adjustment_contrast = 1.05
+	e.adjustment_saturation = 1.08
+
+	# aerial perspective: the biggest single "outdoor" cue, and it works on every
+	# renderer including the Compatibility fallback
+	e.fog_enabled = true
+	e.fog_mode = Environment.FOG_MODE_DEPTH
+	e.fog_light_color = Color(0.62, 0.70, 0.80)
+	e.fog_light_energy = 1.0
+	e.fog_sun_scatter = 0.2
+	e.fog_depth_begin = 40.0
+	e.fog_depth_end = 520.0
+	e.fog_depth_curve = 1.1
+	e.fog_aerial_perspective = 0.6   # tint by the sky cubemap
+	e.fog_sky_affect = 0.0           # PhysicalSky already has its own haze
+
 	env.environment = e
 	add_child(env)
 
-	# ground: 60x60 checkered
+
+func _build_ground() -> void:
 	var ground := MeshInstance3D.new()
 	var plane := PlaneMesh.new()
-	plane.size = Vector2(60, 60)
-	var gmat := StandardMaterial3D.new()
-	gmat.albedo_color = Color(0.25, 0.45, 0.2)
-	plane.material = gmat
+	plane.size = Vector2(GROUND_SIZE, GROUND_SIZE)
+	# NOTE: deliberately flat and un-displaced. _physics_process owns collision as
+	# a hard `_pos.y <= REST_H` test against y=0, so any visual relief would
+	# desync -- the drone would sink into hills and hover over valleys.
+	var smat := ShaderMaterial.new()
+	smat.shader = load("res://shaders/ground.gdshader")
+	plane.material = smat
 	ground.mesh = plane
 	add_child(ground)
 
-	# grid lines for motion perception
-	for i in range(-30, 31, 2):
-		_add_box(Vector3(i, 0.01, 0), Vector3(0.03, 0.02, 60), Color(0.35, 0.55, 0.3))
-		_add_box(Vector3(0, 0.01, i), Vector3(60, 0.02, 0.03), Color(0.35, 0.55, 0.3))
+
+# A ring of low-poly conifers at 80-300 m in ONE draw call. No assets, and it is
+# the largest single cue that this is a place rather than a plane -- parallax
+# against distant objects is most of what sells outdoor flight.
+func _build_treeline() -> void:
+	# Two species, because a ring of identical cones reads as paper cutouts. Both
+	# use per-instance colour so the band has tonal depth rather than one flat
+	# silhouette. Still one draw call each.
+	var conifer := CylinderMesh.new()
+	conifer.top_radius = 0.0
+	conifer.bottom_radius = 1.0
+	conifer.height = 1.0
+	conifer.radial_segments = 12
+	conifer.rings = 1
+
+	var broadleaf := SphereMesh.new()
+	broadleaf.radius = 0.5
+	broadleaf.height = 1.0
+	broadleaf.radial_segments = 12
+	broadleaf.rings = 7
+
+	_scatter_trees(conifer, 520, 0.26, 0.40, Color(0.150, 0.205, 0.115))
+	_scatter_trees(broadleaf, 380, 0.55, 0.85, Color(0.185, 0.235, 0.125))
+
+
+func _scatter_trees(mesh: Mesh, count: int, wmin: float, wmax: float, tint: Color) -> void:
+	var rng := RandomNumberGenerator.new()
+	rng.seed = WORLD_SEED + count   # fixed: the world must be identical every run
+
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = tint
+	mat.roughness = 0.95
+	mat.vertex_color_use_as_albedo = true
+	mesh.material = mat
+
+	var mm := MultiMesh.new()
+	mm.transform_format = MultiMesh.TRANSFORM_3D
+	mm.use_colors = true
+	mm.mesh = mesh
+	mm.instance_count = count
+	for i in count:
+		var ang := rng.randf() * TAU
+		# denser near the inner edge so it reads as a receding mass, not a ring
+		var rad: float = 95.0 + pow(rng.randf(), 1.7) * 380.0
+		var h := rng.randf_range(5.0, 13.0)
+		var w := h * rng.randf_range(wmin, wmax)
+		var t := Transform3D(Basis.IDENTITY.scaled(Vector3(w, h, w)),
+				Vector3(cos(ang) * rad, h * 0.5, sin(ang) * rad))
+		mm.set_instance_transform(i, t)
+		var v := rng.randf_range(0.72, 1.28)
+		mm.set_instance_color(i, Color(tint.r * v, tint.g * v, tint.b * v * 0.95))
+
+	var mmi := MultiMeshInstance3D.new()
+	mmi.multimesh = mm
+	# 95-475 m out: their shadows are invisible but would pollute every cascade
+	mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	add_child(mmi)
+
+
+func _build_world() -> void:
+	_build_sky_and_sun()
+	_build_ground()
+	_build_treeline()
 
 	# a few gates
 	for i in range(3):
 		var z := -6.0 - i * 8.0
-		_add_box(Vector3(-1.2, 1.0, z), Vector3(0.15, 2.0, 0.15), Color(0.9, 0.4, 0.1))
-		_add_box(Vector3(1.2, 1.0, z), Vector3(0.15, 2.0, 0.15), Color(0.9, 0.4, 0.1))
-		_add_box(Vector3(0, 2.05, z), Vector3(2.55, 0.15, 0.15), Color(0.9, 0.4, 0.1))
+		_add_box(Vector3(-1.2, 1.0, z), Vector3(0.15, 2.0, 0.15), GATE_COLOR)
+		_add_box(Vector3(1.2, 1.0, z), Vector3(0.15, 2.0, 0.15), GATE_COLOR)
+		_add_box(Vector3(0, 2.05, z), Vector3(2.55, 0.15, 0.15), GATE_COLOR)
 
 	# drone + FPV camera
 	_drone = Node3D.new()
@@ -721,7 +865,12 @@ func _build_world() -> void:
 	# just below the view, exactly like real cinewhoop footage.
 	var cam := Camera3D.new()
 	cam.fov = 105
-	cam.near = 0.005
+	# near 0.005 against the default far 4000 was an 800,000:1 depth ratio --
+	# harmless in a 60 m world, severe z-fighting once there is a treeline at
+	# 300 m. Nearest airframe geometry (duct lip / blade tips) is ~0.084 m, so
+	# 0.02 is still 4x clear of it.
+	cam.near = 0.02
+	cam.far = 1500.0
 	cam.position = Vector3(0, 0.045, -0.02)
 	cam.rotation_degrees = Vector3(25, 0, 0)
 	_drone.add_child(cam)
