@@ -61,7 +61,17 @@ jobs:
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-ninja
-            python
+            mingw-w64-x86_64-python
+
+      - name: Resolve python3 (native MinGW python understands D:/ paths)
+        run: |
+          # The MinGW cmake bakes Windows-style script paths (D:/...) into the
+          # ctest commands; MSYS2's /usr/bin/python3 treats those as relative
+          # POSIX paths and mangles them. The native /mingw64 python handles
+          # them. Make sure `python3` resolves to it (it precedes /usr/bin).
+          [ -e /mingw64/bin/python3.exe ] || ln -sf /mingw64/bin/python.exe /mingw64/bin/python3.exe
+          which python3
+          python3 -c "import sys; print(sys.executable)"
 
       - name: Configure & build (MinGW-w64)
         run: |
