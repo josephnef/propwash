@@ -27,17 +27,31 @@ class Cli:
         self.sock.settimeout(0.05)
 
     def _drain(self, settle=0.25):
+        # Return as soon as the CLI prompt ("# ") comes back — the command has
+        # been processed — which throttles the caller so a burst of commands
+        # can't overrun the FC's small serial RX ring. That ring overwrites the
+        # OLDEST unread bytes, so without this flow control a rapid `diff` apply
+        # silently loses its early lines on a slower host (this is exactly why
+        # aux/p_pitch didn't persist on the Windows CI runner while the later
+        # rateprofile lines did). Fall back to the `settle` idle window when
+        # output arrives without a trailing prompt, and cap the total wait so a
+        # `save` that reboots (and never prompts) can't hang.
         out = b""
-        end = time.time() + settle
-        while time.time() < end:
+        hard_end = time.time() + max(settle, 6.0)
+        idle_end = time.time() + settle
+        while time.time() < hard_end:
             try:
                 d = self.sock.recv(4096)
                 if not d:
-                    break
+                    break  # connection closed (e.g. after `save` reboots)
                 out += d
-                end = time.time() + settle  # keep reading while data flows
+                if out.endswith(b"# "):
+                    break  # prompt is back -> command finished
+                idle_end = time.time() + settle
             except socket.timeout:
-                continue  # no data this poll; keep waiting until `settle`
+                if out and time.time() >= idle_end:
+                    break  # got output, then went idle without a prompt
+                continue
         return out.decode(errors="replace")
 
     def enter(self, timeout=8.0):
