@@ -952,10 +952,12 @@ func _build_ground() -> void:
 # meshes, each assembled from overlapping jittered blobs, scattered by its own
 # MultiMesh. Still only TREE_VARIANTS draw calls for the whole treeline.
 const TREE_VARIANTS := 6
+var _leaf_tex: ImageTexture
 const TRUNK_COLOR := Color(0.085, 0.062, 0.045)
 
 
 func _build_treeline() -> void:
+	_leaf_tex = _make_leaf_texture()   # one mask shared by every variant
 	var rng := RandomNumberGenerator.new()
 	rng.seed = WORLD_SEED
 	var per := int(_q.trees / float(TREE_VARIANTS))
@@ -966,47 +968,108 @@ func _build_treeline() -> void:
 		_scatter_trees(mesh, per, 0.30 if conifer else 0.62, tint)
 
 
-# One tree: a tapered trunk plus 3-6 overlapping foliage blobs, each offset,
-# squashed and rotated differently. The overlap is the point — it breaks the
-# primitive silhouette that made the old cone/sphere pair look like clip art.
+# Procedural leaf mask, shared by every tree. Alpha is 0 wherever there is no
+# leaf, so the quad that carries it disappears and only leaf shapes render.
+# Generated rather than shipped: no binary asset, no licence question, no repo
+# weight — the whole reason this approach was chosen over sourcing models.
+const LEAF_TEX_SIZE := 192
+
+
+func _make_leaf_texture() -> ImageTexture:
+	var img := Image.create(LEAF_TEX_SIZE, LEAF_TEX_SIZE, true, Image.FORMAT_RGBA8)
+	var clump := FastNoiseLite.new()
+	clump.seed = WORLD_SEED
+	clump.noise_type = FastNoiseLite.TYPE_SIMPLEX
+	clump.frequency = 0.018
+	clump.fractal_octaves = 3
+	var detail := FastNoiseLite.new()
+	detail.seed = WORLD_SEED + 17
+	detail.noise_type = FastNoiseLite.TYPE_SIMPLEX
+	detail.frequency = 0.075
+
+	var half := LEAF_TEX_SIZE * 0.5
+	for y in LEAF_TEX_SIZE:
+		for x in LEAF_TEX_SIZE:
+			var u := (x - half) / half
+			var v := (y - half) / half
+			var r: float = sqrt(u * u + v * v)
+			var n := clump.get_noise_2d(x, y) * 0.5 + 0.5
+			var d := detail.get_noise_2d(x, y) * 0.5 + 0.5
+			# radial falloff keeps foliage off the card's rectangular edges, so
+			# the quad boundary never becomes visible
+			var mask := n * 0.72 + d * 0.28 - r * 0.62
+			if mask > 0.20:
+				var shade := 0.62 + d * 0.38          # per-leaf tonal break-up
+				img.set_pixel(x, y, Color(shade, shade, shade, 1.0))
+			else:
+				img.set_pixel(x, y, Color(0, 0, 0, 0))
+	img.generate_mipmaps()
+	return ImageTexture.create_from_image(img)
+
+
+# One tree: a tapered trunk plus a stack of alpha-cut foliage cards. Each card is
+# a flat quad; the leaf mask discards everything that is not a leaf, so the
+# silhouette comes out ragged and porous with sky visible through the gaps. That
+# porous outline is what actually reads as foliage — a solid blob never will,
+# regardless of how many blobs you overlap.
 func _make_tree_mesh(rng: RandomNumberGenerator, conifer: bool) -> ArrayMesh:
 	var foliage := SurfaceTool.new()
 	foliage.begin(Mesh.PRIMITIVE_TRIANGLES)
 
-	var blobs := rng.randi_range(3, 5) if conifer else rng.randi_range(3, 6)
-	for i in blobs:
-		var t := float(i) / float(maxi(blobs - 1, 1))   # 0 at base, 1 at tip
-		var src: Mesh
-		if conifer:
-			var cone := CylinderMesh.new()
-			cone.top_radius = 0.0
-			cone.bottom_radius = 1.0
-			cone.height = 1.0
-			cone.radial_segments = 9
-			cone.rings = 1
-			src = cone
-		else:
-			var sph := SphereMesh.new()
-			sph.radius = 0.5
-			sph.height = 1.0
-			sph.radial_segments = 9
-			sph.rings = 5
-			src = sph
+	var card := PlaneMesh.new()
+	card.orientation = PlaneMesh.FACE_Z   # vertical quad
+	card.size = Vector2(1.0, 1.0)
 
-		# conifers taper toward the tip; broadleaf clusters bunch near the crown
-		var w: float = lerpf(1.0, 0.35, t) if conifer else rng.randf_range(0.55, 1.0)
-		var h: float = lerpf(0.55, 0.40, t) if conifer else rng.randf_range(0.45, 0.75)
-		var y: float = lerpf(0.38, 1.00, t) if conifer else rng.randf_range(0.50, 0.95)
-		var jitter := Vector3(rng.randf_range(-0.16, 0.16), 0.0,
-				rng.randf_range(-0.16, 0.16)) * (0.4 if conifer else 1.0)
-		var basis := Basis(Vector3.UP, rng.randf() * TAU).scaled(Vector3(w, h, w))
-		foliage.append_from(src, 0, Transform3D(basis, Vector3(0, y, 0) + jitter))
+	# Alpha-tested foliage is overdraw-heavy — each card shades every fragment it
+	# covers whether or not the leaf mask keeps it, and the cards are two-sided.
+	# Card count is therefore the main foliage cost knob, tiered.
+	var base: int = _q.leaf_cards
+	var cards := rng.randi_range(base, base + 4)
+	for i in cards:
+		var t := float(i) / float(maxi(cards - 1, 1))   # 0 at base, 1 at tip
+		# conifers: cards shrink toward a point and droop. broadleaf: cards fill
+		# a rough ellipsoid crown.
+		var w: float
+		var y: float
+		var tilt: float
+		if conifer:
+			w = lerpf(1.15, 0.34, t) * rng.randf_range(0.9, 1.1)
+			y = lerpf(0.32, 1.02, t) + rng.randf_range(-0.04, 0.04)
+			tilt = rng.randf_range(0.06, 0.20)          # gentle branch droop
+		else:
+			w = rng.randf_range(0.72, 1.05)
+			y = rng.randf_range(0.46, 1.00)
+			tilt = rng.randf_range(-0.18, 0.18)
+		# Golden-angle yaw rather than random. Random leaves whole directions
+		# bare, and a card seen edge-on is a thin line -- several of those
+		# aligning is what produced the diagonal streaks and the false "every
+		# tree leans the same way" read.
+		var yaw := float(i) * 2.39996 + rng.randf_range(-0.25, 0.25)
+		# push cards off-axis so the crown has volume rather than all planes
+		# crossing at the trunk
+		var off := Vector3(cos(yaw + 1.2), 0.0, sin(yaw + 1.2)) \
+				* rng.randf_range(0.0, 0.22) * w
+		var basis := Basis(Vector3.UP, yaw) * Basis(Vector3.RIGHT, tilt)
+		foliage.append_from(card, 0,
+				Transform3D(basis.scaled(Vector3(w, w * 0.78, w)), Vector3(0, y, 0) + off))
 
 	foliage.generate_normals()
 	var mesh: ArrayMesh = foliage.commit()
 	var fmat := StandardMaterial3D.new()
-	fmat.albedo_color = Color(0.42, 0.46, 0.34)   # multiplies the instance tint
+	fmat.albedo_texture = _leaf_tex
+	fmat.albedo_color = Color(0.52, 0.56, 0.42)   # multiplies the instance tint
 	fmat.roughness = 0.95
+	# Alpha SCISSOR, not blend: blended foliage needs depth sorting, which at
+	# 105 deg FOV across ~900 instances is both wrong and expensive. Scissor just
+	# discards the fragment. Alpha-to-coverage keeps the cut edges from crawling
+	# once MSAA is on.
+	fmat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA_SCISSOR
+	fmat.alpha_scissor_threshold = 0.5
+	# alpha-to-coverage resolves per MSAA sample, so it only helps (and only
+	# costs) when MSAA is actually on -- pointless on the low tier
+	if _q.msaa != Viewport.MSAA_DISABLED:
+		fmat.alpha_antialiasing_mode = BaseMaterial3D.ALPHA_ANTIALIASING_ALPHA_TO_COVERAGE
+	fmat.cull_mode = BaseMaterial3D.CULL_DISABLED   # cards are visible both sides
 	fmat.vertex_color_use_as_albedo = true   # per-instance tint varies the band
 	mesh.surface_set_material(0, fmat)
 

@@ -12,7 +12,7 @@ extends RefCounted
 const TIERS := {
 	"low": {
 		"msaa": Viewport.MSAA_DISABLED,
-		"scale_3d": 0.72,           # the single biggest fill-rate lever
+		"scale_3d": 0.66,           # the single biggest fill-rate lever
 		"shadow_atlas": 2048,
 		"shadow_filter": RenderingServer.SHADOW_QUALITY_HARD,
 		"shadow_splits": DirectionalLight3D.SHADOW_PARALLEL_2_SPLITS,
@@ -23,11 +23,12 @@ const TIERS := {
 		"ssao": false,               # Forward+ only
 		"ssil": false,               # Forward+ only
 		"volfog": false,             # Forward+ only
-		"trees": 260,
+		"trees": 190,
 		# goggle feed: the cheap effects are on at every tier, because the feed
 		# treatment IS the look and must never silently vanish
 		"goggle_block": false,
 		"goggle_rs": 0.0,
+		"leaf_cards": 7,
 	},
 	"medium": {
 		"msaa": Viewport.MSAA_2X,
@@ -45,6 +46,7 @@ const TIERS := {
 		"trees": 900,
 		"goggle_block": true,
 		"goggle_rs": 0.0,
+		"leaf_cards": 14,
 	},
 	"high": {
 		"msaa": Viewport.MSAA_4X,
@@ -62,6 +64,7 @@ const TIERS := {
 		"trees": 1400,
 		"goggle_block": true,
 		"goggle_rs": 1.0,
+		"leaf_cards": 20,
 	},
 }
 
