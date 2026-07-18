@@ -20,24 +20,58 @@ import time
 
 
 class Cli:
-    def __init__(self, host="127.0.0.1", port=5761, timeout=2.0):
-        self.sock = socket.create_connection((host, port), timeout=timeout)
+    def __init__(self, host="127.0.0.1", port=5761, timeout=2.0, connect_timeout=12.0):
+        # Retry the connection: a freshly spawned core needs a moment to boot
+        # BF and bind the CLI port, and booting from a baked eeprom (the real
+        # tune) is slower still — enough that a single attempt times out on a
+        # slow host (the Windows CI runner). Retry until it accepts or we give
+        # up, so callers don't have to guess a fixed startup sleep.
+        deadline = time.time() + connect_timeout
+        while True:
+            try:
+                self.sock = socket.create_connection((host, port), timeout=timeout)
+                break
+            except OSError:
+                if time.time() >= deadline:
+                    raise
+                time.sleep(0.2)
         # short recv timeout so _drain polls at the settle granularity rather
         # than blocking for the whole connection timeout after the last byte
         self.sock.settimeout(0.05)
 
     def _drain(self, settle=0.25):
+        # Return as soon as the CLI prompt ("# ") comes back — the command has
+        # been processed — which throttles the caller so a burst of commands
+        # can't overrun the FC's small serial RX ring. That ring overwrites the
+        # OLDEST unread bytes, so without this flow control a rapid `diff` apply
+        # silently loses its early lines on a slower host (this is exactly why
+        # aux/p_pitch didn't persist on the Windows CI runner while the later
+        # rateprofile lines did). Fall back to the `settle` idle window when
+        # output arrives without a trailing prompt, and cap the total wait so a
+        # `save` that reboots (and never prompts) can't hang.
         out = b""
-        end = time.time() + settle
-        while time.time() < end:
+        # The prompt is the primary signal. The idle fallback must be generous:
+        # on a slow host (Windows CI) the response trickles in chunks, and a
+        # short idle would fire mid-trickle — returning before the prompt and
+        # defeating the flow control, which is exactly what dropped the early
+        # diff lines. 2 s of true silence means the command produced no prompt
+        # (e.g. `save`, which reboots without one).
+        idle = max(settle, 2.0)
+        hard_end = time.time() + max(settle, 12.0)
+        idle_end = time.time() + idle
+        while time.time() < hard_end:
             try:
                 d = self.sock.recv(4096)
                 if not d:
-                    break
+                    break  # connection closed (e.g. after `save` reboots)
                 out += d
-                end = time.time() + settle  # keep reading while data flows
+                if out.endswith(b"# "):
+                    break  # prompt is back -> command finished
+                idle_end = time.time() + idle  # reset idle window on any data
             except socket.timeout:
-                continue  # no data this poll; keep waiting until `settle`
+                if time.time() >= idle_end:
+                    break  # genuinely idle without a prompt
+                continue
         return out.decode(errors="replace")
 
     def enter(self, timeout=8.0):
@@ -45,19 +79,19 @@ class Cli:
         # `save` the FC reboots (re-runs init + gyro calibration) and doesn't
         # service the serial port for a moment; on a slow host (e.g. CI) the
         # banner can lag well past a single fixed drain, so poll for the "# "
-        # prompt and re-poke '#' periodically in case it was dropped mid-reboot.
-        # A stray '#' at an existing CLI prompt is harmless (just echoed).
+        # prompt. Send '#' ONCE and only re-poke after a long gap: on a slow
+        # host (Windows CI) an every-0.5 s re-poke queues several extra '# '
+        # prompts, and each later cmd() then reads a STALE prompt and returns
+        # early — defeating the flow control and dropping commands. After the
+        # banner, flush any trailing bytes so the next command starts aligned.
         out = b""
         end = time.time() + timeout
-        last_poke = 0.0
+        try:
+            self.sock.sendall(b"#\r\n")
+        except OSError:
+            return ""
+        last_poke = time.time()
         while time.time() < end:
-            now = time.time()
-            if now - last_poke > 0.5:
-                try:
-                    self.sock.sendall(b"#\r\n")
-                except OSError:
-                    break
-                last_poke = now
             try:
                 d = self.sock.recv(4096)
                 if not d:
@@ -66,8 +100,28 @@ class Cli:
                 if b"# " in out:            # CLI prompt reached — ready
                     break
             except socket.timeout:
+                if time.time() - last_poke > 3.0:  # rare: first '#' was dropped
+                    try:
+                        self.sock.sendall(b"#\r\n")
+                    except OSError:
+                        break
+                    last_poke = time.time()
                 continue
+        self._flush()
         return out.decode(errors="replace")
+
+    def _flush(self):
+        # Read and discard anything still pending (duplicate prompts, late
+        # banner bytes) until the link goes quiet, so the next command's
+        # response can't be confused with leftovers.
+        end = time.time() + 0.6
+        while time.time() < end:
+            try:
+                if not self.sock.recv(4096):
+                    break
+                end = time.time() + 0.3
+            except socket.timeout:
+                break
 
     def cmd(self, line, settle=0.25):
         self.sock.sendall(line.encode() + b"\r\n")

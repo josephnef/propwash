@@ -47,9 +47,10 @@ list(APPEND BF_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/betaflightext/src/main/drivers/serial_tcp.c"
 )
 
-if(APPLE)
-  # macOS links the BF lib without dead-stripping (see BF_LINK_OPTIONS below),
-  # so the dead reference GNU --gc-sections prunes on Linux stays and needs a
+if(APPLE OR WIN32)
+  # The dead reference GNU --gc-sections prunes on Linux (gyro_init.c's unused
+  # gyroReadRegister -> mpuGyroReadRegister) survives on macOS (no dead-strip)
+  # and on MinGW (--gc-sections doesn't prune it there), so provide a no-op
   # stub. See pw_stubs.c for the full rationale.
   list(APPEND BF_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/betaflightext/src/main/pw_stubs.c")
@@ -84,6 +85,28 @@ target_include_directories(bf_sitl PUBLIC
   "${BF_ROOT}/src/main/scheduler"
   "${BF_ROOT}/src/main/cli"
 )
+
+if(WIN32)
+  # MinGW-w64 has no <netinet/in.h>; serial_tcp.h includes it vestigially. This
+  # shim dir satisfies the include (forwarding to Winsock) — Windows only, so
+  # POSIX builds keep the real header.
+  target_include_directories(bf_sitl PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/betaflightext/src/main/compat")
+  # dyad.h wrapper: must precede the stock lib/main/dyad so "dyad.h" resolves
+  # to it; it #include_next's the stock header then undefs the Windows baud
+  # macros that clash with baudRate_e.
+  target_include_directories(bf_sitl BEFORE PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/betaflightext/src/main/compat/dyad")
+  # Force-include a compat header supplying POSIX/GNU libc bits MinGW lacks
+  # (ffs, string.h, ...). SHELL: keeps the two tokens together, un-deduplicated.
+  target_compile_options(bf_sitl PRIVATE
+    "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/betaflightext/src/main/compat/pw_win_compat.h")
+  # Winsock: dyad (in this lib) and the UDP server (in pw_sim, which links this
+  # PUBLIC) call it. Declaring it as a PUBLIC dependency here — rather than a
+  # bare -lws2_32 in BF_LINK_OPTIONS — lets CMake order it correctly after the
+  # referencing objects (a raw flag can land before bf_sitl and get dropped).
+  target_link_libraries(bf_sitl PUBLIC ws2_32)
+endif()
 
 target_compile_options(bf_sitl PRIVATE
   -std=gnu17
@@ -123,6 +146,17 @@ if(APPLE)
   # (real-time calls live in libSystem here); pthreads are too.
   set(BF_LINK_OPTIONS
     -lm
+    PARENT_SCOPE
+  )
+elseif(WIN32)
+  # MinGW-w64 GNU ld: same pg.ld linker script as Linux (it already handles the
+  # PE page-alignment case). winpthreads (-lpthread) for the tcp worker; no -lrt
+  # (in the MinGW CRT). Winsock (ws2_32) is a PUBLIC dep of bf_sitl (above), so
+  # it flows to consumers in the right link order.
+  set(BF_LINK_OPTIONS
+    "-T${BF_ROOT}/src/main/target/SITL/pg.ld"
+    "-Wl,--gc-sections"
+    -lm -lpthread
     PARENT_SCOPE
   )
 else()

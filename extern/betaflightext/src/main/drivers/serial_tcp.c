@@ -149,7 +149,17 @@ static tcpPort_t* tcpReconfigure(tcpPort_t *s, int id)
     dyad_setNoDelay(s->serv, 1);
     dyad_addListener(s->serv, DYAD_EVENT_ACCEPT, onAccept, s);
 
-    int listenErr = dyad_listenEx(s->serv, NULL, BASE_PORT + id + 1, 10);
+    // propwash: bind host. On Windows getaddrinfo(NULL, ...) returns IPv6
+    // first, and IPv6 sockets are v6-only by default (IPV6_V6ONLY), so a NULL
+    // host makes dyad bind [::]:port and REFUSE the IPv4 127.0.0.1 that the
+    // Configurator, pw_cli.py and the tests connect to. Bind IPv4 explicitly
+    // there; elsewhere keep the stock all-interfaces (NULL) behaviour.
+#if defined(_WIN32)
+    const char *bindHost = "0.0.0.0";
+#else
+    const char *bindHost = NULL;
+#endif
+    int listenErr = dyad_listenEx(s->serv, bindHost, BASE_PORT + id + 1, 10);
     pw_dyad_unlock();
     if (listenErr == 0) {
         fprintf(stderr, "bind port %u for UART%u\n", (unsigned)BASE_PORT + id + 1, (unsigned)id + 1);

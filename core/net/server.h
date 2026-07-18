@@ -31,7 +31,9 @@ class Server {
   private:
     void sendTo(const void* payload, uint16_t len, uint8_t type);
 
-    int mFd = -1;
+    // Holds a POSIX fd (int) or a Windows SOCKET (UINT_PTR). intptr_t fits
+    // both, and INVALID_SOCKET (~0) lands as -1, so `< 0` stays the error test.
+    intptr_t mFd = -1;
     // last known client
     uint32_t mClientAddr = 0;
     uint16_t mClientPort = 0;
