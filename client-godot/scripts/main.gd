@@ -865,7 +865,7 @@ func _build_sky_and_sun() -> void:
 	# shadow_bias defaults to 0.1 -- comparable to the whole 0.11 m airframe, so
 	# the quad had effectively no self-shadowing and peter-panned off the ground
 	sun.shadow_bias = 0.035
-	sun.shadow_normal_bias = 1.5
+	sun.shadow_normal_bias = 2.4
 	# the quad flies low and close, so bias the cascades hard toward the near field
 	sun.directional_shadow_split_1 = 0.05
 	sun.directional_shadow_split_2 = 0.15
@@ -1129,6 +1129,111 @@ func _scatter_trees(mesh: Mesh, count: int, width: float, tint: Color) -> void:
 	add_child(mmi)
 
 
+# ------------------------------------------------------------------ gates
+# Geometry the flythrough depends on: uprights at x = +/-GATE_HALF, top bar at
+# GATE_H, and the demo cruises through at GATE_ALT (1.0 m). The opening must stay
+# clear -- decoration goes outside it, never across it.
+const GATE_HALF := 1.2
+const GATE_H := 2.05
+const TUBE_R := 0.055
+const GATE_STRIPE_PX := 64
+
+var _gate_tube_mat: StandardMaterial3D
+var _gate_foot_mat: StandardMaterial3D
+
+
+# Hazard banding, generated rather than shipped: alternating safety-orange and
+# off-white along the tube axis, the way real race-gate poles are taped.
+func _make_stripe_texture() -> ImageTexture:
+	var img := Image.create(8, GATE_STRIPE_PX, false, Image.FORMAT_RGBA8)
+	for y in GATE_STRIPE_PX:
+		# 4 bands over the tile; slight tonal noise so it is not perfectly flat
+		var band := int(floor(y / float(GATE_STRIPE_PX) * 2.0)) % 2
+		var c := Color(0.85, 0.30, 0.06) if band == 0 else Color(0.88, 0.87, 0.84)
+		for x in 8:
+			var j := 1.0 + (sin(float(y) * 2.3 + float(x)) * 0.02)
+			img.set_pixel(x, y, Color(c.r * j, c.g * j, c.b * j, 1.0))
+	img.generate_mipmaps()
+	return ImageTexture.create_from_image(img)
+
+
+func _gate_materials() -> void:
+	if _gate_tube_mat != null:
+		return
+	_gate_tube_mat = StandardMaterial3D.new()
+	_gate_tube_mat.albedo_texture = _make_stripe_texture()
+	# powder-coated tube: not a mirror, but it catches the sky, which is most of
+	# what separates "real object" from "flat orange box"
+	_gate_tube_mat.roughness = 0.38
+	_gate_tube_mat.metallic = 0.0
+	_gate_tube_mat.uv1_scale = Vector3(1.0, 1.0, 1.0)
+
+	_gate_foot_mat = StandardMaterial3D.new()
+	_gate_foot_mat.albedo_color = Color(0.07, 0.07, 0.08)
+	_gate_foot_mat.roughness = 0.75
+
+
+func _add_tube(parent: Node3D, from: Vector3, to: Vector3, radius: float) -> void:
+	var mesh := CylinderMesh.new()
+	mesh.top_radius = radius
+	mesh.bottom_radius = radius
+	mesh.height = from.distance_to(to)
+	mesh.radial_segments = 12      # round profile; a box silhouette reads as CG
+	mesh.rings = 1
+	# repeat the banding along the tube rather than stretching one tile over it
+	# tile the banding at a fixed world size (~22 cm per band) instead of
+	# stretching one tile over the whole tube, which read as half orange /
+	# half white rather than striped
+	var mat: StandardMaterial3D = _gate_tube_mat.duplicate()
+	mat.uv1_scale = Vector3(1.0, maxf(1.0, mesh.height / 0.44), 1.0)
+	mesh.material = mat
+	var mi := MeshInstance3D.new()
+	mi.mesh = mesh
+	mi.position = (from + to) * 0.5
+	# CylinderMesh runs along +Y; rotate that onto the segment direction
+	var dir := (to - from).normalized()
+	if absf(dir.dot(Vector3.UP)) < 0.999:
+		var axis := Vector3.UP.cross(dir).normalized()
+		mi.rotate(axis, Vector3.UP.angle_to(dir))
+	parent.add_child(mi)
+
+
+func _build_gate(z: float, idx: int) -> void:
+	_gate_materials()
+	var rng := RandomNumberGenerator.new()
+	rng.seed = WORLD_SEED + idx * 131   # deterministic per-gate variation
+
+	var gate := Node3D.new()
+	gate.position = Vector3(0, 0, z)
+	gate.rotate_y(rng.randf_range(-0.05, 0.05))   # nothing on a field is square
+	add_child(gate)
+
+	# uprights and top bar -- the opening itself, unchanged from the box version
+	_add_tube(gate, Vector3(-GATE_HALF, 0.0, 0), Vector3(-GATE_HALF, GATE_H, 0), TUBE_R)
+	_add_tube(gate, Vector3(GATE_HALF, 0.0, 0), Vector3(GATE_HALF, GATE_H, 0), TUBE_R)
+	_add_tube(gate, Vector3(-GATE_HALF - TUBE_R, GATE_H, 0),
+			Vector3(GATE_HALF + TUBE_R, GATE_H, 0), TUBE_R)
+
+	# corner braces: short diagonals just under the top bar. Outside the flight
+	# line, and they stop the frame reading as three disconnected sticks.
+	var brace := 0.34
+	_add_tube(gate, Vector3(-GATE_HALF, GATE_H - brace, 0),
+			Vector3(-GATE_HALF + brace, GATE_H, 0), TUBE_R * 0.6)
+	_add_tube(gate, Vector3(GATE_HALF, GATE_H - brace, 0),
+			Vector3(GATE_HALF - brace, GATE_H, 0), TUBE_R * 0.6)
+
+	# feet: a gate standing on nothing is one of the strongest "floating CG"
+	# cues, and these also ground it against the shadow
+	for sx in [-1.0, 1.0]:
+		var foot := MeshInstance3D.new()
+		var fm := BoxMesh.new()
+		fm.size = Vector3(0.34, 0.045, 0.30)
+		fm.material = _gate_foot_mat
+		foot.mesh = fm
+		foot.position = Vector3(sx * GATE_HALF, 0.022, 0)
+		gate.add_child(foot)
+
+
 func _build_goggle_layer() -> void:
 	if DisplayServer.get_name() == "headless" or _autotest:
 		return   # nothing is rasterised; the tests read stdout
@@ -1193,12 +1298,8 @@ func _build_world() -> void:
 	_build_ground()
 	_build_treeline()
 
-	# a few gates
 	for i in range(3):
-		var z := -6.0 - i * 8.0
-		_add_box(Vector3(-1.2, 1.0, z), Vector3(0.15, 2.0, 0.15), GATE_COLOR)
-		_add_box(Vector3(1.2, 1.0, z), Vector3(0.15, 2.0, 0.15), GATE_COLOR)
-		_add_box(Vector3(0, 2.05, z), Vector3(2.55, 0.15, 0.15), GATE_COLOR)
+		_build_gate(-6.0 - i * 8.0, i)
 
 	# drone + FPV camera
 	_drone = Node3D.new()
