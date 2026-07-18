@@ -43,6 +43,39 @@ jobs:
           # the Godot client tests need a godot binary; run everything else
           ctest --test-dir build --output-on-failure -E 'godot_client|flythrough'
 
+  build-and-test-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            python
+
+      - name: Configure & build (MinGW-w64)
+        run: |
+          # Ninja generator: avoids the "MinGW Makefiles" gen's refusal to run
+          # with sh.exe on PATH (the MSYS2 shell always has it). BF's SITL
+          # target links via GNU ld + the pg.ld linker script, same as Linux;
+          # the UDP server + serial_tcp use Winsock (-lws2_32, guarded code).
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build build -j"$(nproc)"
+
+      - name: Core tests (headless, no GPU / no joystick)
+        run: |
+          ctest --test-dir build --output-on-failure -E 'godot_client|flythrough'
+
   godot-client:
     strategy:
       fail-fast: false

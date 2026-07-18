@@ -85,6 +85,14 @@ target_include_directories(bf_sitl PUBLIC
   "${BF_ROOT}/src/main/cli"
 )
 
+if(WIN32)
+  # MinGW-w64 has no <netinet/in.h>; serial_tcp.h includes it vestigially. This
+  # shim dir satisfies the include (forwarding to Winsock) — Windows only, so
+  # POSIX builds keep the real header.
+  target_include_directories(bf_sitl PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/betaflightext/src/main/compat")
+endif()
+
 target_compile_options(bf_sitl PRIVATE
   -std=gnu17
   -Wall -Wextra
@@ -123,6 +131,16 @@ if(APPLE)
   # (real-time calls live in libSystem here); pthreads are too.
   set(BF_LINK_OPTIONS
     -lm
+    PARENT_SCOPE
+  )
+elseif(WIN32)
+  # MinGW-w64 GNU ld: same pg.ld linker script as Linux (it already handles the
+  # PE page-alignment case). Winsock (-lws2_32) for dyad + the UDP server;
+  # winpthreads (-lpthread) for the tcp worker. No -lrt (in the MinGW CRT).
+  set(BF_LINK_OPTIONS
+    "-T${BF_ROOT}/src/main/target/SITL/pg.ld"
+    "-Wl,--gc-sections"
+    -lm -lpthread -lws2_32
     PARENT_SCOPE
   )
 else()

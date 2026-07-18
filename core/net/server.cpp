@@ -4,10 +4,23 @@
 #include <cstring>
 #include <string>
 
+#if defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <basetsd.h>
+// dyad also uses Winsock; WSAStartup is refcounted so both can init/cleanup.
+// The Winsock headers don't pull in POSIX ssize_t; define it (guarded by
+// MinGW's own macro so we don't clash if <sys/types.h> already provided it).
+#ifndef _SSIZE_T_DEFINED
+#define _SSIZE_T_DEFINED
+typedef SSIZE_T ssize_t;
+#endif
+#else
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#endif
 
 #include "sim/profile_cinelog35.h"
 #include "sim/util/vector_math.h"
@@ -47,6 +60,14 @@ static std::string armingBlockReason(uint32_t flags)
 
 bool Server::start(uint16_t port)
 {
+#if defined(_WIN32)
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        fprintf(stderr, "[pw][net] WSAStartup failed\n");
+        return false;
+    }
+#endif
+
     mFd = socket(AF_INET, SOCK_DGRAM, 0);
     if (mFd < 0) {
         perror("[pw][net] socket");
@@ -64,8 +85,14 @@ bool Server::start(uint16_t port)
 
     // short recv timeout: when idle (no client), the loop still ticks the
     // firmware so MSP/CLI/Configurator stays responsive (5 ms ~= 200 Hz)
+#if defined(_WIN32)
+    // Winsock's SO_RCVTIMEO takes a DWORD of milliseconds, not a timeval.
+    DWORD tv = 5;
+    setsockopt(mFd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+#else
     timeval tv {0, 5000};
     setsockopt(mFd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
 
     printf("[pw][net] protocol server on udp:%u\n", port);
     return true;
