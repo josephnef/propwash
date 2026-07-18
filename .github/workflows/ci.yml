@@ -90,17 +90,24 @@ jobs:
           echo "=== core stderr ==="; cat core.err || true
           echo "=== core stdout ==="; cat core.out || true
           echo "=== listening sockets (5761/9100) ==="; netstat -an | grep -E '5761|9100' || echo "(none listening)"
-          echo "=== connect probe ==="
+          echo "=== set/get/save probe ==="
           python3 - <<'PY'
           import socket, time
-          for host in ("127.0.0.1", "::1"):
+          def rd(s, t=1.5):
+              s.settimeout(t); buf=b""
               try:
-                  s = socket.create_connection((host, 5761), timeout=3)
-                  s.sendall(b"#\r\n"); time.sleep(0.4)
-                  print(f"{host}: connected, recv={s.recv(200)!r}")
-                  s.close()
-              except Exception as e:
-                  print(f"{host}: {type(e).__name__}: {e}")
+                  while True:
+                      d=s.recv(4096)
+                      if not d: break
+                      buf+=d
+                      if buf.endswith(b"# "): break
+              except socket.timeout: pass
+              return buf
+          s = socket.create_connection(("127.0.0.1", 5761), timeout=3)
+          s.sendall(b"#\r\n");                 print("enter:", rd(s)[-60:])
+          s.sendall(b"set p_pitch = 99\r\n");  print("set:  ", rd(s)[-80:])
+          s.sendall(b"get p_pitch\r\n");       print("get:  ", rd(s)[-80:])
+          s.close()
           PY
           kill $CPID 2>/dev/null || true
 
