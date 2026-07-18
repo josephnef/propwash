@@ -82,6 +82,28 @@ jobs:
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
           cmake --build build -j"$(nproc)"
 
+      - name: DIAG core TCP CLI (temporary)
+        run: |
+          ./build/propwash-core.exe --server --no-js >core.out 2>core.err &
+          CPID=$!
+          sleep 4
+          echo "=== core stderr ==="; cat core.err || true
+          echo "=== core stdout ==="; cat core.out || true
+          echo "=== listening sockets (5761/9100) ==="; netstat -an | grep -E '5761|9100' || echo "(none listening)"
+          echo "=== connect probe ==="
+          python3 - <<'PY'
+          import socket, time
+          for host in ("127.0.0.1", "::1"):
+              try:
+                  s = socket.create_connection((host, 5761), timeout=3)
+                  s.sendall(b"#\r\n"); time.sleep(0.4)
+                  print(f"{host}: connected, recv={s.recv(200)!r}")
+                  s.close()
+              except Exception as e:
+                  print(f"{host}: {type(e).__name__}: {e}")
+          PY
+          kill $CPID 2>/dev/null || true
+
       - name: Core tests (headless, no GPU / no joystick)
         run: |
           ctest --test-dir build --output-on-failure -E 'godot_client|flythrough'
