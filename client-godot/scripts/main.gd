@@ -90,6 +90,14 @@ var _shot_dir := ""
 var _shots_taken := {}
 var _shot_times := [3.0, 8.0, 12.0, 16.0]
 
+# multi-monitor: with a second screen attached, fly fullscreen on it and leave
+# the primary free for the Configurator / CLI / logs — the usual bench setup.
+# Borderless (MODE_FULLSCREEN), not macOS's native fullscreen Space, which
+# would shunt the sim onto its own Space and animate on every focus change.
+#   PROPWASH_SCREEN=off   stay windowed on the primary (old behaviour)
+#   PROPWASH_SCREEN=2     force a screen index (0-based)
+const SCREEN_ENV := "PROPWASH_SCREEN"
+
 
 func _ready() -> void:
 	_autotest = OS.get_environment("PROPWASH_AUTOTEST") == "1"
@@ -99,6 +107,7 @@ func _ready() -> void:
 		# capture through the whole gate run
 		_shot_times = [4.0, 7.0, 9.0, 11.0, 13.0, 15.0, 17.0, 19.0]
 	_parse_js_env()
+	_setup_display()
 	_build_world()
 	_spawn_core()
 	_udp.connect_to_host("127.0.0.1", CORE_PORT)
@@ -107,6 +116,48 @@ func _ready() -> void:
 func _exit_tree() -> void:
 	if _core_pid > 0:
 		OS.kill(_core_pid)
+
+
+func _setup_display() -> void:
+	# --headless has no real DisplayServer, and the autotests assert on stdout,
+	# not pixels — never grab a screen out from under them.
+	if DisplayServer.get_name() == "headless" or _autotest:
+		return
+	var want := OS.get_environment(SCREEN_ENV)
+	if want == "off":
+		return
+	var n := DisplayServer.get_screen_count()
+	var screen := -1
+	if want.is_valid_int():
+		screen = int(want)
+		if screen < 0 or screen >= n:
+			push_warning("%s=%s out of range (%d screen(s)) — staying windowed"
+					% [SCREEN_ENV, want, n])
+			return
+	else:
+		screen = _secondary_screen()
+		if screen < 0:
+			return   # single screen: windowed, as before
+	var win := get_window()
+	# order matters: move while still windowed, then go fullscreen. Setting the
+	# mode first makes the move a no-op on some platforms — the window already
+	# owns the old screen's fullscreen surface.
+	win.current_screen = screen
+	win.mode = Window.MODE_FULLSCREEN
+	print("[pw][display] fullscreen on screen %d/%d %s" % [
+			screen, n, DisplayServer.screen_get_size(screen)])
+
+
+# First screen that isn't the primary, or -1 when only one is attached.
+func _secondary_screen() -> int:
+	var n := DisplayServer.get_screen_count()
+	if n < 2:
+		return -1
+	var primary := DisplayServer.get_primary_screen()
+	for i in n:
+		if i != primary:
+			return i
+	return -1
 
 
 func _spawn_core() -> void:

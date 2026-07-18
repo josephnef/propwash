@@ -117,6 +117,9 @@ The Godot client spawns `build/propwash-core` itself. Controls:
 - **Betaflight Configurator** connects any time to TCP `127.0.0.1:5761` (MSP/CLI)
   and tunes it live.
 - The **real Betaflight OSD** is overlaid on the FPV view.
+- **Second monitor** — if one is attached the sim opens fullscreen on it, leaving
+  the primary free for the Configurator and logs. Override with
+  `PROPWASH_SCREEN=off` (stay windowed) or `PROPWASH_SCREEN=<index>` (0-based).
 
 ### Loading the pilot's real tune
 
