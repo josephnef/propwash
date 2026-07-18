@@ -47,9 +47,10 @@ list(APPEND BF_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/betaflightext/src/main/drivers/serial_tcp.c"
 )
 
-if(APPLE)
-  # macOS links the BF lib without dead-stripping (see BF_LINK_OPTIONS below),
-  # so the dead reference GNU --gc-sections prunes on Linux stays and needs a
+if(APPLE OR WIN32)
+  # The dead reference GNU --gc-sections prunes on Linux (gyro_init.c's unused
+  # gyroReadRegister -> mpuGyroReadRegister) survives on macOS (no dead-strip)
+  # and on MinGW (--gc-sections doesn't prune it there), so provide a no-op
   # stub. See pw_stubs.c for the full rationale.
   list(APPEND BF_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/betaflightext/src/main/pw_stubs.c")
