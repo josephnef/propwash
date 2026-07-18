@@ -15,9 +15,21 @@ window/size/viewport_height=720
 
 [physics]
 
+; Baseline lockstep rate — headless/CI runs at exactly this. The client raises
+; it at runtime to match the monitor (see _match_tick_rate in main.gd); it is
+; deliberately NOT pinned high here, so a 60 Hz setup keeps paying what it
+; always has. Interpolation is cheap and smooths the leftover mismatch (100 Hz
+; physics does not divide 60 Hz refresh either), so it is on for everyone.
 common/physics_ticks_per_second=100
+common/physics_interpolation=true
 
 [rendering]
 
-renderer/rendering_method="gl_compatibility"
+; Forward+ (Vulkan/Metal). gl_compatibility presents at only ~133 fps on a
+; 240 Hz macOS display even when the scene can push 750 — the OpenGL-on-Metal
+; path doesn't sync to high refresh. fallback_to_opengl3 (engine default, set
+; explicitly here) drops back to the compatibility renderer when the rendering
+; device won't initialise, so old GPUs still run.
+renderer/rendering_method="forward_plus"
 renderer/rendering_method.mobile="gl_compatibility"
+rendering_device/fallback_to_opengl3=true
