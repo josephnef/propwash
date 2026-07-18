@@ -37,8 +37,15 @@ class Cli:
         # output arrives without a trailing prompt, and cap the total wait so a
         # `save` that reboots (and never prompts) can't hang.
         out = b""
-        hard_end = time.time() + max(settle, 6.0)
-        idle_end = time.time() + settle
+        # The prompt is the primary signal. The idle fallback must be generous:
+        # on a slow host (Windows CI) the response trickles in chunks, and a
+        # short idle would fire mid-trickle — returning before the prompt and
+        # defeating the flow control, which is exactly what dropped the early
+        # diff lines. 2 s of true silence means the command produced no prompt
+        # (e.g. `save`, which reboots without one).
+        idle = max(settle, 2.0)
+        hard_end = time.time() + max(settle, 12.0)
+        idle_end = time.time() + idle
         while time.time() < hard_end:
             try:
                 d = self.sock.recv(4096)
@@ -47,10 +54,10 @@ class Cli:
                 out += d
                 if out.endswith(b"# "):
                     break  # prompt is back -> command finished
-                idle_end = time.time() + settle
+                idle_end = time.time() + idle  # reset idle window on any data
             except socket.timeout:
-                if out and time.time() >= idle_end:
-                    break  # got output, then went idle without a prompt
+                if time.time() >= idle_end:
+                    break  # genuinely idle without a prompt
                 continue
         return out.decode(errors="replace")
 
