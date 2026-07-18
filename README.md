@@ -134,8 +134,9 @@ The Godot client spawns `build/propwash-core` itself. Controls:
   100–240). Pin it with `PROPWASH_TICK=<hz>` if you'd rather choose yourself.
 - **Quality tiers** — `low`/`medium`/`high`, auto-selected from what the GPU
   actually has to sustain (width × height × refresh), so a 240 Hz panel keeps its
-  framerate and a 60 Hz one gets the prettier version. Measured spread at
-  2940×1846: 326 / 117 / 51 fps. Override with `PROPWASH_QUALITY=<tier>`. If
+  framerate and a 60 Hz one gets the prettier version. All tiers upscale with
+  FSR rather than bilinear and keep MSAA on — thin geometry (gate tube, prop
+  blades) stair-steps badly otherwise. Override with `PROPWASH_QUALITY=<tier>`. If
   render rate falls far below the lockstep rate for a few seconds, the client
   gives the tick rate back rather than let a heavy scene starve the sim.
 

@@ -215,7 +215,11 @@ func _apply_quality() -> void:
 	vp.msaa_3d = _q.msaa
 	vp.screen_space_aa = Viewport.SCREEN_SPACE_AA_DISABLED
 	vp.use_debanding = true
-	vp.scaling_3d_mode = Viewport.SCALING_3D_MODE_BILINEAR
+	# FSR (spatial), not bilinear: bilinear upscaling turns thin high-contrast
+	# geometry -- gate tubes, prop blades, stripe boundaries -- into stair-steps.
+	# FSR1 is edge-adaptive. Deliberately FSR1 and not FSR2, which is temporal
+	# and would reintroduce exactly the ghosting that ruled out TAA.
+	vp.scaling_3d_mode = Viewport.SCALING_3D_MODE_FSR
 	vp.scaling_3d_scale = _q.scale_3d
 
 	# These are read once at boot, so ProjectSettings.set_setting() at runtime is
