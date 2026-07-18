@@ -416,8 +416,11 @@ void FLASH_Unlock(void)
         eepromFd = NULL;
     }
 
-    // open or create
-    eepromFd = fopen(pw_eeprom_path, "r+");
+    // open or create. BINARY mode ("b") is essential on Windows: the eeprom is
+    // raw config bytes, and text mode would translate every 0x0A to CRLF on
+    // write (and back on read), corrupting the image so PG records fail their
+    // checksum and load as defaults. The "b" is a harmless no-op on POSIX.
+    eepromFd = fopen(pw_eeprom_path, "rb+");
     if (eepromFd != NULL) {
         // obtain file size:
         fseek(eepromFd, 0, SEEK_END);
@@ -433,7 +436,7 @@ void FLASH_Unlock(void)
         }
     } else {
         printf("[pw][FLASH_Unlock] created '%s', size = %zu\n", pw_eeprom_path, sizeof(eepromData));
-        if ((eepromFd = fopen(pw_eeprom_path, "w+")) == NULL) {
+        if ((eepromFd = fopen(pw_eeprom_path, "wb+")) == NULL) {
             fprintf(stderr, "[pw][FLASH_Unlock] failed to create '%s'\n", pw_eeprom_path);
             return;
         }
