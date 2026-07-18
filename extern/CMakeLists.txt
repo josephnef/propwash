@@ -91,6 +91,10 @@ if(WIN32)
   # POSIX builds keep the real header.
   target_include_directories(bf_sitl PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/betaflightext/src/main/compat")
+  # Force-include a compat header supplying POSIX/GNU libc bits MinGW lacks
+  # (ffs, ...). SHELL: keeps the two tokens together and un-deduplicated.
+  target_compile_options(bf_sitl PRIVATE
+    "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/betaflightext/src/main/compat/pw_win_compat.h")
 endif()
 
 target_compile_options(bf_sitl PRIVATE
