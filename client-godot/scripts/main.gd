@@ -380,9 +380,20 @@ func _physics_process(delta: float) -> void:
 			sim_pos, sim_rot, sim_av, sim_lv, 16.8, contact)
 	_udp.put_packet(pkt)
 
-	# --- lockstep wait (up to ~8 ms)
+	# --- lockstep wait
+	#
+	# This budget must not be tight. In lockstep the core advances the moment it
+	# receives the packet, so giving up here does NOT undo that work: the sim has
+	# moved and the client simply skips its own pose update, leaving the two out
+	# of step. Measured over a demo run, an 8 ms budget silently dropped between
+	# 0 and 16 of 5500 frames depending on machine load, and that variation was
+	# the client's remaining source of run-to-run divergence.
+	#
+	# 60 ms is far beyond any observed round-trip (measured mean 2-71 us), so a
+	# timeout now means something is genuinely wrong and the warning below is
+	# worth reading, rather than being routine loss.
 	var got := false
-	for i in range(800):
+	for i in range(6000):
 		if _udp.get_available_packet_count() > 0:
 			got = true
 			break
@@ -398,15 +409,26 @@ func _physics_process(delta: float) -> void:
 	_await_warned = false
 	_got_first_reply = true
 
+	# Keep waiting until the STATE_OUT for THIS frame arrives. The core
+	# interleaves PW_OSD on the same socket, so the first packet available is
+	# often an OSD frame. Draining once and giving up if it happened not to
+	# contain a STATE_OUT skipped the pose update for that frame — and left the
+	# real reply to be consumed a frame late, putting client and core out of
+	# step. Measured over a demo run that lost 0-16 of 5500 frames depending on
+	# load, which was the client's remaining source of run-to-run divergence.
 	var out := {}
-	while _udp.get_available_packet_count() > 0:      # drain, keep newest
-		var raw := _udp.get_packet()
-		if raw.size() >= 8 and raw[5] == PwProtocol.PW_OSD:
-			_update_osd(PwProtocol.unpack_osd(raw))
-			continue
-		var d := PwProtocol.unpack_state_out(raw)
-		if not d.is_empty():
-			out = d
+	for _spin in range(6000):
+		while _udp.get_available_packet_count() > 0:
+			var raw := _udp.get_packet()
+			if raw.size() >= 8 and raw[5] == PwProtocol.PW_OSD:
+				_update_osd(PwProtocol.unpack_osd(raw))
+				continue
+			var d := PwProtocol.unpack_state_out(raw)
+			if not d.is_empty():
+				out = d
+		if not out.is_empty():
+			break
+		OS.delay_usec(10)
 	if out.is_empty():
 		return
 	_last_out = out
