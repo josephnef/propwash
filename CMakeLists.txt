@@ -148,3 +148,31 @@ if(GODOT_BIN)
     TIMEOUT 120
     ENVIRONMENT "PROPWASH_DEMO=acro;PROPWASH_PORT=9144;PROPWASH_CORE=$<TARGET_FILE:propwash-core>")
 endif()
+
+# Python gym (M4). Runs only if an interpreter with numpy + gymnasium is found.
+# Prefer the uv-managed venv (python/propwash_gym/.venv), else fall back to a
+# system python3 that happens to have the deps. Mirrors the Godot-optional
+# pattern: absent deps skip the test rather than fail the suite.
+set(PW_GYM_DIR ${CMAKE_SOURCE_DIR}/python/propwash_gym)
+find_program(PW_GYM_PYTHON
+  NAMES python3
+  PATHS ${PW_GYM_DIR}/.venv/bin
+  NO_DEFAULT_PATH)
+if(NOT PW_GYM_PYTHON)
+  find_program(PW_GYM_PYTHON NAMES python3)
+endif()
+if(PW_GYM_PYTHON)
+  execute_process(
+    COMMAND ${PW_GYM_PYTHON} -c "import numpy, gymnasium"
+    RESULT_VARIABLE PW_GYM_DEPS
+    OUTPUT_QUIET ERROR_QUIET)
+  if(PW_GYM_DEPS EQUAL 0)
+    add_test(NAME gym_hover
+      COMMAND ${PW_GYM_PYTHON} ${PW_GYM_DIR}/tests/gym_smoke.py
+        $<TARGET_FILE:propwash-core>)
+    set_tests_properties(gym_hover PROPERTIES TIMEOUT 120)
+    message(STATUS "gym_hover test enabled (python: ${PW_GYM_PYTHON})")
+  else()
+    message(STATUS "gym_hover test skipped (numpy/gymnasium not in ${PW_GYM_PYTHON})")
+  endif()
+endif()

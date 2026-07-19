@@ -17,7 +17,7 @@ No external dependencies (kernel `js` API, not SDL2). One pinned submodule.
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo && cmake --build build -j
-ctest --test-dir build            # 14 headless tests; ~2 min
+ctest --test-dir build            # 14 headless tests (+ gym_hover if uv-synced); ~2 min
 ```
 
 The Betaflight submodule builds as a static lib (`extern/`). Source list is
@@ -42,11 +42,15 @@ if the firmware version changes.
 | `quality_tiers` | render tier selection rule as a pure function (cases a single machine can't produce) |
 | `fpv_cull` | FPV cull mask + prop→motor index map — invariants a rewrite has already silently dropped once |
 | `client_collision` | client detection: hull vs analytic ground + engine-query gate tubes, slop depenetration, Godot→sim manifold conversion |
+| `gym_hover` | the Python Gymnasium env spawns a real core, arms + hovers, and passes the env-checker (step-determinism sub-check xfail'd — see below) |
 
 `godot_client`/`flythrough` only run if a `godot` binary is found (see
-`find_program(GODOT_BIN ...)` in `CMakeLists.txt`). Tests that bind ports must
-not overlap — leftover `propwash-core` processes cause spurious failures; kill
-strays before running (`pkill -f build/propwash-core`).
+`find_program(GODOT_BIN ...)` in `CMakeLists.txt`). `gym_hover` only runs if a
+Python with `numpy`+`gymnasium` is found — prefer `python/propwash_gym/.venv`
+(run `uv sync` there first, then re-run `cmake -B build` so it's detected).
+Tests that bind ports must not overlap — leftover `propwash-core` processes
+cause spurious failures; kill strays before running
+(`pkill -f build/propwash-core`).
 
 ## How the pieces fit
 
@@ -70,6 +74,14 @@ strays before running (`pkill -f build/propwash-core`).
   core resolves contacts as forces — the client never edits velocities),
   converts sim↔Godot handedness (mirror z; quat -x,-y; angular velocity is a
   pseudovector: -x,-y,+z).
+- **`python/propwash_gym/`** — MIT Gymnasium env (`uv`-managed). Same lockstep
+  loop as the Godot client: subprocess-per-env, one PW_STATE_IN→PW_STATE_OUT per
+  step, client-side position integration + `ground_manifold`. Carries its own
+  MIT copy of the wire codec (`protocol.py`) rather than importing the GPL
+  `tools/tester/pw_udp.py`. `reset()` drives arming (gyro-cal warm-up → ARM);
+  defaults `gyro_noise=0`. **Known gap:** the sim is not bit-reproducible across
+  `reset()`s (same reason `determinism_check` is unwired), so Gymnasium's
+  step-determinism check is an xfail — the M5 system-ID work closes it.
 
 ## Non-obvious things that will bite you (learned the hard way)
 

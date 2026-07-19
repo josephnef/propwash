@@ -54,7 +54,7 @@ normal sim can't do:
 └─────────┼  state + damage out ─────────────── ┼────────────┘
           │                                     │
    Godot 4 client / Quest 3 (planned) /   Betaflight Configurator
-   Python gym (planned) / bbreplay (planned)   (MSP / CLI)
+   Python gym / bbreplay (planned)             (MSP / CLI)
 ```
 
 - **In-process, not networked SITL.** The core links Betaflight's C internals
@@ -89,6 +89,7 @@ two lockstep scheduler patches and the OSD/CLI plumbing.
 | `extern/betaflightext/` | GPL-3.0 | Override layer (SITL-derived target, patched scheduler/cli, fake OSD displayport) + recorded diffs in `patches/` |
 | `protocol/` | MIT | Wire protocol — single header, no Betaflight includes (the boundary) |
 | `client-godot/` | MIT | Godot 4 frontend: FPV cinewhoop, OSD overlay, joystick/keyboard |
+| `python/propwash_gym/` | MIT | Gymnasium env (RL): `uv`-managed, subprocess-per-env, `frame_id` lockstep |
 | `tools/tester/` | GPL-3.0 | Headless tests: boot/MSP identity, hover, determinism, OSD, real-tune |
 | `tools/bfcli/` | MIT-ish | CLI-over-TCP: apply the pilot's `diff all`, bake eeprom, calibrate joystick |
 | `config/` | — | The real `cinelog35v3.diff` + SITL overrides |
@@ -220,6 +221,26 @@ board and must not apply to a virtual gyro — critically `align_board_roll`
                       [--wind x,y,z] [--gust amp]
 ```
 
+## Reinforcement learning (gym)
+
+[`python/propwash_gym/`](python/propwash_gym/) is a
+[Gymnasium](https://gymnasium.farama.org/) environment: each env owns one
+`propwash-core` subprocess and drives it in `frame_id` lockstep, so the policy
+trains against the pilot's real firmware and the rollouts are reproducible.
+
+```bash
+cd python/propwash_gym
+uv sync                      # base env; `uv sync --extra rl` adds SB3 + torch
+uv run pytest                # env-checker + arm/step/hover against a real core
+uv run python examples/ppo_hover.py --timesteps 20000   # PPO smoke run
+```
+
+The env task is a hover (arm → hold altitude, level and still). Action is
+`[throttle, roll, pitch, yaw]`; observation is
+`quat | angvel | linvel | pos_error | motor_rpm`. See its
+[README](python/propwash_gym/README.md) for the spaces, reward and the
+determinism caveat.
+
 ## Status
 
 Working: in-process Betaflight 4.5.2, deterministic lockstep, physics + stable
@@ -227,14 +248,17 @@ hover, real collision physics (solid world, contact forces the firmware feels,
 per-motor crash damage, repair/reset flow, wind + gusts, ground effect), UDP
 protocol, Godot FPV client with the real OSD and a cinewhoop model,
 CLI/Configurator data path, real-tune loading, joystick calibration, autonomous
-gate fly-through. **14 headless self-tests** cover boot/MSP identity, hover,
-contact settling (level *and* inverted), the crash→repair lifecycle, damage
-over the wire, OSD render, real-tune hover, and the Godot client's detection,
-repair flow and gate fly-through (now with clearance asserts against solid
-gates).
+gate fly-through, and a **[Gymnasium environment](python/propwash_gym/)** (RL,
+`uv`-managed, subprocess-per-env, `frame_id` lockstep). **15 headless self-tests**
+cover boot/MSP identity, hover, contact settling (level *and* inverted), the
+crash→repair lifecycle, damage over the wire, OSD render, real-tune hover, the
+Godot client's detection, repair flow and gate fly-through (now with clearance
+asserts against solid gates), and the gym env-checker + hover with the real core
+in the loop.
 
-Planned: Python gym env (RL), blackbox replay (sim-vs-real system ID), Quest 3 /
-OpenXR build.
+Planned: blackbox replay (sim-vs-real system ID), Quest 3 / OpenXR build.
+Bit-reproducibility across resets (the last gap for a fully deterministic gym)
+lands with the M5 system-ID work.
 
 ## Prior art & credits
 

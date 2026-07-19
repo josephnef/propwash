@@ -98,6 +98,33 @@ jobs:
           ctest --test-dir build --output-on-failure \
             -E 'godot_client|flythrough|real_tune_hover|diff_roundtrip'
 
+  python-gym:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install toolchain + uv
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      - name: Sync the gym (uv) — creates the venv CMake detects
+        run: |
+          cd python/propwash_gym
+          "$HOME/.local/bin/uv" sync
+
+      - name: Configure & build core
+        run: |
+          # configure AFTER uv sync so the gym_hover test picks up the venv
+          cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build build -j"$(nproc)"
+
+      - name: Gym env-checker + hover (real core in the loop)
+        run: ctest --test-dir build --output-on-failure -R gym_hover
+
   godot-client:
     strategy:
       fail-fast: false

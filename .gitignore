@@ -5,5 +5,7 @@ build/
 __pycache__/
 *.pyc
 .cache/
+.venv/
+*.egg-info/
 compile_commands.json
 client-godot/.godot/
