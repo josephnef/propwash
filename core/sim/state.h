@@ -86,6 +86,61 @@ namespace SimITL{
     double mAhDrawn = 0.0f;
   };
 
+  /* Impact-damage tuning. Every threshold is a SPEED (m/s), not a force —
+   * independent of the contact-spring stiffness (retuning the solver must
+   * not retune damage) and immune to resting-load false positives by
+   * construction: a parked quad has v_n ~ 0 no matter how hard it presses.
+   * Calibrated for the 0.33 kg CineLog35 (terminal velocity ~17 m/s, so a
+   * long fall always lands far above vCrash). */
+  struct DamageConfig {
+    float vSafe            = 1.8f;    // m/s: below this, zero damage
+    float vCrash           = 7.0f;    // m/s (surface-scaled): structural crash
+    float impactGain       = 0.35f;   // frame damage at the vCrash end of the ramp
+    float propStrikeVMin   = 0.7f;    // m/s: a spinning prop chips on any touch
+    float propStrikeBase   = 0.25f;   // instant damage floor for a prop strike
+    float propStrikeGain   = 0.50f;   // + gain * min(1, v_n / 8)
+    float propStrikeRadius = 0.05f;   // m: xz distance to a motor axis
+    float propStrikeYBand  = 0.03f;   // m: |y - motor plane| gate
+    float propSpinMinRpm   = 3000.0f; // below this a "strike" is just a frame tap
+    float strikeTorque     = 0.8f;    // N*m yaw kick from a prop strike
+    float strikeTorqueS    = 0.010f;  // s: kick duration (~8.8 rad/s on I_yaw)
+    float strikeRpmKeep    = 0.3f;    // rpm multiplier applied once on strike
+    float crashDamage      = 0.9f;    // per-motor damage from a structural crash
+                                      // (max thrust 1.12 N < 3.24 N weight:
+                                      // hover becomes impossible via physics)
+    float damagedStatusAt  = 0.25f;   // eff damage that latches MotorDamaged
+    float motorReachXZ     = 0.11f;   // m: frame-damage proximity falloff
+    float distribFloor     = 0.25f;   // every impact stresses the whole frame
+    float cooldownS        = 0.25f;   // s: per-motor re-damage lockout
+                                      // (sustained scraping re-damages at 4 Hz)
+    // index = PwSurfaceType: GROUND (dirt), GATE (plastic), TREE, OBJECT
+    float surfaceFactor[4] = {0.7f, 0.5f, 0.85f, 1.0f};
+  };
+
+  struct DamageState {
+    float accumulated[4] {};    // core-owned impact damage, 0..1
+    float eff[4] {};            // max(client input, accumulated) — what physics uses
+    float cooldown[4] {};       // s remaining per motor
+    int   strikeTicks = 0;      // remaining yaw-kick sub-ticks
+    float strikeYawSign = 0.0f; // summed -motor_dir of struck motors
+    bool  crashed = false;      // structural-crash latch (REPAIR/RESET clears)
+  };
+
+  /* One core-resolved contact. Loaded from the client's manifold once per
+   * frame, then force-integrated every 50 us sub-tick — the penetration depth
+   * evolves with the contact-point velocity until the client's next manifold
+   * replaces the set or the point separates (depth <= 0). */
+  struct ActiveContact {
+    bool  active = false;
+    vec3  pointBody {0.0f, 0.0f, 0.0f};   // body frame, m
+    vec3  normalWorld {0.0f, 1.0f, 0.0f}; // unit, surface -> quad
+    float depth = 0.0f;                   // m
+    uint8_t surface = 0;                  // PwSurfaceType
+    // per-sub-tick scratch
+    vec3  rWorld {0.0f, 0.0f, 0.0f};      // lever arm R*pointBody
+    vec3  force {0.0f, 0.0f, 0.0f};       // last applied force, N
+  };
+
   /**
    * \brief Stores the state of the simulation including incoming and 
    * outgoing network packets.
@@ -112,6 +167,23 @@ namespace SimITL{
 
     std::array<MotorState, 4> motorsState {};
     BatteryState batteryState {};
+
+    // contact manifold being resolved (mirrors StateInput.contacts)
+    std::array<ActiveContact, 6> contacts {};
+    int contactCount = 0;
+    // per-client-frame contact statistics (damage-model inputs)
+    float contactPeakForceN = 0.0f; // max |F| over the frame's sub-ticks
+    float contactImpulseNs = 0.0f;  // sum |F|*dt over the frame
+
+    DamageConfig damageCfg {};
+    DamageState damage {};
+
+    // current wind velocity, world frame (updated per tick from StateInit)
+    vec3 wind {0, 0, 0};
+
+    // firmware crash state, read back each tick (crash_flags bits 1/2)
+    bool bfCrashRecoveryActive = false;
+    bool bfFlipOverActive = false;
 
     vec3 acceleration{0, 0, 0};
 

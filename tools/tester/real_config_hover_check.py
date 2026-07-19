@@ -12,7 +12,6 @@ Exit 0 = the real tune persists and hovers.
 import math
 import os
 import socket
-import struct
 import subprocess
 import sys
 import tempfile
@@ -21,11 +20,7 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bfcli"))
 from pw_cli import Cli, diff_commands  # noqa: E402
 
-MAGIC = 0x48535750
-HDR = struct.Struct("<IBBH")
-SIN = struct.Struct("<If8f3f4f3f3ff4f4ffB")
-SOUT = struct.Struct("<IQ4f3f3f3f3f4f4BBIIBff")
-PW_STATE_IN, PW_STATE_OUT = 3, 4
+import pw_udp  # noqa: E402
 
 
 def spawn(core, mode, eeprom, port=None):
@@ -109,27 +104,21 @@ def main():
             t = f * dt
             arm = 1.0 if t >= T_ARM else -1.0
             rc = [0, 0, throttle, 0, arm, 1.0, -1, -1]
-            contact = 1 if pos[1] <= 0.001 else 0
-            payload = SIN.pack(f, dt, *rc, *pos, *rot, *angvel, *linvel,
-                               0.0002, *([0] * 4), *([0] * 4), 16.8, contact)
-            s.sendto(HDR.pack(MAGIC, 1, PW_STATE_IN, len(payload)) + payload, addr)
-            while True:
-                d, _ = s.recvfrom(2048)
-                if HDR.unpack(d[:8])[2] == PW_STATE_OUT:
-                    break
-            o = SOUT.unpack(d[8:8 + SOUT.size])
+            # hull-vs-ground manifold; depenetrates pos in place
+            contacts = pw_udp.ground_manifold(pos, rot)
+            pkt = pw_udp.pack_state_in(f, dt, rc, pos, rot, angvel, linvel,
+                                       contact=1 if contacts else 0,
+                                       contacts=contacts)
+            out = pw_udp.step(s, addr, pkt)
+            o = pw_udp.SOUT.unpack(out)
             (_, _, qw, qx, qy, qz, avx, avy, avz, lvx, lvy, lvz,
              px, py, pz, ax, ay, az, r0, r1, r2, r3, s0, s1, s2, s3,
-             armed, dis, mode, beep, vbat, amps) = o
+             armed, dis, mode, beep, vbat, amps,
+             d0, d1, d2, d3, cflags) = o
             rot = (qw, qx, qy, qz)
             angvel = [avx, avy, avz]
             linvel = [lvx, lvy, lvz]
             pos = [pos[i] + linvel[i] * dt for i in range(3)]
-            if pos[1] <= 0.0:
-                pos[1] = 0.0
-                if linvel[1] < 0.0:
-                    linvel[1] = 0.0
-                angvel = [0.0] * 3
             if armed:
                 armed_seen = True
                 u = -0.3 + 0.5 * (TARGET - pos[1]) - 0.4 * linvel[1]

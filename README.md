@@ -30,6 +30,12 @@ normal sim can't do:
    logs for sim-vs-real validation.
 3. **Configurator-compatible** — the real Betaflight Configurator connects over
    TCP and tunes it live, exactly like a bench quad.
+4. **Crashes are real** — contacts are resolved as forces inside the physics
+   tick, so the firmware *feels* impacts on its virtual gyro/accel exactly like
+   real hardware (its own crash detection works, straight from your dump).
+   Gates and trees are solid, impact speed maps to per-motor prop damage, a
+   hard crash grounds you because damaged props can't lift the quad — and you
+   fix it (`T`) or walk back to the pad (`R`), not respawn through a menu.
 
 ## Architecture
 
@@ -39,10 +45,13 @@ normal sim can't do:
 │  ┌───────────────┐   in-process    ┌─────────────────────┐  │
 │  │ physics 20kHz │ ── gyro/accel ► │ Betaflight 4.5.2    │  │
 │  │ (rigid body,  │ ◄─ motor PWM ── │ (static lib: real   │  │
-│  │  motors, bat) │                 │  scheduler + PIDs)  │  │
-│  └──────┬────────┘                 └──────────┬──────────┘  │
-│         │  UDP protocol (versioned)           │ TCP 5761    │
-└─────────┼──────────────────────────────────── ┼────────────┘
+│  │  motors, bat, │                 │  scheduler + PIDs)  │  │
+│  │  contacts,    │                 └──────────┬──────────┘  │
+│  │  damage, wind)│                            │ TCP 5761    │
+│  └──────┬────────┘                            │             │
+│         │  UDP protocol (versioned):          │             │
+│         │  pose + contact manifold in,        │             │
+└─────────┼  state + damage out ─────────────── ┼────────────┘
           │                                     │
    Godot 4 client / Quest 3 (planned) /   Betaflight Configurator
    Python gym (planned) / bbreplay (planned)   (MSP / CLI)
@@ -58,6 +67,15 @@ normal sim can't do:
   and carries no GPL code.
 - **The tick rate (20 kHz) exceeds the gyro/PID rate (8 kHz)** on purpose — the
   scheduler only services non-realtime tasks (RX, MSP) between gyro boundaries.
+- **The client senses collisions, the core solves them.** The client owns world
+  geometry and position: it tests a shared 5-sphere hull against the world each
+  frame and sends the contact manifold (point, normal, depth, surface). The
+  core resolves contacts as spring-damper *forces* inside the physics tick —
+  never velocity edits, which the virtual accelerometer cannot see — so
+  touchdown, ground rest and crashes reach the firmware the way real sensors
+  would. Impact speed then drives a deterministic damage model (prop damage,
+  prop strikes, structural crashes), and wind is a pure function of sim time +
+  seed, so reproducibility survives all of it.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the details, including the
 two lockstep scheduler patches and the OSD/CLI plumbing.
@@ -113,7 +131,19 @@ The Godot client spawns `build/propwash-core` itself. Controls:
   by name, RC read directly by the core. Calibrate once:
   `./build/propwash-core --js-calibrate`.
 - **No radio** — keyboard: arrows = right stick, `W`/`S` throttle, `A`/`D` yaw,
-  `E` arm, `Q` angle toggle, `R` reset.
+  `E` arm, `Q` angle toggle, `T` repair in place, `R` reset to pad.
+- **Crashes have consequences.** Gates, trees and the ground are solid; hitting
+  them costs momentum and props. The HUD shows per-motor damage, a hard impact
+  puts up a `CRASHED` banner, and a wrecked quad genuinely cannot hover (the
+  thrust isn't there any more). Disarm and press `T` to repair + set the quad
+  upright where it lies, or `R` to reset to the pad. `PROPWASH_STRICT=1`
+  disables `T` for deliberate practice — a crash then always ends the flight.
+  If your dump sets `crash_recovery = DISARM`, the firmware's own crash
+  detection disarms you exactly as on hardware (`CRASH DETECTED` banner; cycle
+  the ARM switch to clear).
+- **Wind** — `PROPWASH_WIND="3,0,0" PROPWASH_GUST=1.5 godot --path client-godot`
+  gives a 3 m/s steady wind with 1.5 m/s gusts. Deterministic: the same flags
+  reproduce the same run; calm runs are byte-identical to a build without wind.
 - **Betaflight Configurator** connects any time to TCP `127.0.0.1:5761` (MSP/CLI)
   and tunes it live.
 - The **real Betaflight OSD** is overlaid on the FPV view — crisp, above the
@@ -160,6 +190,12 @@ discoverable by reading the source.
 | `PROPWASH_SCALE=<0.5-1.0>` | render 3D below native and upscale; off by default |
 | `PROPWASH_JS_MAP="0,1,2,..."` | remap RC channel → joystick axis |
 | `PROPWASH_JS_INVERT="2"` | comma list of RC channels to negate |
+| `PROPWASH_STRICT=1` | disable `T` repair — a crash always ends the flight |
+| `PROPWASH_WIND="x,y,z"` | steady wind in m/s, forwarded to the core |
+| `PROPWASH_GUST=<amp>` | gust amplitude in m/s on top of the steady wind |
+| `PROPWASH_PORT=<port>` | core UDP port; lets tests and a live session coexist |
+| `PROPWASH_NO_JS=1` | spawn the core with `--no-js` (scripted harnesses) |
+| `PROPWASH_CONTACT_LOG=1` | print every new contact event (surface, depth) |
 
 ### Loading the pilot's real tune
 
@@ -180,16 +216,22 @@ board and must not apply to a virtual gyro — critically `align_board_roll`
 
 ```bash
 ./build/propwash-core [--server|--realtime|--js-calibrate] [--port 9100] \
-                      [--eeprom path] [--js /dev/input/jsN | --no-js]
+                      [--eeprom path] [--js /dev/input/jsN | --no-js] \
+                      [--wind x,y,z] [--gust amp]
 ```
 
 ## Status
 
 Working: in-process Betaflight 4.5.2, deterministic lockstep, physics + stable
-hover, UDP protocol, Godot FPV client with the real OSD and a cinewhoop model,
+hover, real collision physics (solid world, contact forces the firmware feels,
+per-motor crash damage, repair/reset flow, wind + gusts, ground effect), UDP
+protocol, Godot FPV client with the real OSD and a cinewhoop model,
 CLI/Configurator data path, real-tune loading, joystick calibration, autonomous
-gate fly-through. **9 headless self-tests** cover boot/MSP identity, hover,
-determinism, OSD render, real-tune hover, and the Godot client + fly-through.
+gate fly-through. **14 headless self-tests** cover boot/MSP identity, hover,
+contact settling (level *and* inverted), the crash→repair lifecycle, damage
+over the wire, OSD render, real-tune hover, and the Godot client's detection,
+repair flow and gate fly-through (now with clearance asserts against solid
+gates).
 
 Planned: Python gym env (RL), blackbox replay (sim-vs-real system ID), Quest 3 /
 OpenXR build.

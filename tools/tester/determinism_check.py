@@ -46,17 +46,25 @@ def run(core, port, jitter):
         # No explicit RESET needed: the core discards its pre-client idle time
         # on first contact, so a session always starts from the same physics
         # state regardless of when the client happened to attach.
-        pos = [0.0, 0.12, 0.0]
+        #
+        # The pose is a fixed input TAPE (never integrated from replies): a
+        # resting ground manifold every frame, plus a scripted gate side-
+        # scrape over frames 900-950 so the hash also covers the contact
+        # solver's friction/torque path and the damage model.
+        pos = [0.0, 0.0, 0.0]
+        rest = pw_udp.ground_manifold(pos, (1.0, 0.0, 0.0, 0.0))
+        scrape = ((0.054, 0.02, 0.054), (-1.0, 0.0, 0.0), 0.008, 1)
         for f in range(FRAMES):
             t = f * DT
             # deterministic, scripted stick input — no wall clock anywhere
             throttle = -1.0 if t < 1.0 else (-0.15 if t < 2.0 else -0.2)
             arm = 1.0 if t >= 1.0 else -1.0
             rc = [0.0, 0.0, throttle, 0.0, arm, 1.0, -1.0, -1.0]
+            contacts = rest + ([scrape] if 900 <= f < 950 else [])
             pkt = pw_udp.pack_state_in(
                 f, DT, rc, pos, [1.0, 0.0, 0.0, 0.0],
                 [0.0, 0.0, 0.0], [0.0, 0.0, 0.0],
-                contact=1 if pos[1] <= 0.13 else 0)
+                contact=1, contacts=contacts)
             if jitter and f % 97 == 0:
                 # longer than the core's 5 ms recv timeout, on purpose
                 time.sleep(0.012)

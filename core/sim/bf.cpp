@@ -111,6 +111,12 @@ namespace SimITL{
       simState.armingDisabledFlags = (int)BF::getArmingDisableFlags();
       simState.flightModeFlags = (int)BF::flightModeFlags;
       simState.beep = BF::isBeeperOn();
+      // firmware crash state: contact forces reach the virtual gyro/accel,
+      // so BF's own crash detection can fire — surface it to the client.
+      // (Turtle can never activate on this target — DSHOT-gated — but the
+      // accessor is wired so the flag lights up the day that changes.)
+      simState.bfCrashRecoveryActive = BF::crashRecoveryModeActive();
+      simState.bfFlipOverActive = BF::isFlipOverAfterCrashActive();
       simState.stateOutput.beep = simState.beep ? 1U : 0U;
       // capture the OSD character grid (fake max7456 displayport)
       for (int y = 0; y < 16; y++) {

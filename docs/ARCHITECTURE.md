@@ -72,11 +72,33 @@ run must have nothing attached to it.
 
 ## Division of labour with clients
 
-The client owns terrain/collision: each `PW_STATE_IN` carries the
-authoritative pose/velocities (normally echoing the previous `PW_STATE_OUT`,
-corrected on contact), plus `contact` so the physics damps toward the
-client's resolution. The core owns everything between RC input and rigid
-body state.
+The client is the collision **sensor**, the core is the collision **solver**.
+The client owns geometry and world position: each `PW_STATE_IN` carries the
+authoritative pose plus the frame's contact manifold (up to 6 points: body-
+frame contact point, world-frame normal, penetration depth, surface type),
+detected against the client's world (analytic ground plane + shape queries
+for gates/trees) from the shared 5-sphere hull in `propwash_protocol.h`. The
+client depenetrates its position with a 4 mm slop and reports near-contacts
+within 5 mm at depth 0 (speculative, so the core can damp an approach before
+impact).
+
+The core owns dynamics — as of protocol v2 the velocity fields in
+`PW_STATE_IN` are ignored. Contacts are resolved as penalty spring-damper
+forces inside the 20 kHz tick's force/moment accumulator, which means the
+firmware's virtual accelerometer feels ground support, touchdown and crashes
+exactly as real hardware would (a velocity edit never reaches the accel; a
+force does). Penetration depths evolve per sub-tick between client frames.
+
+Consequences are core-owned and deterministic: contact approach speed maps
+to per-motor prop damage (frame impacts, prop strikes inside a spinning
+disc, structural crashes above ~7 m/s surface-scaled), reported back in
+`PW_STATE_OUT.prop_damage`/`crash_flags`. A wrecked quad cannot hover
+because damaged props cannot lift it — not because a script says so.
+`PW_CMD_REPAIR` fits new props; `PW_CMD_RESET` is the full respawn. The
+damage path draws no randomness and reads no clock, so reproducibility is
+untouched. Wind (`--wind x,y,z`, `--gust amp`) is likewise a pure function
+of sim time + seed via simplex noise: calm runs are bit-identical to
+pre-wind builds, windy runs reproduce given the same flags.
 
 ## Loading the pilot's tune (M3)
 

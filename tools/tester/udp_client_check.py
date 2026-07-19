@@ -10,19 +10,10 @@ Exit 0 = armed + hovered + latency sane.
 """
 import math
 import socket
-import struct
 import sys
 import time
 
-MAGIC = 0x48535750
-VERSION = 1
-PW_STATE_IN, PW_STATE_OUT = 3, 4
-
-HDR = struct.Struct("<IBBH")
-# frame u32, dt f32, rc 8f, pos 3f, quat wxyz 4f, angvel 3f, linvel 3f,
-# noise f32, damage 4f, ground 4f, vbat f32, contact u8
-SIN = struct.Struct("<If8f3f4f3f3ff4f4ffB")
-SOUT = struct.Struct("<IQ4f3f3f3f3f4f4BBIIBff")
+import pw_udp
 
 
 def quat_to_up(w, x, y, z):
@@ -54,38 +45,31 @@ def main():
         arm = 1.0 if t >= T_ARM else -1.0
 
         rc = [0.0, 0.0, throttle, 0.0, arm, 1.0, -1.0, -1.0]
-        contact = 1 if pos[1] <= 0.001 else 0
+        # hull-vs-ground manifold; depenetrates pos in place. The core
+        # resolves the contact as forces (velocities are core-authoritative).
+        contacts = pw_udp.ground_manifold(pos, rot)
 
-        payload = SIN.pack(f, dt, *rc, *pos, *rot, *angvel, *linvel,
-                           0.0002, *([0.0] * 4), *([0.0] * 4), 16.8, contact)
-        pkt = HDR.pack(MAGIC, VERSION, PW_STATE_IN, len(payload)) + payload
+        pkt = pw_udp.pack_state_in(f, dt, rc, pos, rot, angvel, linvel,
+                                   contact=1 if contacts else 0,
+                                   contacts=contacts)
 
         t0 = time.perf_counter()
-        sock.sendto(pkt, addr)
-        # the server also emits PW_OSD packets; skip anything but STATE_OUT
-        while True:
-            data, _ = sock.recvfrom(2048)
-            magic, ver, typ, plen = HDR.unpack(data[:8])
-            if magic == MAGIC and typ == PW_STATE_OUT:
-                break
+        # step() skips the interleaved PW_OSD packets for us
+        out = pw_udp.step(sock, addr, pkt)
         latencies.append(time.perf_counter() - t0)
-        o = SOUT.unpack(data[8:8 + SOUT.size])
+        o = pw_udp.SOUT.unpack(out)
         (frame_id, sim_us,
          qw, qx, qy, qz,
          avx, avy, avz, lvx, lvy, lvz,
          px, py, pz, ax, ay, az,
          r0, r1, r2, r3, s0, s1, s2, s3,
-         armed, dis, mode, beep, vbat, amps) = o
+         armed, dis, mode, beep, vbat, amps,
+         d0, d1, d2, d3, cflags) = o
 
         rot = (qw, qx, qy, qz)
         angvel = [avx, avy, avz]
         linvel = [lvx, lvy, lvz]
         pos = [pos[i] + linvel[i] * dt for i in range(3)]
-        if pos[1] <= 0.0:
-            pos[1] = 0.0
-            if linvel[1] < 0.0:
-                linvel[1] = 0.0
-            angvel = [0.0] * 3
 
         if armed:
             armed_seen = True

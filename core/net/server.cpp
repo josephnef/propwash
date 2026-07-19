@@ -30,6 +30,12 @@ namespace pw {
 
 using namespace SimITL;
 
+// Wire layout guards: every codec (Python struct strings, GDScript byte
+// counts) mirrors these sizes by hand — catch drift at compile time.
+static_assert(sizeof(PwContact) == 29, "PwContact wire size changed");
+static_assert(sizeof(PwStateIn) == 308, "PwStateIn wire size changed");
+static_assert(sizeof(PwStateOut) == 131, "PwStateOut wire size changed");
+
 // Decode the Betaflight arming-disable bitmask to names (4.5.2 order), so the
 // pilot can see *why* it won't arm while setting up switches. ARM_SWITCH is
 // suppressed — it only ever lights as a consequence of another flag.
@@ -222,6 +228,11 @@ void Server::run(SimITL::Sim& sim, const StateInit& defaultInit, Joystick* js)
                 (nowMillis() - lastStateInMs) < CLIENT_IDLE_MS;
             if (!clientDriving) {
                 input.delta = 0.005f;
+                // `input` outlives the client: without this a departed
+                // client's last contact manifold would keep applying forces
+                // for as long as the core idle-ticks.
+                input.contact = 0;
+                input.contactCount = 0;
                 sim.update(input);
             }
             continue;
@@ -320,6 +331,19 @@ void Server::run(SimITL::Sim& sim, const StateInit& defaultInit, Joystick* js)
             input.vbat = p.vbat_charged;
             input.contact = p.contact;
 
+            input.contactCount = p.contact_count > PW_MAX_CONTACTS
+                ? PW_MAX_CONTACTS : p.contact_count;
+            for (int i = 0; i < input.contactCount; i++) {
+                input.contacts[i].pointBody   = { p.contacts[i].point_body.x,
+                                                  p.contacts[i].point_body.y,
+                                                  p.contacts[i].point_body.z };
+                input.contacts[i].normalWorld = { p.contacts[i].normal_world.x,
+                                                  p.contacts[i].normal_world.y,
+                                                  p.contacts[i].normal_world.z };
+                input.contacts[i].depth   = p.contacts[i].depth;
+                input.contacts[i].surface = p.contacts[i].surface;
+            }
+
             sim.update(input);
 
             const SimState& st = sim.getSimState();
@@ -343,6 +367,8 @@ void Server::run(SimITL::Sim& sim, const StateInit& defaultInit, Joystick* js)
             o.beeper = st.beep ? 1 : 0;
             o.vbat = st.batteryState.batVoltageSag;
             o.amperage = (float)st.batteryState.amperage;
+            for (int i = 0; i < 4; i++) o.prop_damage[i] = out.propDamage[i];
+            o.crash_flags = out.crashFlags;
             sendTo(&o, sizeof(o), PW_STATE_OUT);
 
             // OSD grid, throttled to ~15 Hz (it changes far slower than the
@@ -389,6 +415,12 @@ void Server::run(SimITL::Sim& sim, const StateInit& defaultInit, Joystick* js)
                 printf("[pw][net] RESET\n");
                 sim.reset(initState);
                 rcOverrideActive = false;
+                break;
+            case PW_CMD_REPAIR:
+                // Clear accumulated damage + recharge; pose/firmware untouched
+                // (the client owns pose and rights the quad itself).
+                printf("[pw][net] REPAIR\n");
+                sim.command(CommandType::Repair);
                 break;
             case PW_CMD_LOCKSTEP:
                 // The protocol's documented default: time advances only on

@@ -83,6 +83,28 @@ namespace SimITL{
                             const std::array<MotorState, 4>& motors,
                             float motorsTorque);
 
+      /* Penalty spring-damper forces for the active contact manifold.
+       * Returns the summed world-frame force; accumulates the matching
+       * moments (r x F) into momentOut. Runs inside calculatePhysics so the
+       * result flows into `acceleration` — which is what the virtual
+       * accelerometer reads, i.e. the firmware feels impacts and ground
+       * support like the real sensor would. */
+      vec3 contactForces(double dt, const StateInput& state, vec3& momentOut);
+
+      /* Evolve penetration depths with the post-integration velocities;
+       * a contact expires (active = false) once it separates. */
+      void advanceContactDepths(double dt, const StateInput& state);
+
+      /* Impact damage: map contact approach speeds to per-motor damage
+       * (frame impacts, prop strikes, structural crashes) and maintain the
+       * effective damage max(client input, accumulated) that the motor
+       * model consumes. RNG-free — must not shift the noise stream. */
+      void updateDamage(double dt);
+
+      /* Sample the wind field for this tick (mean + simplex gusts, a pure
+       * function of sim time + seed — deterministic, no RNG draws). */
+      void updateWind();
+
       void repair();
 
       SimState* mSimState = nullptr;

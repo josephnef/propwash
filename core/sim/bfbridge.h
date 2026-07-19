@@ -34,6 +34,7 @@ namespace SimITL{
       #include "fc/init.h"
       #include "fc/runtime_config.h"
       #include "fc/tasks.h"
+      #include "fc/core.h"
 
       #include "flight/imu.h"
 

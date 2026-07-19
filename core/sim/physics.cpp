@@ -1,7 +1,9 @@
 #include "physics.h"
 #include <cstdio>
 #include "util/SimplexNoise.h"
+#include "contact_materials.h"
 #include "bf.h"
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 
@@ -75,31 +77,64 @@ namespace SimITL{
   void Physics::updateState(const StateInput& state){
     BF::setDebugValue(E_DEBUG_SIM, 2, state.contact * 1000);
 
-    //angular velocity update
-    vec3 currentAngularVelocity;
-    copy(currentAngularVelocity, mSimState->stateInput.angularVelocity);
-    vec3 newAngularVelocity;
-    copy(newAngularVelocity, state.angularVelocity);
-    vec3 angularVelocityDiff = newAngularVelocity - currentAngularVelocity;
-    float i_angular = (state.contact == 1) ? 0.5f : 0.0f;
-    //linear interpolation, strength defined by diff between states
-    newAngularVelocity = currentAngularVelocity + angularVelocityDiff * i_angular;
+    /* Velocities are core-authoritative: contacts arrive as manifold points
+     * and are resolved as *forces* in calculatePhysics, so the firmware's
+     * virtual accel/gyro see impacts and ground support the way the real
+     * sensors would (a velocity edit is invisible to the accelerometer).
+     * The client's velocity fields are its echo of the last output. */
+    vec3 coreAngularVelocity;
+    copy(coreAngularVelocity, mSimState->stateInput.angularVelocity);
+    vec3 coreLinearVelocity;
+    copy(coreLinearVelocity, mSimState->stateInput.linearVelocity);
 
-    //linear velocity update
-    vec3 currentLinearVelocity;
-    copy(currentLinearVelocity, mSimState->stateInput.linearVelocity);
-    vec3 newLinearVelocity;
-    copy(newLinearVelocity, state.linearVelocity);
-    vec3 linearVelocityDiff = newLinearVelocity - currentLinearVelocity;
-    float i_linear = (state.contact == 1) ? 0.75f : 0.0f;
-    //linear interpolation, strength defined by diff between states
-    newLinearVelocity = currentLinearVelocity + linearVelocityDiff * i_linear;
-
-    //copy data
+    //copy data (client pose is authoritative; velocities restored below)
     memcpy( (void *)&(mSimState->stateInput), (const void *)(&state), sizeof(StateInput) );
 
-    copy(mSimState->stateInput.angularVelocity, newAngularVelocity);
-    copy(mSimState->stateInput.linearVelocity, newLinearVelocity);
+    copy(mSimState->stateInput.angularVelocity, coreAngularVelocity);
+    copy(mSimState->stateInput.linearVelocity, coreLinearVelocity);
+
+    // load this frame's contact manifold; it replaces the previous set and
+    // is then evolved per sub-tick until the next frame
+    auto& contacts = mSimState->contacts;
+    const std::array<ActiveContact, 6> prev = contacts;
+    const int n = std::min<int>(state.contactCount, (int)contacts.size());
+    for (int i = 0; i < n; i++) {
+      auto& c = contacts[i];
+      c.active = true;
+      copy(c.pointBody, state.contacts[i].pointBody);
+      copy(c.normalWorld, state.contacts[i].normalWorld);
+      c.normalWorld = normalize(c.normalWorld); // degenerate -> zero force
+      c.depth = clamp(state.contacts[i].depth, 0.0f, CONTACT_DMAX);
+      c.surface = state.contacts[i].surface;
+      c.rWorld = {0.0f, 0.0f, 0.0f};
+      c.force = {0.0f, 0.0f, 0.0f};
+
+      /* Depth continuity. The client integrates position with one
+       * end-of-frame velocity (rectangle rule) while the core evolved this
+       * depth per sub-tick, so the client's geometric depth carries an
+       * O(a*dt^2) error every frame — enough to differentially pump a
+       * rocking mode when resting on an asymmetric contact set. For a
+       * persisting contact keep the core's evolved depth; the client
+       * re-anchors only when geometry genuinely changed (> 2 mm disagreement,
+       * far above the ~0.1 mm static penetration and the sub-mm frame
+       * integration error). */
+      for (const auto& p : prev) {
+        if (!p.active || p.surface != c.surface) continue;
+        const vec3 d = c.pointBody - p.pointBody;
+        if (length2(d) < 0.02f * 0.02f) {
+          if (std::fabs(p.depth - c.depth) < 0.002f) {
+            c.depth = p.depth;
+          }
+          break;
+        }
+      }
+    }
+    for (size_t i = n; i < contacts.size(); i++) {
+      contacts[i].active = false;
+    }
+    mSimState->contactCount = n;
+    mSimState->contactPeakForceN = 0.0f;
+    mSimState->contactImpulseNs = 0.0f;
   }
 
   void Physics::updateGyro(double dt){
@@ -129,6 +164,8 @@ namespace SimITL{
   }
 
   void Physics::updatePhysics(double dt){
+    updateWind();
+    updateDamage(dt);
     float motorsTorque = calculateMotors(dt, mSimState->stateInput, mSimState->motorsState);
     mSimState->acceleration = calculatePhysics(dt, mSimState->stateInput, mSimState->motorsState, motorsTorque);
 
@@ -160,22 +197,166 @@ namespace SimITL{
     mSimState->stateOutput.motorStatus[1] = mSimState->motorsState[1].status;
     mSimState->stateOutput.motorStatus[2] = mSimState->motorsState[2].status;
     mSimState->stateOutput.motorStatus[3] = mSimState->motorsState[3].status;
+
+    for (int i = 0; i < 4; i++) {
+      mSimState->stateOutput.propDamage[i] = mSimState->damage.eff[i];
+    }
+    mSimState->stateOutput.crashFlags =
+        (mSimState->damage.crashed ? 1U : 0U) |
+        (mSimState->bfCrashRecoveryActive ? 2U : 0U) |
+        (mSimState->bfFlipOverActive ? 4U : 0U);
+  }
+
+  void Physics::updateWind(){
+    const auto& si = mSimState->stateInit;
+    if (si.windGustAmp <= 0.0f && si.windMean.x == 0.0f &&
+        si.windMean.y == 0.0f && si.windMean.z == 0.0f) {
+      // calm: skip entirely so no-wind trajectories stay bit-identical
+      mSimState->wind = {0.0f, 0.0f, 0.0f};
+      return;
+    }
+    vec3 wind;
+    copy(wind, si.windMean);
+    if (si.windGustAmp > 0.0f) {
+      const float t = (float)((double)mSimState->microsPassed * 1e-6) * si.windGustFreq;
+      const float ph = (float)(si.seed & 0xFFFFu) * 0.001f;
+      // simplex is a pure function of its argument — deterministic without
+      // touching the noise RNG stream. Vertical gusts weaker: real gust
+      // spectra are mostly horizontal.
+      wind[0] += SimplexNoise::noise(t + ph + 17.3f) * si.windGustAmp;
+      wind[1] += SimplexNoise::noise(t + ph + 29.7f) * si.windGustAmp * 0.3f;
+      wind[2] += SimplexNoise::noise(t + ph + 43.1f) * si.windGustAmp;
+    }
+    mSimState->wind = wind;
+  }
+
+  void Physics::updateDamage(double dt){
+    auto& dmg = mSimState->damage;
+    const auto& cfg = mSimState->damageCfg;
+
+    for (int i = 0; i < 4; i++) {
+      dmg.cooldown[i] = std::max(0.0f, dmg.cooldown[i] - (float)dt);
+    }
+    if (dmg.strikeTicks > 0) {
+      dmg.strikeTicks--;
+      if (dmg.strikeTicks == 0) {
+        dmg.strikeYawSign = 0.0f;
+      }
+    }
+
+    if (mSimState->contactCount > 0) {
+      mat3 rotation;
+      copy(rotation, mSimState->stateInput.rotation);
+      vec3 linVel;
+      copy(linVel, mSimState->stateInput.linearVelocity);
+      vec3 angVel;
+      copy(angVel, mSimState->stateInput.angularVelocity);
+      // must match calculateMotors' motor_dir (yaw reaction sign per motor)
+      const float motor_dir[4] = {-1.0f, 1.0f, 1.0f, -1.0f};
+
+      for (const auto& c : mSimState->contacts) {
+        if (!c.active) continue;
+        const vec3 rW = xform(rotation, c.pointBody);
+        const vec3 vPoint = linVel + cross(angVel, rW);
+        // approach speed at the contact point; a parked quad has vN ~ 0
+        const float vN = std::max(0.0f, -dot(vPoint, c.normalWorld));
+        const float S = cfg.surfaceFactor[c.surface < 4 ? c.surface : 3];
+
+        // structural crash: the whole airframe is done, regardless of where
+        // it hit — all motors heavily damaged, latch reported to the client
+        if (vN * S >= cfg.vCrash) {
+          for (int i = 0; i < 4; i++) {
+            dmg.accumulated[i] = std::max(dmg.accumulated[i], cfg.crashDamage);
+            dmg.cooldown[i] = cfg.cooldownS;
+          }
+          dmg.crashed = true;
+          continue;
+        }
+        if (vN < cfg.propStrikeVMin) continue;
+
+        // prop strike: contact inside a spinning prop disc — instant heavy
+        // damage on that motor, rpm slashed, and a yaw kick (the prop grabs)
+        bool struck = false;
+        for (int i = 0; i < 4; i++) {
+          const Vec3F& mp = mSimState->stateInit.quadMotorPos[i];
+          const float dx = c.pointBody[0] - mp.x;
+          const float dz = c.pointBody[2] - mp.z;
+          if (dx * dx + dz * dz > cfg.propStrikeRadius * cfg.propStrikeRadius) continue;
+          if (std::fabs(c.pointBody[1] - mp.y) > cfg.propStrikeYBand) continue;
+          if (mSimState->motorsState[i].rpm < cfg.propSpinMinRpm) continue;
+          if (dmg.cooldown[i] > 0.0f) continue;
+          const float inc = (cfg.propStrikeBase +
+                             cfg.propStrikeGain * std::min(1.0f, vN / 8.0f)) * S;
+          dmg.accumulated[i] = std::min(1.0f, dmg.accumulated[i] + inc);
+          mSimState->motorsState[i].rpm *= cfg.strikeRpmKeep;
+          dmg.strikeTicks = (int)(cfg.strikeTorqueS / dt);
+          dmg.strikeYawSign += -motor_dir[i];
+          dmg.cooldown[i] = cfg.cooldownS;
+          struck = true;
+        }
+
+        // frame impact: cumulative, quadratic in speed above the safe
+        // threshold, proximity-weighted toward the motors nearest the hit
+        if (!struck && vN >= cfg.vSafe) {
+          const float ramp = (std::min(vN, cfg.vCrash) - cfg.vSafe) /
+                             (cfg.vCrash - cfg.vSafe);
+          const float inc = cfg.impactGain * S * ramp * ramp;
+          for (int i = 0; i < 4; i++) {
+            if (dmg.cooldown[i] > 0.0f) continue;
+            const Vec3F& mp = mSimState->stateInit.quadMotorPos[i];
+            const float dx = c.pointBody[0] - mp.x;
+            const float dz = c.pointBody[2] - mp.z;
+            const float dist = std::sqrt(dx * dx + dz * dz);
+            const float w = std::max(clamp(1.0f - dist / cfg.motorReachXZ, 0.0f, 1.0f),
+                                     cfg.distribFloor);
+            dmg.accumulated[i] = std::min(1.0f, dmg.accumulated[i] + inc * w);
+            dmg.cooldown[i] = cfg.cooldownS;
+          }
+        }
+      }
+    }
+
+    // effective damage: the client's scripted input still works, the core's
+    // accumulated impact damage layers on top
+    for (int i = 0; i < 4; i++) {
+      dmg.eff[i] = clamp(std::max(mSimState->stateInput.propDamage[i],
+                                  dmg.accumulated[i]), 0.0f, 1.0f);
+      if (dmg.eff[i] >= cfg.damagedStatusAt) {
+        mSimState->motorsState[i].status |= MotorStatus::MotorDamaged;
+      }
+    }
   }
 
   void Physics::updateRotation(double dt, StateInput& state) {
     vec3 angularVelocity;
     copy(angularVelocity, state.angularVelocity);
-    
+
     const auto w = angularVelocity * dt;
     const mat3 W = {
-      vec3{    1, -w[2],  w[1]}, 
-      vec3{ w[2],     1, -w[0]}, 
+      vec3{    1, -w[2],  w[1]},
+      vec3{ w[2],     1, -w[0]},
       vec3{-w[1],  w[0],     1}
     };
-    
+
     mat3 rotation;
     copy(rotation, state.rotation);
     rotation = W * rotation;
+
+    /* The first-order update above never re-orthonormalizes, and contact
+     * torques are the first thing in this sim that spins the matrix hard
+     * between the client's per-frame quaternion echoes (which used to be the
+     * only renormalization). Gram-Schmidt the body axes (columns) so R stays
+     * in SO(3) even through a sustained max-rate tumble. */
+    const vec3 bx = normalize(get_axis(rotation, 0));
+    vec3 by = get_axis(rotation, 1);
+    by = normalize(by - bx * dot(bx, by));
+    const vec3 bz = cross(bx, by);
+    for (int i = 0; i < 3; i++) {
+      rotation[i][0] = bx[i];
+      rotation[i][1] = by[i];
+      rotation[i][2] = bz[i];
+    }
+
     copy(state.rotation, rotation);
   }
 
@@ -341,7 +522,8 @@ namespace SimITL{
 
     vec4 rpmFactor    = maximum(motorRpm, 0.0f) / maxRpm;
     vec4 rpmFactor2   = rpmFactor * rpmFactor;
-    vec4 dmgFactor    = toVec4(state.propDamage) + 0.05f;
+    // effective damage (client input + impact-accumulated) drives vibration
+    vec4 dmgFactor    = toVec4(mSimState->damage.eff) + 0.05f;
     vec4 rpmDmgFactor = dmgFactor * rpmFactor2;
 
     // only call once per dt, adapts motor phase!
@@ -455,7 +637,9 @@ namespace SimITL{
 
     vec3 linVel;
     copy(linVel, state.linearVelocity);
-    const auto vel = std::max(0.0f, dot(linVel, up));
+    // aerodynamics act on the velocity relative to the AIR, not the ground
+    const vec3 airVel = linVel - mSimState->wind;
+    const auto vel = std::max(0.0f, dot(airVel, up));
 
     const auto ambientTemp = mSimState->stateInit.ambientTemp;
     // prevent div by 0 
@@ -464,25 +648,26 @@ namespace SimITL{
     const float maxPropWashSpeed = std::max(mSimState->stateInit.maxPropWashSpeed, 0.001f); 
     const float propWashFactor   = mSimState->stateInit.propWashFactor;
 
-    const float speed = std::abs(length(linVel)); // m/s
+    const float speed = std::abs(length(airVel)); // airspeed, m/s
     float speedFactor = std::min(speed / maxPropWashSpeed, 1.0f);
 
     for (int i = 0; i < 4; i++) {
 
-      state.propDamage[i] = clamp(state.propDamage[i], 0.0f, 1.0f);
+      // effective damage: max(client-scripted input, impact-accumulated)
+      const float propDamage = mSimState->damage.eff[i];
 
       // 1.0 - effect
-      float propHealthFactor = 1.0f - state.propDamage[i];
+      float propHealthFactor = 1.0f - propDamage;
       // 1.0 + effect: increasing torque for damaged prop
-      float propHealthTorqueFactor = 1.0f + state.propDamage[i];
+      float propHealthTorqueFactor = 1.0f + propDamage;
 
       // 1.0 + effect: increasing thrust close to ground
       float groundEffect = 1.0f + ((state.groundEffect[i] * state.groundEffect[i]) * 0.7f);
       
-      // clamp speed so it has no propwash effect at 0 
+      // clamp speed so it has no propwash effect at 0
       // positive value depending on how much thrust is given against actual movement direction of quad
-      float reverseThrust = (speed > minPropWashSpeed) ? 
-        std::max(0.0f, dot(normalize(linVel), normalize(motors[i].thrust * up) * -1.0f)) : 0.0f;
+      float reverseThrust = (speed > minPropWashSpeed) ?
+        std::max(0.0f, dot(normalize(airVel), normalize(motors[i].thrust * up) * -1.0f)) : 0.0f;
       // keep between 0.0 and 1.0, takes x % that point the most against movement direction
       
       reverseThrust = std::max(0.0f, (reverseThrust - propWashAngleOfAttack) / (1.0f - propWashAngleOfAttack));
@@ -500,10 +685,10 @@ namespace SimITL{
       float propwashEffect = std::max(std::min(1.0f - (speedFactor * propWashNoise * reverseThrust) * propWashFactor, 1.0f), 0.0f);
 
       // 1.0 - effect    reusing prop wash noise to reduce thrust if motor/prop is damaged
-      float motorDamageEffect = 1.0f - (std::max(0.0f, 0.5f * (SimplexNoise::noise(motors[i].phase * speed) + 1.0f)) * state.propDamage[i] * propWashNoise);
+      float motorDamageEffect = 1.0f - (std::max(0.0f, 0.5f * (SimplexNoise::noise(motors[i].phase * speed) + 1.0f)) * propDamage * propWashNoise);
 
       // 1.0 - effect   reusing prop wash noise to reduce thrust if motor is damaged
-      float propDamageEffect = 1.0f - (state.propDamage[i] * propWashNoise);
+      float propDamageEffect = 1.0f - (propDamage * propWashNoise);
 
       auto rpm = motors[i].rpm;
       const auto kV = mSimState->stateInit.motorKV[i];
@@ -589,12 +774,14 @@ namespace SimITL{
     // force sum:
     vec3 total_force = gravity_force;
 
-    // drag:
+    // drag — on the velocity relative to the air, so wind both drifts the
+    // quad and changes its effective drag
     vec3 linearVelocity;
     copy(linearVelocity, state.linearVelocity);
+    const vec3 airVelocity = linearVelocity - mSimState->wind;
 
-    float vel2 = length2(linearVelocity);
-    auto dir = normalize(linearVelocity);
+    float vel2 = length2(airVelocity);
+    auto dir = normalize(airVelocity);
 
     mat3 rotation;
     copy(rotation, state.rotation);
@@ -614,6 +801,13 @@ namespace SimITL{
     for (auto i = 0u; i < 4; i++) {
       total_force = total_force + xform(rotation, vec3{0, motors[i].thrust, 0});
     }
+
+    // contacts: penalty forces at the manifold points. Added to the same
+    // accumulator as thrust so they flow into `acceleration` — which is what
+    // the virtual accelerometer reads: the firmware feels touchdown, ground
+    // support and crashes exactly like real hardware.
+    vec3 contactMoment {0.0f, 0.0f, 0.0f};
+    total_force = total_force + contactForces(dt, state, contactMoment);
 
     acceleration = total_force / std::max(mSimState->stateInit.quadMass, 0.001f);
 
@@ -638,6 +832,14 @@ namespace SimITL{
       total_moment = total_moment + cross(rad, force);
     }
 
+    total_moment = total_moment + contactMoment;
+
+    // prop-strike yaw kick: a striking prop grabs the surface briefly
+    if (mSimState->damage.strikeTicks > 0) {
+      total_moment = total_moment + get_axis(rotation, 1) *
+          (mSimState->damageCfg.strikeTorque * mSimState->damage.strikeYawSign);
+    }
+
     vec3 inv_inertia;
     copy(inv_inertia, mSimState->stateInit.quadInvInertia);
     mat3 inv_tensor = {vec3{inv_inertia[0], 0, 0},
@@ -657,7 +859,79 @@ namespace SimITL{
     copy(state.angularVelocity, angularVelocity);
 
     updateRotation(dt, state);
+    advanceContactDepths(dt, state);
     return acceleration;
+  }
+
+  vec3 Physics::contactForces(double dt, const StateInput& state, vec3& momentOut){
+    vec3 totalForce {0.0f, 0.0f, 0.0f};
+    if (mSimState->contactCount == 0) {
+      return totalForce;
+    }
+
+    mat3 rotation;
+    copy(rotation, state.rotation);
+    vec3 linVel;
+    copy(linVel, state.linearVelocity);
+    vec3 angVel;
+    copy(angVel, state.angularVelocity);
+
+    for (auto& c : mSimState->contacts) {
+      if (!c.active) continue;
+      const ContactMaterial& mat = contactMaterial(c.surface);
+
+      c.rWorld = xform(rotation, c.pointBody);
+      const vec3 vPoint = linVel + cross(angVel, c.rWorld);
+      const float vN = dot(vPoint, c.normalWorld);
+
+      // spring-damper along the normal; max(0,..) means no adhesion
+      const float fN = clamp(mat.k * c.depth - mat.c * vN, 0.0f, CONTACT_FMAX);
+
+      // Coulomb friction with a viscous cap for stability near rest
+      const vec3 vT = vPoint - c.normalWorld * vN;
+      const float vTLen = length(vT);
+      vec3 fT {0.0f, 0.0f, 0.0f};
+      if (vTLen > 1e-6f) {
+        fT = (vT / vTLen) * -std::min(mat.mu * fN, CONTACT_KT * vTLen);
+      }
+
+      const vec3 f = c.normalWorld * fN + fT;
+      c.force = f;
+      totalForce = totalForce + f;
+      momentOut = momentOut + cross(c.rWorld, f);
+
+      const float fLen = length(f);
+      if (fLen > mSimState->contactPeakForceN) {
+        mSimState->contactPeakForceN = fLen;
+      }
+      mSimState->contactImpulseNs += fLen * static_cast<float>(dt);
+    }
+    return totalForce;
+  }
+
+  void Physics::advanceContactDepths(double dt, const StateInput& state){
+    if (mSimState->contactCount == 0) {
+      return;
+    }
+    vec3 linVel;
+    copy(linVel, state.linearVelocity);
+    vec3 angVel;
+    copy(angVel, state.angularVelocity);
+
+    for (auto& c : mSimState->contacts) {
+      if (!c.active) continue;
+      // rWorld cached by contactForces this sub-tick; the surface is static,
+      // so the point sinks/rises with its own normal velocity
+      const vec3 vPoint = linVel + cross(angVel, c.rWorld);
+      const float vN = dot(vPoint, c.normalWorld);
+      c.depth += static_cast<float>(-vN * dt);
+      /* A separated point stays ARMED at depth 0 until the next manifold:
+       * with d = 0 the spring term vanishes and Fn = max(0, -c*vn) is a
+       * one-sided damper on re-approach. Expiring immediately let a rocking
+       * quad re-impact undamped between client frames, which pumped a
+       * standing wobble that never settled. */
+      c.depth = clamp(c.depth, 0.0f, CONTACT_DMAX);
+    }
   }
 
   void Physics::updateCommands(CommandType commands){
@@ -680,6 +954,8 @@ namespace SimITL{
       mSimState->motorsState[i].temp = mSimState->stateInit.ambientTemp;
       mSimState->motorsState[i].status = MotorStatus::MotorNone;
     }
+    // new props on, crash latch cleared
+    mSimState->damage = DamageState{};
   }
 
   /* Clears the integrator state that initState() does not touch. Without this,
@@ -690,6 +966,16 @@ namespace SimITL{
     mSimState->acceleration = {0.0f, 0.0f, 0.0f};
     mSimState->stateInput.linearVelocity = {0.0f, 0.0f, 0.0f};
     mSimState->stateInput.angularVelocity = {0.0f, 0.0f, 0.0f};
+
+    for (auto& c : mSimState->contacts) {
+      c = ActiveContact{};
+    }
+    mSimState->contactCount = 0;
+    mSimState->contactPeakForceN = 0.0f;
+    mSimState->contactImpulseNs = 0.0f;
+    mSimState->damage = DamageState{};
+    mSimState->bfCrashRecoveryActive = false;
+    mSimState->bfFlipOverActive = false;
 
     mSimState->gyro = {0.0f, 0.0f, 0.0f};
     mSimState->acc = {0.0f, 0.0f, 0.0f};

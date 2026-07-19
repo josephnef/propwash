@@ -36,6 +36,24 @@ target_link_libraries(pw-tester PRIVATE pw_sim ${BF_LINK_OPTIONS})
 
 enable_testing()
 add_test(NAME headless_scenario COMMAND pw-tester)
+
+# Contact solver gate: a disarmed quad dropped 0.5 m (level and inverted)
+# must settle dead still on contact physics alone — and the inverted drop
+# must stay inverted (crash outcomes are allowed to exist).
+add_test(NAME contact_drop COMMAND pw-tester --drop-test)
+
+# Crash lifecycle: rest never damages; a 10 m drop is a structural crash;
+# a wrecked quad cannot hover (through physics, not scripting); REPAIR
+# restores it and the same controller then hovers.
+add_test(NAME crash_scenario COMMAND pw-tester --crash-test)
+set_tests_properties(crash_scenario PROPERTIES TIMEOUT 120)
+
+# Contact/damage over the wire: scripted drops onto the client-built ground
+# manifold -> damage bands + crash latch + REPAIR read back from PW_STATE_OUT.
+add_test(NAME collision_e2e
+  COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/tester/collision_e2e.py
+    $<TARGET_FILE:propwash-core>)
+set_tests_properties(collision_e2e PROPERTIES TIMEOUT 90)
 add_test(NAME udp_e2e
   COMMAND bash ${CMAKE_SOURCE_DIR}/tools/tester/run_e2e.sh $<TARGET_FILE:propwash-core>)
 set_tests_properties(udp_e2e PROPERTIES TIMEOUT 120)
@@ -83,7 +101,7 @@ if(GODOT_BIN)
     COMMAND ${GODOT_BIN} --headless --path ${CMAKE_SOURCE_DIR}/client-godot)
   set_tests_properties(godot_client PROPERTIES
     TIMEOUT 120
-    ENVIRONMENT "PROPWASH_AUTOTEST=1;PROPWASH_CORE=$<TARGET_FILE:propwash-core>")
+    ENVIRONMENT "PROPWASH_AUTOTEST=1;PROPWASH_PORT=9143;PROPWASH_CORE=$<TARGET_FILE:propwash-core>")
 
   # Quality-tier selection rule. Pure function, no rendering, no sim — the
   # cases that matter (240 Hz -> low) cannot be produced on a 60 Hz dev machine.
@@ -100,7 +118,27 @@ if(GODOT_BIN)
             --script res://tests/fpv_cull_test.gd)
   set_tests_properties(fpv_cull PROPERTIES
     TIMEOUT 60
-    ENVIRONMENT "PROPWASH_CORE=/nonexistent/propwash-core")
+    ENVIRONMENT "PROPWASH_PORT=9146;PROPWASH_CORE=/nonexistent/propwash-core")
+
+  # Collision detection: hull vs analytic ground + engine-query gate tubes,
+  # surface classification, slop depenetration, Godot->sim manifold
+  # conversion. Detection only — the core's solver has its own ctests.
+  add_test(NAME client_collision
+    COMMAND ${GODOT_BIN} --headless --path ${CMAKE_SOURCE_DIR}/client-godot
+            --script res://tests/collision_test.gd)
+  set_tests_properties(client_collision PROPERTIES
+    TIMEOUT 60
+    ENVIRONMENT "PROPWASH_PORT=9147;PROPWASH_CORE=/nonexistent/propwash-core")
+
+  # T-repair flow against a real core: crash from 10 m, repair in place,
+  # assert damage/latch cleared, quad upright, and no stale-echo pose
+  # flicker (the one-deep pipeline bug that made T "not work").
+  add_test(NAME repair_flow
+    COMMAND ${GODOT_BIN} --headless --path ${CMAKE_SOURCE_DIR}/client-godot
+            --script res://tests/repair_flow_test.gd)
+  set_tests_properties(repair_flow PROPERTIES
+    TIMEOUT 90
+    ENVIRONMENT "PROPWASH_NO_JS=1;PROPWASH_PORT=9145;PROPWASH_CORE=$<TARGET_FILE:propwash-core>")
 
   # Autonomous gate fly-through (angle mode): arms, cruises forward through
   # all three gates holding altitude, asserts it flew past the last gate.
@@ -108,5 +146,5 @@ if(GODOT_BIN)
     COMMAND ${GODOT_BIN} --headless --path ${CMAKE_SOURCE_DIR}/client-godot)
   set_tests_properties(flythrough PROPERTIES
     TIMEOUT 120
-    ENVIRONMENT "PROPWASH_DEMO=acro;PROPWASH_CORE=$<TARGET_FILE:propwash-core>")
+    ENVIRONMENT "PROPWASH_DEMO=acro;PROPWASH_PORT=9144;PROPWASH_CORE=$<TARGET_FILE:propwash-core>")
 endif()

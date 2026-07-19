@@ -16,3 +16,14 @@ set align_board_yaw = 0
 #  - motor_output_reordering, gps_*, beeper hardware, osd chip position: some
 #    exist, some are rejected as INVALID NAME; none affect flight in the sim.
 #  - acc_calibration is the real chip's bias; harmless small offsets in sim.
+#
+# Crash handling: the FC dump is authoritative — nothing is overridden here,
+# so reloading a new dump makes the sim behave like the reconfigured real
+# quad. Contact forces reach the virtual gyro/accel, which means Betaflight's
+# own crash detection works natively: `set crash_recovery = ON|BEEP|DISARM`
+# in the dump behaves as on hardware (DISARM kills the motors on a detected
+# crash signature — saturated mixer + gyro > crash_gthreshold — and sets
+# ARMING_DISABLED_CRASH_DETECTED until the ARM switch is cycled). The
+# sim-side damage model (prop damage, structural-crash latch) runs on top
+# either way. flip_over_after_crash (turtle) can NOT work on this target:
+# it is gated on a DSHOT motor protocol, and targetPreInit() forces PWM.
