@@ -17,7 +17,7 @@ No external dependencies (kernel `js` API, not SDL2). One pinned submodule.
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo && cmake --build build -j
-ctest --test-dir build            # 9 headless tests; ~2 min
+ctest --test-dir build            # 14 headless tests; ~2 min
 ```
 
 The Betaflight submodule builds as a static lib (`extern/`). Source list is
@@ -130,6 +130,9 @@ strays before running (`pkill -f build/propwash-core`).
   reason on every change — the tool for setting up switches / debugging "won't
   arm".
 - `[pw][js]` shows joystick detection + calibration load.
+- `PROPWASH_CONTACT_LOG=1` (client) prints every new contact event —
+  `[pw][contact] t=… n=… surface=… depth=…` — the tool for "did I actually
+  touch that gate" and for verifying a course change keeps the demo clear.
 - MSP identity / live config: `python3 tools/bfcli/pw_cli.py run "version"`.
 
 ## Conventions
