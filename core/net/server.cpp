@@ -125,10 +125,16 @@ static uint64_t nowMillis()
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-/* A client is considered gone after this long without a PW_STATE_IN, at which
- * point idle-ticking resumes so the Configurator stays alive. Generous: a
- * stalled client must not silently hand time back to the idle tick. */
-static constexpr uint64_t CLIENT_IDLE_MS = 250;
+/* How long without a PW_STATE_IN before a client counts as gone, at which point
+ * idle-ticking resumes so the Configurator stays alive on an abandoned core.
+ *
+ * Deliberately generous. In lockstep the client owns the clock, so a client
+ * that merely stalls — GC, a slow frame, a loaded CI runner — must not have the
+ * gap silently filled in by idle ticks; that reintroduces exactly the
+ * wall-clock dependency this mode exists to remove. 250 ms was too tight and
+ * made the determinism test flaky under CI load. The cost of erring long is
+ * only that MSP takes a couple of seconds to come back after a client exits. */
+static constexpr uint64_t CLIENT_IDLE_MS = 3000;
 
 static void applyInit(const PwInit& p, StateInit& s)
 {
