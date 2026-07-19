@@ -58,16 +58,27 @@ add_test(NAME udp_e2e
   COMMAND bash ${CMAKE_SOURCE_DIR}/tools/tester/run_e2e.sh $<TARGET_FILE:propwash-core>)
 set_tests_properties(udp_e2e PROPERTIES TIMEOUT 120)
 
-# NOTE: tools/tester/determinism_check.py is deliberately NOT wired in as a
-# ctest yet. It measures the real property — two fresh cores, identical inputs,
-# byte-identical output — and the sim does not yet satisfy it: suppressing the
-# idle tick removed the dominant source, but residual firmware state that
-# BF::init() does not clear still varies between sessions. Run it by hand:
+# NOTE: neither determinism check is wired as a ctest yet — both are red for
+# the same underlying reason (Betaflight statics that BF::init() does not
+# clear on an in-process re-init) and wiring in a red test trains people to
+# ignore it. Run them by hand; on a mismatch both report the first divergent
+# frame and field:
 #
-#   python3 tools/tester/determinism_check.py ./build/propwash-core
+#   python3 tools/tester/reset_determinism.py ./build/propwash-core
+#     ONE core, the identical tape twice around PW_CMD_RESET. Currently red
+#     on frame 0: the firmware's internal RC/mode latches and the completed
+#     gyro calibration survive the reset (tape 2 boots "pre-armed" with tape
+#     1's switch state). Gates the purity of the whole sim path once green.
 #
-# It will be made a gating test once it passes reliably. Wiring it in while it
-# is red would either block every unrelated change or train people to ignore it.
+#   python3 tools/tester/determinism_check.py ./build/propwash-core [--runs N]
+#     CROSS-process: two fresh cores, identical inputs. Red via the same
+#     residue class reached through the first-contact reset: whether gyro
+#     calibration completed during pre-client idle ticking decides between
+#     two trajectory classes. --runs N prints the class histogram.
+#
+# Both get promoted to gating tests once the reset is made fully
+# deterministic (snapshot/restore of the firmware's data+bss is the likely
+# fix — the residue is a family of statics, not one latch).
 
 # CLI/Configurator data path: apply the pilot's diff over TCP 5761, save,
 # reboot in-process, verify the tune survives (the M3 core deliverable).

@@ -33,6 +33,50 @@ SOUT = struct.Struct("<IQ4f3f3f3f3f4f4BBIIBff4fB")
 assert SIN.size == 308, SIN.size    # PwStateIn, protocol v2
 assert SOUT.size == 131, SOUT.size  # PwStateOut, protocol v2
 
+# Field names for SOUT.unpack()'s flat tuple, used by the determinism
+# tooling to say WHICH field diverged instead of just "hashes differ".
+SOUT_FIELDS = (
+    ["frame_id", "sim_time_us"]
+    + ["orientation." + c for c in "wxyz"]
+    + ["angular_velocity." + c for c in "xyz"]
+    + ["linear_velocity." + c for c in "xyz"]
+    + ["position." + c for c in "xyz"]
+    + ["acceleration." + c for c in "xyz"]
+    + ["motor_rpm[%d]" % i for i in range(4)]
+    + ["motor_status[%d]" % i for i in range(4)]
+    + ["armed", "arming_disable_flags", "flight_mode_flags", "beeper",
+       "vbat", "amperage"]
+    + ["prop_damage[%d]" % i for i in range(4)]
+    + ["crash_flags"]
+)
+assert len(SOUT_FIELDS) == len(SOUT.unpack(b"\0" * SOUT.size))
+
+
+def report_first_divergence(frames_a, frames_b, label_a="A", label_b="B"):
+    """Print where two PW_STATE_OUT streams first differ, field by field.
+    Returns the first divergent frame index, or -1 if byte-identical.
+
+    Frame 0 divergence means init residue; a late divergence points at
+    filter/noise/accumulator state."""
+    n = min(len(frames_a), len(frames_b))
+    for f in range(n):
+        if frames_a[f] == frames_b[f]:
+            continue
+        a = SOUT.unpack(frames_a[f])
+        b = SOUT.unpack(frames_b[f])
+        diffs = [i for i in range(len(a)) if a[i] != b[i]]
+        print("first divergence at frame %d (sim_t=%.4f s), %d field(s):"
+              % (f, a[1] / 1e6, len(diffs)))
+        for i in diffs:
+            print("  %-24s %s=%r  %s=%r"
+                  % (SOUT_FIELDS[i], label_a, a[i], label_b, b[i]))
+        return f
+    if len(frames_a) != len(frames_b):
+        print("streams identical for %d frames but lengths differ (%d vs %d)"
+              % (n, len(frames_a), len(frames_b)))
+        return n
+    return -1
+
 
 def spawn(core, port, eeprom=None, extra=None, settle=2.0):
     """Start a propwash-core. Always --no-js: a connected handset has RC
