@@ -81,6 +81,16 @@ if(GODOT_BIN)
             --script res://tests/quality_test.gd)
   set_tests_properties(quality_tiers PROPERTIES TIMEOUT 60)
 
+  # FPV cull mask + prop->motor index map. Both are invariants a rewrite can
+  # silently drop, and the cull mask already was once. PROPWASH_CORE points
+  # nowhere on purpose: this builds the world but must not spawn a core.
+  add_test(NAME fpv_cull
+    COMMAND ${GODOT_BIN} --headless --path ${CMAKE_SOURCE_DIR}/client-godot
+            --script res://tests/fpv_cull_test.gd)
+  set_tests_properties(fpv_cull PROPERTIES
+    TIMEOUT 60
+    ENVIRONMENT "PROPWASH_CORE=/nonexistent/propwash-core")
+
   # Autonomous gate fly-through (angle mode): arms, cruises forward through
   # all three gates holding altitude, asserts it flew past the last gate.
   add_test(NAME flythrough

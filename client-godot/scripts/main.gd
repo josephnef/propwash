@@ -719,23 +719,58 @@ func _autotest_check(delta: float) -> void:
 
 
 var _props: Array[Node3D] = []   # 4 prop meshes, spun by motor RPM
-var _prop_angle := 0.0
+var _prop_angles := [0.0, 0.0, 0.0, 0.0]
 
 
 # Spin the props from the firmware's motor RPM (PW_STATE_OUT.motor_rpm) and
 # fade the blur discs in with RPM. At real RPM the blades strobe, which reads
 # as a translucent disc — exactly the real O3 look.
+# Godot prop index -> firmware/physics motor index.
+#
+# These orders genuinely differ and it is not obvious, because the two frames
+# disagree about which way is forward. The sim frame is +z forward
+# (core/sim/profile_cinelog35.h): motors are RR, FR, RL, FL. Godot is -z
+# forward (main.gd builds them FR, FL, RR, RL). So prop i must read motor
+# RPM_FOR_PROP[i], not motor i.
+#
+# Cross-check: physics.cpp:431 has motor_dir = {-1, 1, 1, -1} in sim order.
+# Permuting that by this map gives [+1, -1, -1, +1] — exactly PROP_SPIN below,
+# which is independent confirmation the mapping is right rather than plausible.
+const RPM_FOR_PROP := [1, 3, 0, 2]
+const PROP_SPIN := [1.0, -1.0, -1.0, 1.0]
+
+# Visual layer for airframe parts the O3 physically cannot see. The FPV camera's
+# cull mask excludes it; a chase camera could still render them.
+#
+# This has been lost once before: a rewrite of the drone model dropped both the
+# layer assignment and the camera's mask, and nothing noticed. Procedural scenes
+# have no schema, so tests/fpv_cull_test.gd guards it.
+#
+# Ducts, motors and props deliberately stay on the default layer: a real
+# cinewhoop feed does show its own front ducts and blades, and that is a strong
+# authenticity cue rather than an artifact.
+const FPV_HIDDEN_LAYER := 20
+
+
+func _hide_from_fpv(node: Node) -> void:
+	if node is VisualInstance3D:
+		node.set_layer_mask_value(1, false)
+		node.set_layer_mask_value(FPV_HIDDEN_LAYER, true)
+	for c in node.get_children():
+		_hide_from_fpv(c)
+
+
 func _spin_props(delta: float) -> void:
 	if _props.is_empty():
 		return
 	var rpm := [0.0, 0.0, 0.0, 0.0]
 	if not _last_out.is_empty() and _last_out.has("motor_rpm"):
 		rpm = _last_out.motor_rpm
-	# a single shared visual rate (scaled down; true RPM would just alias)
-	var avg: float = (rpm[0] + rpm[1] + rpm[2] + rpm[3]) / 4.0
-	_prop_angle += (avg / 60.0) * TAU * delta * 0.05   # 5% so blades stay visible
 	for i in range(_props.size()):
-		_props[i].rotation.y = _prop_angle * (1.0 if (_props[i].scale.x > 0) else -1.0)
+		var r: float = rpm[RPM_FOR_PROP[i]]
+		# 5% of true rate so the blades stay legible instead of strobing
+		_prop_angles[i] += (r / 60.0) * TAU * delta * 0.05 * PROP_SPIN[i]
+		_props[i].rotation.y = _prop_angles[i]
 
 
 # A procedural CineLog35-style 3.5" ducted cinewhoop: centre plate, 4 ducts
@@ -757,6 +792,7 @@ func _build_drone_model(root: Node3D) -> void:
 	pm.material = carbon
 	plate.mesh = pm
 	root.add_child(plate)
+	_hide_from_fpv(plate)
 
 	# battery on top
 	var batt := MeshInstance3D.new()
@@ -768,6 +804,7 @@ func _build_drone_model(root: Node3D) -> void:
 	batt.mesh = btm
 	batt.position = Vector3(0, 0.02, 0.005)
 	root.add_child(batt)
+	_hide_from_fpv(batt)
 
 	# O3 camera pod up front (what the FPV cam looks out of)
 	var pod := MeshInstance3D.new()
@@ -778,6 +815,7 @@ func _build_drone_model(root: Node3D) -> void:
 	pod.position = Vector3(0, 0.038, -0.03)
 	pod.rotation_degrees = Vector3(25, 0, 0)
 	root.add_child(pod)
+	_hide_from_fpv(pod)
 
 	# 4 ducts + motors + props at the motor positions (Godot: forward = -z)
 	var motors := [
@@ -786,7 +824,6 @@ func _build_drone_model(root: Node3D) -> void:
 		Vector3( 0.054, 0.0,  0.054),  # rear-right
 		Vector3(-0.054, 0.0,  0.054),  # rear-left
 	]
-	var spin_dir := [1.0, -1.0, -1.0, 1.0]
 	for i in range(4):
 		var p: Vector3 = motors[i]
 
@@ -814,7 +851,6 @@ func _build_drone_model(root: Node3D) -> void:
 		# prop — a translucent disc (spinning blur) with 3 faint blades
 		var prop := Node3D.new()
 		prop.position = p + Vector3(0, 0.014, 0)
-		prop.scale = Vector3(spin_dir[i], 1, 1)  # cheap CW/CCW hint
 		var disc := MeshInstance3D.new()
 		var dm := CylinderMesh.new()
 		dm.top_radius = 0.043
@@ -1377,6 +1413,7 @@ func _build_world() -> void:
 	cam.far = 1500.0
 	cam.position = Vector3(0, 0.045, -0.02)
 	cam.rotation_degrees = Vector3(25, 0, 0)
+	cam.set_cull_mask_value(FPV_HIDDEN_LAYER, false)   # see _hide_from_fpv
 	_drone.add_child(cam)
 	cam.current = true
 	_cam = cam
