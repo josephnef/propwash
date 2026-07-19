@@ -135,7 +135,11 @@ jobs:
           curl -sL -o godot.zip \
             "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_macos.universal.zip"
           unzip -q godot.zip
-          sudo install -m755 Godot.app/Contents/MacOS/Godot /usr/local/bin/godot
+          # symlink into the bundle; do NOT copy the executable out of it.
+          # Copying breaks the code signature and macOS SIGKILLs the binary
+          # (exit 137, "Killed: 9") the moment it runs.
+          sudo mv Godot.app /Applications/
+          sudo ln -sf /Applications/Godot.app/Contents/MacOS/Godot /usr/local/bin/godot
           godot --version
 
       - name: Configure & build
