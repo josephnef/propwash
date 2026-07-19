@@ -283,9 +283,13 @@ void Server::run(SimITL::Sim& sim, const StateInit& defaultInit, Joystick* js)
                 // depends on when the client happened to start — which showed
                 // up as a different battery state on frame 0 of every run.
                 // Discard it so a client session always begins from the same
-                // physics state. Firmware is deliberately NOT re-inited here:
-                // a Configurator may already be attached and mid-session.
-                sim.resetPhysicsOnly(initState);
+                // state. This includes re-initialising the firmware: the idle
+                // ticks advanced firmware time too, so resetting only the
+                // physics left boot-grace and calibration at a different point
+                // in every run. Settings are unaffected — BF::init() reloads
+                // them from the eeprom, so anything applied and saved over the
+                // CLI survives.
+                sim.reset(initState);
             }
 
             boot();
