@@ -17,7 +17,7 @@ No external dependencies (kernel `js` API, not SDL2). One pinned submodule.
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo && cmake --build build -j
-ctest --test-dir build            # 7 headless tests; ~2 min
+ctest --test-dir build            # 9 headless tests; ~2 min
 ```
 
 The Betaflight submodule builds as a static lib (`extern/`). Source list is
@@ -29,13 +29,15 @@ if the firmware version changes.
 
 | ctest | proves |
 |-------|--------|
-| `headless_scenario` | BF boots, MSP identity = `BTFL 4.5.2`, arms, angle-hover, **determinism hash equal across runs** |
+| `headless_scenario` | BF boots, MSP identity = `BTFL 4.5.2`, arms, angle-hover; prints `STATE_HASH` (printed, not asserted) |
 | `udp_e2e` | Python client drives the wire protocol, hovers |
 | `diff_roundtrip` | apply a `diff all` over CLI → save → in-process reboot → settings survive |
 | `osd_render` | real `osd.c` renders through the fake displayport → `PW_OSD` |
 | `real_tune_hover` | bake the real diff → fresh boot has `p_pitch=53`, `align_board_roll=0` → hovers |
 | `godot_client` | the actual GDScript client arms + hovers headless (`--headless`, autotest) |
 | `flythrough` | autonomous angle-mode gate run |
+| `quality_tiers` | render tier selection rule as a pure function (cases a single machine can't produce) |
+| `fpv_cull` | FPV cull mask + prop→motor index map — invariants a rewrite has already silently dropped once |
 
 `godot_client`/`flythrough` only run if a `godot` binary is found (see
 `find_program(GODOT_BIN ...)` in `CMakeLists.txt`). Tests that bind ports must
@@ -56,8 +58,8 @@ strays before running (`pkill -f build/propwash-core`).
   patched `scheduler.c` and `cli.c`, and a fake max7456 displayport for OSD
   capture. Every modified stock file has a recorded diff in `patches/`.
 - **`core/net/server.cpp`** — the UDP protocol server. Boots BF immediately (so
-  the Configurator can attach before a client), idle-ticks when no client is
-  driving (keeps MSP/CLI alive), streams `PW_STATE_OUT` + `PW_OSD`.
+  the Configurator can attach before a client), idle-ticks *only while no client
+  is driving* (keeps MSP/CLI alive), streams `PW_STATE_OUT` + `PW_OSD`.
 - **`client-godot/`** — Godot 4, pure GDScript. Spawns the core, drives it in
   lockstep, owns collision, converts sim↔Godot handedness (mirror z; quat -x,-y;
   angular velocity is a pseudovector: -x,-y,+z).
@@ -79,7 +81,19 @@ strays before running (`pkill -f build/propwash-core`).
   zeroed for the sim — the virtual gyro is already airframe-aligned, else it
   flies upside-down. That's what `config/sitl-overrides.txt` is for.
 - **`--server` must boot BF immediately and idle-tick** — otherwise an idle core
-  (no client) leaves MSP/CLI/Configurator dead.
+  (no client) leaves MSP/CLI/Configurator dead. But the idle tick must NOT fire
+  while a client is driving: it advances the same accumulator the client does, so
+  any packet later than the 5 ms recv timeout used to inject simulated time
+  nobody asked for and made runs unreproducible. That is what `PW_CMD_LOCKSTEP`
+  (the default) enforces; `PW_CMD_REALTIME` opts back into free-running.
+- **The client is the clock.** It sends a fixed 250 Hz timestep and consumes
+  exactly one `PW_STATE_OUT` per frame (a one-deep pipeline). Both matter for
+  reproducibility: 1/250 divides exactly into the 50 µs tick quantum, and
+  draining a variable number of replies made the client's lag vary run to run.
+- **First client contact resets the sim.** Before a client attaches the core is
+  idle-ticking, so how much simulated time has already elapsed depends on process
+  startup. Without the reset that showed up as a different battery voltage on
+  frame 0 of every run.
 - **A physically-connected joystick has RC priority** and will hijack the
   headless tests — autotest/demo spawn the core with `--no-js`.
 - **Betaflight source uses `#pragma GCC poison sprintf snprintf`** unless

@@ -97,7 +97,7 @@ If you cloned without `--recursive`: `git submodule update --init --recursive`.
 
 ## Fly it
 
-Install Godot 4.3+ (`pacman -S godot`, `apt install godot`, or grab the
+Install Godot 4.7+ (`pacman -S godot`, `apt install godot`, or grab the
 [official binary](https://godotengine.org/download)), then:
 
 ```bash
@@ -127,11 +127,11 @@ The Godot client spawns `build/propwash-core` itself. Controls:
 - **Second monitor** — if one is attached the sim opens fullscreen on it, leaving
   the primary free for the Configurator and logs. Override with
   `PROPWASH_SCREEN=off` (stay windowed) or `PROPWASH_SCREEN=<index>` (0-based).
-- **High-refresh displays** — the client drives the core in lockstep, one packet
-  per physics frame, so the pose update rate *is* the physics rate. It follows
-  the monitor: a 240 Hz screen runs a 240 Hz lockstep, while 60/100 Hz setups
-  stay on the 100 Hz baseline and pay exactly what they always have (clamped to
-  100–240). Pin it with `PROPWASH_TICK=<hz>` if you'd rather choose yourself.
+- **Lockstep rate** — the client drives the core at a fixed **250 Hz**, one packet
+  per step, and consumes exactly one reply per frame. It is deliberately not tied
+  to your monitor: the rate is an input to the simulation, so varying it makes
+  runs unreproducible. 1/250 also divides exactly into the core's 50 µs tick
+  quantum. Display smoothness comes from physics interpolation instead.
 - **Quality tiers** — `low`/`medium`/`high`, auto-selected from what the GPU
   actually has to sustain (width × height × refresh), so a 240 Hz panel keeps its
   framerate and a 60 Hz one gets the prettier version. **Every tier renders at
@@ -141,6 +141,25 @@ The Godot client spawns `build/propwash-core` itself. Controls:
   than let a heavy scene starve the sim. `PROPWASH_SCALE=<0.5-1.0>` exists as an
   explicit opt-in for a GPU that genuinely can't drive the panel — it is never
   applied by default.
+
+### Environment variables
+
+Everything the client understands, in one place — several of these were only
+discoverable by reading the source.
+
+| variable | effect |
+|---|---|
+| `PROPWASH_EEPROM=<path>` | eeprom the client's core boots from (your baked tune) |
+| `PROPWASH_CORE=<path>` | propwash-core binary to spawn; defaults to `../build/propwash-core` |
+| `PROPWASH_DEMO=acro` | autonomous fly-through of all three gates, prints `[demo] PASS` |
+| `PROPWASH_AUTOTEST=1` | headless arm + hover self-test, exits 0/1 (what CI runs) |
+| `PROPWASH_SHOTS=<dir>` | save PNG frames at fixed times during a demo run |
+| `PROPWASH_QUALITY=low\|medium\|high` | override the auto-selected render tier |
+| `PROPWASH_SCREEN=off\|<index>` | stay windowed, or force a monitor |
+| `PROPWASH_GOGGLE=off` | disable the O3 feed treatment, show the raw render |
+| `PROPWASH_SCALE=<0.5-1.0>` | render 3D below native and upscale; off by default |
+| `PROPWASH_JS_MAP="0,1,2,..."` | remap RC channel → joystick axis |
+| `PROPWASH_JS_INVERT="2"` | comma list of RC channels to negate |
 
 ### Loading the pilot's real tune
 
@@ -169,7 +188,7 @@ board and must not apply to a virtual gyro — critically `align_board_roll`
 Working: in-process Betaflight 4.5.2, deterministic lockstep, physics + stable
 hover, UDP protocol, Godot FPV client with the real OSD and a cinewhoop model,
 CLI/Configurator data path, real-tune loading, joystick calibration, autonomous
-gate fly-through. **7 headless self-tests** cover boot/MSP identity, hover,
+gate fly-through. **9 headless self-tests** cover boot/MSP identity, hover,
 determinism, OSD render, real-tune hover, and the Godot client + fly-through.
 
 Planned: Python gym env (RL), blackbox replay (sim-vs-real system ID), Quest 3 /
