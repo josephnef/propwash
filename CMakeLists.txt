@@ -18,6 +18,7 @@ add_library(pw_sim STATIC
   core/sim/bf.cpp
   core/sim/sim.cpp
   core/sim/physics.cpp
+  core/sim/static_snapshot.cpp
   core/sim/util/SimplexNoise.cpp
   core/net/server.cpp
   core/input/joystick.cpp
@@ -64,27 +65,29 @@ add_test(NAME codec_parity
   COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/tester/codec_parity_check.py)
 set_tests_properties(codec_parity PROPERTIES TIMEOUT 30)
 
-# NOTE: neither determinism check is wired as a ctest yet — both are red for
-# the same underlying reason (Betaflight statics that BF::init() does not
-# clear on an in-process re-init) and wiring in a red test trains people to
-# ignore it. Run them by hand; on a mismatch both report the first divergent
-# frame and field:
+# Determinism, both tiers — gating since the snapshot/restore reset made
+# them green (BF::init() alone left ~20 subsystems of firmware statics
+# carrying session history; Sim::reset now rewinds the process's writable
+# statics to the post-first-boot snapshot, see core/sim/static_snapshot.h).
+# On a mismatch both report the first divergent frame and field.
 #
-#   python3 tools/tester/reset_determinism.py ./build/propwash-core
-#     ONE core, the identical tape twice around PW_CMD_RESET. Currently red
-#     on frame 0: the firmware's internal RC/mode latches and the completed
-#     gyro calibration survive the reset (tape 2 boots "pre-armed" with tape
-#     1's switch state). Gates the purity of the whole sim path once green.
-#
-#   python3 tools/tester/determinism_check.py ./build/propwash-core [--runs N]
-#     CROSS-process: two fresh cores, identical inputs. Red via the same
-#     residue class reached through the first-contact reset: whether gyro
-#     calibration completed during pre-client idle ticking decides between
-#     two trajectory classes. --runs N prints the class histogram.
-#
-# Both get promoted to gating tests once the reset is made fully
-# deterministic (snapshot/restore of the firmware's data+bss is the likely
-# fix — the residue is a family of statics, not one latch).
+# Same-process: one core, the identical input tape twice around
+# PW_CMD_RESET, byte-identical streams. Fails on any stray rand()/clock in
+# the sim path and on anything leaking through the reset.
+add_test(NAME reset_determinism
+  COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/tester/reset_determinism.py
+    $<TARGET_FILE:propwash-core>)
+set_tests_properties(reset_determinism PROPERTIES TIMEOUT 60)
+
+# Cross-process: two fresh cores, identical inputs (one run with sends
+# deliberately delayed past the recv timeout), byte-identical output — the
+# project's headline claim. Diagnosis tools when it breaks:
+#   determinism_check.py --runs N       trajectory-class histogram
+#   PROPWASH_DUMP_STATE + state_diff.py bisect firmware residue to symbols
+add_test(NAME cross_process_determinism
+  COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/tester/determinism_check.py
+    $<TARGET_FILE:propwash-core>)
+set_tests_properties(cross_process_determinism PROPERTIES TIMEOUT 180)
 
 # CLI/Configurator data path: apply the pilot's diff over TCP 5761, save,
 # reboot in-process, verify the tune survives (the M3 core deliverable).

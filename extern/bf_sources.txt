@@ -152,7 +152,6 @@ io/vtx_msp.c
 io/vtx_rtc6705.c
 io/vtx_smartaudio.c
 io/vtx_tramp.c
-lib/main/dyad/dyad.c
 lib/main/google/olc/olc.c
 msp/msp_box.c
 msp/msp_build_info.c

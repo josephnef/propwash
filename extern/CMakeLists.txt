@@ -45,6 +45,12 @@ list(APPEND BF_SOURCES
   # (100% on macOS CI). This copy serialises dyad via pw_dyad_lock/unlock —
   # patches/serial-tcp-dyad-lock.diff (stock excluded from bf_sources.txt).
   "${CMAKE_CURRENT_SOURCE_DIR}/betaflightext/src/main/drivers/serial_tcp.c"
+  # dyad.c: stock, with its mutable globals gathered into one exported struct
+  # (pw_dyad_state) so the deterministic-reset snapshot can EXCLUDE dyad by
+  # address range — dyad's SelectSet reallocates fd arrays as connections come
+  # and go, so restoring boot-time pointers would be a use-after-free —
+  # patches/dyad-globals-struct.diff (stock excluded from bf_sources.txt).
+  "${CMAKE_CURRENT_SOURCE_DIR}/betaflightext/src/main/compat/dyad/dyad.c"
 )
 
 if(APPLE OR WIN32)

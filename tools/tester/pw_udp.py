@@ -78,15 +78,24 @@ def report_first_divergence(frames_a, frames_b, label_a="A", label_b="B"):
     return -1
 
 
-def spawn(core, port, eeprom=None, extra=None, settle=2.0):
+def spawn(core, port, eeprom=None, extra=None, settle=2.0, env=None):
     """Start a propwash-core. Always --no-js: a connected handset has RC
-    priority and would silently override the packets we send."""
+    priority and would silently override the packets we send.
+
+    `env` adds/overrides environment variables (e.g. PROPWASH_DUMP_STATE);
+    `settle` is the boot wait — also the lever that decides how many idle
+    ticks run before first contact."""
     if eeprom is None:
         eeprom = tempfile.mktemp(suffix=".bin")
     cmd = [core, "--server", "--no-js", "--eeprom", eeprom, "--port", str(port)]
     if extra:
         cmd += extra
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    full_env = None
+    if env:
+        full_env = dict(os.environ)
+        full_env.update(env)
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, env=full_env)
     time.sleep(settle)
     return proc, eeprom
 

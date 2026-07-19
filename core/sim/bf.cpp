@@ -14,6 +14,7 @@
 
 #include "bf.h"
 #include "bfbridge.h"
+#include "static_snapshot.h"
 
 namespace SimITL{
 
@@ -165,6 +166,31 @@ namespace SimITL{
     void disableRunawayTakeoff(){
       BF::pidConfigMutable()->runaway_takeoff_prevention = 0;
       printf("[pw] runaway takeoff prevention disabled (bench mode)\n");
+    }
+
+    void takeStateSnapshot(){
+      if (SimITL::snapshotTaken()) return;
+      // lifetime/concurrency hazards the restore must never touch: dyad's
+      // connection state (realloc'd fd arrays, mutated by the pump thread)
+      // and the dyad mutex (held during the restore itself)
+      void* addr = nullptr;
+      unsigned long size = 0;
+      BF::pw_dyad_state_range(&addr, &size);
+      SimITL::snapshotExclude(addr, (size_t)size);
+      BF::pw_dyad_mutex_range(&addr, &size);
+      SimITL::snapshotExclude(addr, (size_t)size);
+      SimITL::snapshotTake();
+    }
+
+    bool restoreStateSnapshot(){
+      if (!SimITL::snapshotTaken()) return false;
+      // quiesce dyad: its pump thread wraps every dyad_update in this lock,
+      // so holding it guarantees no dyad callback is mid-flight while the
+      // firmware statics (including serial buffers) rewind
+      BF::pw_dyad_lock();
+      const bool ok = SimITL::snapshotRestore();
+      BF::pw_dyad_unlock();
+      return ok;
     }
   } // namespace BF
 } // namespace SimITL

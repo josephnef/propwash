@@ -57,6 +57,20 @@ namespace SimITL{
 
     /** Bench mode: disable runaway-takeoff prevention (see bf.cpp). */
     void disableRunawayTakeoff();
+
+    /**
+     * \brief Capture the canonical firmware memory state (writable statics of
+     * the whole process, with dyad's live state excluded). Call once, right
+     * after the FIRST init() — before any simulated time has passed.
+     */
+    void takeStateSnapshot();
+
+    /**
+     * \brief Rewind the firmware statics to the snapshot (under the dyad
+     * lock). The caller re-runs init() and the RAM-mode setup afterwards.
+     * \return False when no snapshot exists (unsupported platform).
+     */
+    bool restoreStateSnapshot();
   }
 }
 

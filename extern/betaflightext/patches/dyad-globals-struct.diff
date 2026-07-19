@@ -1,0 +1,280 @@
+diff --git a/extern/betaflight/lib/main/dyad/dyad.c b/extern/betaflightext/src/main/compat/dyad/dyad.c
+index bb7f2cb..b9b0d8b 100644
+--- a/extern/betaflight/lib/main/dyad/dyad.c
++++ b/extern/betaflightext/src/main/compat/dyad/dyad.c
+@@ -299,25 +299,40 @@ struct dyad_Stream {
+ #define DYAD_FLAG_WRITTEN (1 << 1)
+ 
+ 
+-static dyad_Stream *dyad_streams;
+-static int dyad_streamCount;
+-static char dyad_panicMsgBuffer[128];
+-static dyad_PanicCallback panicCallback;
+-static SelectSet dyad_selectSet;
+-static double dyad_updateTimeout = 1;
+-static double dyad_tickInterval = 1;
+-static double dyad_lastTick = 0;
++/* propwash: dyad's mutable globals live in ONE exported struct so the
++ * deterministic-reset snapshot can exclude dyad by address range. dyad's
++ * SelectSet reallocates its fd arrays as connections come and go; restoring
++ * boot-time pointers after that would be a use-after-free, and the stream
++ * list is mutated concurrently by the pump thread. Everything else about
++ * dyad is stock. */
++typedef struct {
++  dyad_Stream *streams;
++  int streamCount;
++  char panicMsgBuffer[128];
++  dyad_PanicCallback panicCallback;
++  SelectSet selectSet;
++  double updateTimeout;
++  double tickInterval;
++  double lastTick;
++} pw_dyad_state_t;
++
++pw_dyad_state_t pw_dyad_state = { .updateTimeout = 1, .tickInterval = 1 };
++
++void pw_dyad_state_range(void **addr, unsigned long *size) {
++  *addr = &pw_dyad_state;
++  *size = sizeof(pw_dyad_state);
++}
+ 
+ 
+ static void panic(const char *fmt, ...) {
+   va_list args;
+   va_start(args, fmt);
+-  vsprintf(dyad_panicMsgBuffer, fmt, args);
++  vsprintf(pw_dyad_state.panicMsgBuffer, fmt, args);
+   va_end(args);
+-  if (panicCallback) {
+-    panicCallback(dyad_panicMsgBuffer);
++  if (pw_dyad_state.panicCallback) {
++    pw_dyad_state.panicCallback(pw_dyad_state.panicMsgBuffer);
+   } else {
+-    printf("dyad panic: %s\n", dyad_panicMsgBuffer);
++    printf("dyad panic: %s\n", pw_dyad_state.panicMsgBuffer);
+   }
+   exit(EXIT_FAILURE);
+ }
+@@ -334,7 +349,7 @@ static dyad_Event createEvent(int type) {
+ static void stream_destroy(dyad_Stream *stream);
+ 
+ static void destroyClosedStreams(void) {
+-  dyad_Stream *stream = dyad_streams;
++  dyad_Stream *stream = pw_dyad_state.streams;
+   while (stream) {
+     if (stream->state == DYAD_STATE_CLOSED) {
+       dyad_Stream *next = stream->next;
+@@ -351,20 +366,20 @@ static void stream_emitEvent(dyad_Stream *stream, dyad_Event *e);
+ 
+ static void updateTickTimer(void) {
+   /* Update tick timer */
+-  if (dyad_lastTick == 0) {
+-    dyad_lastTick = dyad_getTime();
++  if (pw_dyad_state.lastTick == 0) {
++    pw_dyad_state.lastTick = dyad_getTime();
+   }
+-  while (dyad_lastTick < dyad_getTime()) {
++  while (pw_dyad_state.lastTick < dyad_getTime()) {
+     /* Emit event on all streams */
+     dyad_Stream *stream;
+     dyad_Event e = createEvent(DYAD_EVENT_TICK);
+     e.msg = "a tick has occured";
+-    stream = dyad_streams;
++    stream = pw_dyad_state.streams;
+     while (stream) {
+       stream_emitEvent(stream, &e);
+       stream = stream->next;
+     }
+-    dyad_lastTick += dyad_tickInterval;
++    pw_dyad_state.lastTick += pw_dyad_state.tickInterval;
+   }
+ }
+ 
+@@ -374,7 +389,7 @@ static void updateStreamTimeouts(void) {
+   dyad_Stream *stream;
+   dyad_Event e = createEvent(DYAD_EVENT_TIMEOUT);
+   e.msg = "stream timed out";
+-  stream = dyad_streams;
++  stream = pw_dyad_state.streams;
+   while (stream) {
+     if (stream->timeout) {
+       if (currentTime - stream->lastActivity > stream->timeout) {
+@@ -404,12 +419,12 @@ static void stream_destroy(dyad_Stream *stream) {
+   e.msg = "the stream has been destroyed";
+   stream_emitEvent(stream, &e);
+   /* Remove from list and decrement count */
+-  next = &dyad_streams;
++  next = &pw_dyad_state.streams;
+   while (*next != stream) {
+     next = &(*next)->next;
+   }
+   *next = stream->next;
+-  dyad_streamCount--;
++  pw_dyad_state.streamCount--;
+   /* Destroy and free */
+   vec_deinit(&stream->listeners);
+   vec_deinit(&stream->lineBuffer);
+@@ -689,28 +704,28 @@ void dyad_update(void) {
+   updateStreamTimeouts();
+ 
+   /* Create fd sets for select() */
+-  select_zero(&dyad_selectSet);
++  select_zero(&pw_dyad_state.selectSet);
+ 
+-  stream = dyad_streams;
++  stream = pw_dyad_state.streams;
+   while (stream) {
+     switch (stream->state) {
+       case DYAD_STATE_CONNECTED:
+-        select_add(&dyad_selectSet, SELECT_READ, stream->sockfd);
++        select_add(&pw_dyad_state.selectSet, SELECT_READ, stream->sockfd);
+         if (!(stream->flags & DYAD_FLAG_READY) ||
+             stream->writeBuffer.length != 0
+         ) {
+-          select_add(&dyad_selectSet, SELECT_WRITE, stream->sockfd);
++          select_add(&pw_dyad_state.selectSet, SELECT_WRITE, stream->sockfd);
+         }
+         break;
+       case DYAD_STATE_CLOSING:
+-        select_add(&dyad_selectSet, SELECT_WRITE, stream->sockfd);
++        select_add(&pw_dyad_state.selectSet, SELECT_WRITE, stream->sockfd);
+         break;
+       case DYAD_STATE_CONNECTING:
+-        select_add(&dyad_selectSet, SELECT_WRITE, stream->sockfd);
+-        select_add(&dyad_selectSet, SELECT_EXCEPT, stream->sockfd);
++        select_add(&pw_dyad_state.selectSet, SELECT_WRITE, stream->sockfd);
++        select_add(&pw_dyad_state.selectSet, SELECT_EXCEPT, stream->sockfd);
+         break;
+       case DYAD_STATE_LISTENING:
+-        select_add(&dyad_selectSet, SELECT_READ, stream->sockfd);
++        select_add(&pw_dyad_state.selectSet, SELECT_READ, stream->sockfd);
+         break;
+     }
+     stream = stream->next;
+@@ -723,25 +738,25 @@ void dyad_update(void) {
+      * because the type of timeval's fields don't agree across platforms */
+     #pragma warning(disable: 4244)
+   #endif
+-  tv.tv_sec = dyad_updateTimeout;
+-  tv.tv_usec = (dyad_updateTimeout - tv.tv_sec) * 1e6;
++  tv.tv_sec = pw_dyad_state.updateTimeout;
++  tv.tv_usec = (pw_dyad_state.updateTimeout - tv.tv_sec) * 1e6;
+   #ifdef _MSC_VER
+     #pragma warning(pop)
+   #endif
+ 
+-  select(dyad_selectSet.maxfd + 1,
+-         dyad_selectSet.fds[SELECT_READ],
+-         dyad_selectSet.fds[SELECT_WRITE],
+-         dyad_selectSet.fds[SELECT_EXCEPT],
++  select(pw_dyad_state.selectSet.maxfd + 1,
++         pw_dyad_state.selectSet.fds[SELECT_READ],
++         pw_dyad_state.selectSet.fds[SELECT_WRITE],
++         pw_dyad_state.selectSet.fds[SELECT_EXCEPT],
+          &tv);
+ 
+   /* Handle streams */
+-  stream = dyad_streams;
++  stream = pw_dyad_state.streams;
+   while (stream) {
+     switch (stream->state) {
+ 
+       case DYAD_STATE_CONNECTED:
+-        if (select_has(&dyad_selectSet, SELECT_READ, stream->sockfd)) {
++        if (select_has(&pw_dyad_state.selectSet, SELECT_READ, stream->sockfd)) {
+           stream_handleReceivedData(stream);
+           if (stream->state == DYAD_STATE_CLOSED) {
+             break;
+@@ -750,13 +765,13 @@ void dyad_update(void) {
+ 
+ 	FALLTHROUGH;
+       case DYAD_STATE_CLOSING:
+-        if (select_has(&dyad_selectSet, SELECT_WRITE, stream->sockfd)) {
++        if (select_has(&pw_dyad_state.selectSet, SELECT_WRITE, stream->sockfd)) {
+           stream_flushWriteBuffer(stream);
+         }
+         break;
+ 
+       case DYAD_STATE_CONNECTING:
+-        if (select_has(&dyad_selectSet, SELECT_WRITE, stream->sockfd)) {
++        if (select_has(&pw_dyad_state.selectSet, SELECT_WRITE, stream->sockfd)) {
+           /* Check socket for error */
+           int optval = 0;
+           socklen_t optlen = sizeof(optval);
+@@ -772,7 +787,7 @@ void dyad_update(void) {
+           e.msg = "connected to server";
+           stream_emitEvent(stream, &e);
+         } else if (
+-          select_has(&dyad_selectSet, SELECT_EXCEPT, stream->sockfd)
++          select_has(&pw_dyad_state.selectSet, SELECT_EXCEPT, stream->sockfd)
+         ) {
+           /* Handle failed connection */
+ connectFailed:
+@@ -781,7 +796,7 @@ connectFailed:
+         break;
+ 
+       case DYAD_STATE_LISTENING:
+-        if (select_has(&dyad_selectSet, SELECT_READ, stream->sockfd)) {
++        if (select_has(&pw_dyad_state.selectSet, SELECT_READ, stream->sockfd)) {
+           stream_acceptPendingConnections(stream);
+         }
+         break;
+@@ -817,12 +832,12 @@ void dyad_init(void) {
+ 
+ void dyad_shutdown(void) {
+   /* Close and destroy all the streams */
+-  while (dyad_streams) {
+-    dyad_close(dyad_streams);
+-    stream_destroy(dyad_streams);
++  while (pw_dyad_state.streams) {
++    dyad_close(pw_dyad_state.streams);
++    stream_destroy(pw_dyad_state.streams);
+   }
+   /* Clear up everything */
+-  select_deinit(&dyad_selectSet);
++  select_deinit(&pw_dyad_state.selectSet);
+ #ifdef _WIN32
+   WSACleanup();
+ #endif
+@@ -848,23 +863,23 @@ double dyad_getTime(void) {
+ 
+ 
+ int dyad_getStreamCount(void) {
+-  return dyad_streamCount;
++  return pw_dyad_state.streamCount;
+ }
+ 
+ 
+ void dyad_setTickInterval(double seconds) {
+-  dyad_tickInterval = seconds;
++  pw_dyad_state.tickInterval = seconds;
+ }
+ 
+ 
+ void dyad_setUpdateTimeout(double seconds) {
+-  dyad_updateTimeout = seconds;
++  pw_dyad_state.updateTimeout = seconds;
+ }
+ 
+ 
+ dyad_PanicCallback dyad_atPanic(dyad_PanicCallback func) {
+-  dyad_PanicCallback old = panicCallback;
+-  panicCallback = func;
++  dyad_PanicCallback old = pw_dyad_state.panicCallback;
++  pw_dyad_state.panicCallback = func;
+   return old;
+ }
+ 
+@@ -880,9 +895,9 @@ dyad_Stream *dyad_newStream(void) {
+   stream->sockfd = INVALID_SOCKET;
+   stream->lastActivity = dyad_getTime();
+   /* Add to list and increment count */
+-  stream->next = dyad_streams;
+-  dyad_streams = stream;
+-  dyad_streamCount++;
++  stream->next = pw_dyad_state.streams;
++  pw_dyad_state.streams = stream;
++  pw_dyad_state.streamCount++;
+   return stream;
+ }
+ 

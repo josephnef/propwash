@@ -191,6 +191,15 @@ static pthread_mutex_t pwDyadMutex = PTHREAD_MUTEX_INITIALIZER;
 void pw_dyad_lock(void)   { pthread_mutex_lock(&pwDyadMutex); }
 void pw_dyad_unlock(void) { pthread_mutex_unlock(&pwDyadMutex); }
 
+/* propwash: the deterministic-reset snapshot must not restore this mutex —
+ * the restore runs while HOLDING it, and rewinding a held mutex to its
+ * boot (unlocked) bytes corrupts it for the unlock that follows. */
+void pw_dyad_mutex_range(void **addr, unsigned long *size)
+{
+    *addr = &pwDyadMutex;
+    *size = sizeof(pwDyadMutex);
+}
+
 static void *tcpThread(void *data)
 {
     UNUSED(data);
