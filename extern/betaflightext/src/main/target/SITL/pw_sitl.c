@@ -204,11 +204,18 @@ static void *tcpThread(void *data)
 {
     UNUSED(data);
 
+    // propwash: dyad_init/dyad_set* mutate pw_dyad_state, and the sim thread
+    // may already be inside tcpReconfigure() creating the listener (systemInit
+    // spawns this worker before serial init, but nothing guarantees who runs
+    // first on a loaded host) — initialising unlocked could wipe the freshly
+    // created listener from the stream list.
+    pw_dyad_lock();
     dyad_init();
     dyad_setTickInterval(0.2f);
     // non-blocking poll so the lock is never held across a blocking select();
     // the usleep below sets the effective poll rate and yields to the sim thread
     dyad_setUpdateTimeout(0.0f);
+    pw_dyad_unlock();
 
     while (workerRunning) {
         pw_dyad_lock();

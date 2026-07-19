@@ -627,6 +627,27 @@ static void stream_acceptPendingConnections(dyad_Stream *stream) {
         /* No more waiting sockets */
         return;
       }
+      /* propwash: a backlog connection can abort before accept() reaches it.
+       * Linux kernels discard those silently, but Windows fails the accept()
+       * with WSAECONNRESET (POSIX may return ECONNABORTED, or EINTR on a
+       * signal). Stock dyad fell through here and fabricated a CONNECTED
+       * stream around INVALID_SOCKET, emitting a bogus ACCEPT event — which
+       * made serial_tcp.c's newest-client-wins onAccept drop the HEALTHY
+       * CLI/MSP connection every time a retrying client left a corpse in the
+       * listen backlog. That is the Windows-CI "CLI reconnect after `save`
+       * times out" failure: each retry's abort killed the next good
+       * connection. Skip the corpse and keep draining; on any other error
+       * leave the listener alone and let the next dyad_update() retry. */
+#ifdef _WIN32
+      if (err == WSAECONNRESET || err == WSAEINTR) {
+        continue;
+      }
+#else
+      if (err == ECONNABORTED || err == EINTR) {
+        continue;
+      }
+#endif
+      return;
     }
     /* Create client stream */
     remote = dyad_newStream();

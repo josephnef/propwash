@@ -1,5 +1,5 @@
 diff --git a/extern/betaflight/lib/main/dyad/dyad.c b/extern/betaflightext/src/main/compat/dyad/dyad.c
-index bb7f2cb..9033b17 100644
+index bb7f2cb..8e1296b 100644
 --- a/extern/betaflight/lib/main/dyad/dyad.c
 +++ b/extern/betaflightext/src/main/compat/dyad/dyad.c
 @@ -42,7 +42,14 @@
@@ -130,7 +130,35 @@ index bb7f2cb..9033b17 100644
    /* Destroy and free */
    vec_deinit(&stream->listeners);
    vec_deinit(&stream->lineBuffer);
-@@ -689,28 +711,28 @@ void dyad_update(void) {
+@@ -605,6 +627,27 @@ static void stream_acceptPendingConnections(dyad_Stream *stream) {
+         /* No more waiting sockets */
+         return;
+       }
++      /* propwash: a backlog connection can abort before accept() reaches it.
++       * Linux kernels discard those silently, but Windows fails the accept()
++       * with WSAECONNRESET (POSIX may return ECONNABORTED, or EINTR on a
++       * signal). Stock dyad fell through here and fabricated a CONNECTED
++       * stream around INVALID_SOCKET, emitting a bogus ACCEPT event — which
++       * made serial_tcp.c's newest-client-wins onAccept drop the HEALTHY
++       * CLI/MSP connection every time a retrying client left a corpse in the
++       * listen backlog. That is the Windows-CI "CLI reconnect after `save`
++       * times out" failure: each retry's abort killed the next good
++       * connection. Skip the corpse and keep draining; on any other error
++       * leave the listener alone and let the next dyad_update() retry. */
++#ifdef _WIN32
++      if (err == WSAECONNRESET || err == WSAEINTR) {
++        continue;
++      }
++#else
++      if (err == ECONNABORTED || err == EINTR) {
++        continue;
++      }
++#endif
++      return;
+     }
+     /* Create client stream */
+     remote = dyad_newStream();
+@@ -689,28 +732,28 @@ void dyad_update(void) {
    updateStreamTimeouts();
  
    /* Create fd sets for select() */
@@ -167,7 +195,7 @@ index bb7f2cb..9033b17 100644
          break;
      }
      stream = stream->next;
-@@ -723,25 +745,25 @@ void dyad_update(void) {
+@@ -723,25 +766,25 @@ void dyad_update(void) {
       * because the type of timeval's fields don't agree across platforms */
      #pragma warning(disable: 4244)
    #endif
@@ -201,7 +229,7 @@ index bb7f2cb..9033b17 100644
            stream_handleReceivedData(stream);
            if (stream->state == DYAD_STATE_CLOSED) {
              break;
-@@ -750,13 +772,13 @@ void dyad_update(void) {
+@@ -750,13 +793,13 @@ void dyad_update(void) {
  
  	FALLTHROUGH;
        case DYAD_STATE_CLOSING:
@@ -217,7 +245,7 @@ index bb7f2cb..9033b17 100644
            /* Check socket for error */
            int optval = 0;
            socklen_t optlen = sizeof(optval);
-@@ -772,7 +794,7 @@ void dyad_update(void) {
+@@ -772,7 +815,7 @@ void dyad_update(void) {
            e.msg = "connected to server";
            stream_emitEvent(stream, &e);
          } else if (
@@ -226,7 +254,7 @@ index bb7f2cb..9033b17 100644
          ) {
            /* Handle failed connection */
  connectFailed:
-@@ -781,7 +803,7 @@ connectFailed:
+@@ -781,7 +824,7 @@ connectFailed:
          break;
  
        case DYAD_STATE_LISTENING:
@@ -235,7 +263,7 @@ index bb7f2cb..9033b17 100644
            stream_acceptPendingConnections(stream);
          }
          break;
-@@ -817,12 +839,12 @@ void dyad_init(void) {
+@@ -817,12 +860,12 @@ void dyad_init(void) {
  
  void dyad_shutdown(void) {
    /* Close and destroy all the streams */
@@ -252,7 +280,7 @@ index bb7f2cb..9033b17 100644
  #ifdef _WIN32
    WSACleanup();
  #endif
-@@ -848,23 +870,23 @@ double dyad_getTime(void) {
+@@ -848,23 +891,23 @@ double dyad_getTime(void) {
  
  
  int dyad_getStreamCount(void) {
@@ -281,7 +309,7 @@ index bb7f2cb..9033b17 100644
    return old;
  }
  
-@@ -880,9 +902,9 @@ dyad_Stream *dyad_newStream(void) {
+@@ -880,9 +923,9 @@ dyad_Stream *dyad_newStream(void) {
    stream->sockfd = INVALID_SOCKET;
    stream->lastActivity = dyad_getTime();
    /* Add to list and increment count */
