@@ -163,11 +163,15 @@ cause spurious failures; kill strays before running
   for zero gain). GDScript for the client. Python (stdlib) for tools/tests.
 - Match the surrounding style. Keep `protocol/propwash_protocol.h` free of any
   Betaflight include — it is the GPL/MIT boundary.
-- A wire-format change touches exactly four codecs: `propwash_protocol.h`
+- A wire-format change touches exactly **five** codecs: `propwash_protocol.h`
   (+ the `static_assert` sizes in `server.cpp`), `server.cpp`,
-  `tools/tester/pw_udp.py` (all python tests import it — don't re-inline
-  struct strings), and `client-godot/scripts/protocol.gd`. Bump `PW_VERSION`;
-  mismatches are dropped on both sides.
+  `tools/tester/pw_udp.py` (the GPL test codec — all tools/tester + tools/sysid
+  import it, don't re-inline struct strings), `client-godot/scripts/protocol.gd`,
+  and `python/propwash_gym/src/propwash_gym/protocol.py` (the gym's own MIT copy
+  — it can't import the GPL test codec). Bump `PW_VERSION`; mismatches are
+  dropped on both sides. The `codec_parity` ctest compares the two Python
+  codecs field-for-field, so changing one alone goes red instead of silently
+  breaking the gym.
 - When you modify a vendored stock Betaflight file, update its recorded diff in
   `extern/betaflightext/patches/`.
 - Commit or push only when asked. End commit messages with the Co-Authored-By
