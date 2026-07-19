@@ -102,6 +102,15 @@ add_test(NAME real_tune_hover
     $<TARGET_FILE:propwash-core>)
 set_tests_properties(real_tune_hover PROPERTIES TIMEOUT 90)
 
+# Blackbox replay + system ID (stdlib only). Physics-only motor replay
+# (PW_MOTOR_IN) is reproducible across cores, and the fitter recovers a known
+# physics parameter from a synthetic reference. A real CineLog35 log drops into
+# the same pipeline once the quad has flown.
+add_test(NAME sysid_selfcheck
+  COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/sysid/sysid_check.py
+    $<TARGET_FILE:propwash-core>)
+set_tests_properties(sysid_selfcheck PROPERTIES TIMEOUT 180)
+
 # Godot client autotest (runs only if a godot 4 binary is available).
 # PROPWASH_AUTOTEST=1 arms + hovers via the real GDScript client, headless.
 find_program(GODOT_BIN NAMES godot godot4

@@ -91,6 +91,40 @@ namespace SimITL{
     simStep();
   }
 
+  void Sim::updateMotors(const StateInput& stateInput, const float motor[4]){
+    if(!mPhysics.checkSimState()){
+      return; // no SimState, no sim!
+    }
+
+    int64_t stateUpdateDelta = static_cast<int64_t>(stateInput.delta * 1000000.0);
+    if(stateUpdateDelta > static_cast<int64_t>(100000)){
+      stateUpdateDelta = static_cast<int64_t>(100000);
+    }
+    if(stateUpdateDelta < static_cast<int64_t>(0)){
+      stateUpdateDelta = static_cast<int64_t>(1);
+    }
+
+    total_delta += stateUpdateDelta;
+
+    mPhysics.updateState(stateInput);
+
+    // Same accumulator as simStep(), but the firmware is bypassed: the motor
+    // commands come straight from the caller (a recorded blackbox log), so the
+    // physics model is exercised in isolation from Betaflight's PID loop.
+    while ((total_delta - DELTA) >= 0) {
+      total_delta -= DELTA;
+      const double dt = static_cast<double>(DELTA) / 1e6f;
+
+      mPhysics.updateGyro(dt);
+      for (int i = 0; i < 4; i++) {
+        mSimState.motorsState[i].pwm = motor[i];
+      }
+      mPhysics.updatePhysics(dt);
+    }
+
+    mSimState.microsPassed += stateUpdateDelta;
+  }
+
   const StateOutput& Sim::getStateUpdate() const{
     return mSimState.stateOutput;
   }
