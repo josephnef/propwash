@@ -27,9 +27,8 @@ set align_board_yaw = 0
 # sim-side damage model (prop damage, structural-crash latch) runs on top
 # either way.
 #
-# Motor protocol: targetPreInit() still forces PWM by default, but a virtual
-# DSHOT ESC exists — run the core with PROPWASH_DSHOT=1 and the dump's
-# dshot600 applies as-is (boot grace clears, spin-direction commands reach
-# the physics via pw_motor_dir). That is the flip_over_after_crash (turtle)
-# prerequisite; the default flips to DSHOT once the reversed-spin prop model
-# and eRPM telemetry land.
+# Motor protocol: the dump's dshot600 applies AS-IS on the virtual DSHOT
+# ESC — spin-direction commands reach the physics (turtle mode works, ch7/F)
+# and dshot_bidir feeds the RPM filter with eRPM derived from the physics'
+# true motor speeds. PROPWASH_FORCE_PWM=1 restores the old forced-PWM
+# behaviour as an escape hatch.

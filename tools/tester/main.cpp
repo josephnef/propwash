@@ -370,12 +370,7 @@ static int crashTest()
  *      (repeats, delays, all-motors-idle gating) land in pw_motor_dir. */
 static int dshotTest()
 {
-#if defined(_WIN32)
-    _putenv("PROPWASH_DSHOT=1");
-#else
-    setenv("PROPWASH_DSHOT", "1", 1);
-#endif
-    const char* eeprom = "pw-tester-dshot-eeprom.bin";
+const char* eeprom = "pw-tester-dshot-eeprom.bin";
     remove(eeprom);
 
     StateInit init {};
@@ -484,10 +479,246 @@ static int dshotTest()
     return rc;
 }
 
+// -------------------------------------------------------------- turtle test
+/* --turtle-test: crashflip end to end, as an emergent contact-solver
+ * maneuver. The quad settles INVERTED, the turtle box (ch7) goes active,
+ * arming reverses the props through the stock DSHOT command queue, and a
+ * held roll stick pivots the quad over its duct edge until it is upright —
+ * at which point the "pilot" releases the stick, disarms, and re-arms
+ * normally (directions restored). small_angle=180 is set like the real
+ * dump does — arming inverted is the turtle prerequisite. */
+static int turtleTest()
+{
+const char* eeprom = "pw-tester-turtle-eeprom.bin";
+    remove(eeprom);
+
+    StateInit init {};
+    profileCineLog35(init, eeprom);
+
+    StateInput in {};
+    inputDefaults(in);
+    in.gyroBaseNoiseAmp = 0.0002f;
+    const float dt = 1.0f / 250.0f;
+    in.delta = dt;
+
+    Sim& sim = Sim::getInstance();
+    sim.init(init);
+    // small_angle=180 like the real dump — allows arming inverted. It is
+    // cached as a cosine at imu init, so a RAM poke alone is not enough:
+    // persist and reboot, the same way a pilot's saved config applies.
+    BF::setSmallAngle(180);
+    BF::saveConfig();
+    sim.reset(init);
+
+    // start inverted, dropped just above the pad (settles on belly + ducts)
+    mat3 basis = mat3{vec3{-1, 0, 0}, vec3{0, -1, 0}, vec3{0, 0, 1}};
+    vec3 position {0.0f, 0.3f, 0.0f};
+    copy(in.rotation, basis);
+
+    int rc = 0;
+    bool turtleSeen = false;
+    bool rearmedSeen = false;
+    bool righted = false;
+    float maxUp = -1.0f;
+
+    /* burst-and-coast stick technique, like a real pilot: a marginal-
+     * authority whoop (2 reversed motors ~ 1.2x weight) stalls at the
+     * balance point under a HELD stick — the thrust vector turns downward
+     * as the quad comes up. Short bursts build pivot momentum instead. */
+    const float BURST_ON = 0.5f, BURST_OFF = 0.35f;
+
+    const float T_BOX = 5.0f, T_ARM = 5.5f, T_DISARM = 9.0f, T_REARM = 11.0f;
+    const float T_END = 13.0f;
+
+    const int frames = (int)(T_END / dt);
+    for (int f = 0; f <= frames; f++) {
+        const float t = f * dt;
+        const bool flipPhase = t >= T_ARM && t < T_DISARM;
+
+        in.rcData[4] = (flipPhase || t >= T_REARM) ? 1.0f : -1.0f; // ARM
+        in.rcData[5] = 1.0f;                                       // ANGLE
+        in.rcData[6] = (t >= T_BOX && t < T_DISARM) ? 1.0f : -1.0f; // TURTLE box
+        in.rcData[2] = -1.0f;                                      // throttle low
+        // burst-and-coast until past horizontal, then hands off
+        float roll = 0.0f;
+        if (flipPhase && !righted) {
+            const float phase = fmodf(t - T_ARM, BURST_ON + BURST_OFF);
+            roll = phase < BURST_ON ? 1.0f : 0.0f;
+        }
+        in.rcData[0] = roll;
+
+        sim.update(in);
+
+        const StateOutput& out = sim.getStateUpdate();
+        const SimState& st = sim.getSimState();
+        quat q { out.orientation.x, out.orientation.y, out.orientation.z, out.orientation.w };
+        basis = quat_to_mat3(q);
+        copy(in.rotation, basis);
+        in.angularVelocity = out.angularVelocity;
+        in.linearVelocity  = out.linearVelocity;
+
+        vec3 vel;
+        copy(vel, out.linearVelocity);
+        position = position + vel * dt;
+        groundManifold(position, basis, in);
+
+        const float upY = get_axis(basis, 1)[1];
+        if (upY > maxUp) maxUp = upY;
+        if (flipPhase && upY > 0.5f) righted = true;
+        if (out.crashFlags & 4) turtleSeen = true;
+        if (t >= T_REARM && st.armed && !(out.crashFlags & 4)) rearmedSeen = true;
+
+        if (f % (int)(1.0f / dt) == 0) {
+            printf("[turtle] t=%5.1f upY=%+.2f armed=%d flags=%d dir=%+d%+d%+d%+d dis=0x%05x\n",
+                   t, upY, st.armed ? 1 : 0, (int)out.crashFlags,
+                   BF::motorSpinDirection(0), BF::motorSpinDirection(1),
+                   BF::motorSpinDirection(2), BF::motorSpinDirection(3),
+                   (unsigned)st.armingDisabledFlags);
+        }
+    }
+
+    if (!turtleSeen) { printf("FAIL: turtle mode never activated (crash_flags bit2)\n"); rc = 1; }
+    if (maxUp < 0.9f) {
+        printf("FAIL: never righted itself (max bodyUp.y %.2f)\n", maxUp);
+        rc = 1;
+    } else {
+        printf("[turtle] righted: max bodyUp.y %.2f\n", maxUp);
+    }
+    if (!rearmedSeen) { printf("FAIL: never re-armed normally after the flip\n"); rc = 1; }
+    for (int i = 0; i < 4; i++) {
+        if (BF::motorSpinDirection(i) != 1) {
+            printf("FAIL: motor %d still reversed after normal re-arm\n", i);
+            rc = 1;
+        }
+    }
+    printf(rc == 0 ? "PASS\n" : "FAIL\n");
+    return rc;
+}
+
+// ---------------------------------------------------------- rpm filter test
+/* --rpmfilter-test: bidirectional-DSHOT eRPM telemetry end to end. The
+ * virtual ESC encodes physics-true rpm into the real eRPM period frames;
+ * the STOCK stack decodes them and feeds the RPM filter — the firmware
+ * flies with the pilot's actual gyro-filter configuration. Asserts the
+ * firmware-side telemetry rpm matches the physics rpm and that the filter
+ * is genuinely enabled while a hover stays stable. */
+static int rpmFilterTest()
+{
+const char* eeprom = "pw-tester-rpmfilter-eeprom.bin";
+    remove(eeprom);
+
+    StateInit init {};
+    profileCineLog35(init, eeprom);
+
+    StateInput in {};
+    inputDefaults(in);
+    in.gyroBaseNoiseAmp = 0.0002f;
+    const float dt = 1.0f / 250.0f;
+    in.delta = dt;
+
+    Sim& sim = Sim::getInstance();
+    sim.init(init);
+    // dshot_bidir like the real dump, persisted, then a clean reboot: the
+    // RPM filter samples the flag at gyro init
+    BF::setDshotBidir(true);
+    BF::saveConfig();
+    sim.reset(init);
+
+    mat3 basis = identity;
+    vec3 position {0.0f, PW_HULL_REST_H, 0.0f};
+    copy(in.rotation, basis);
+
+    int rc = 0;
+    float throttle = -1.0f;
+    bool armedSeen = false;
+    float minAlt = 1e9f, maxAlt = -1e9f;
+
+    const float T_ARM = 6.0f, T_CHECK = 15.0f, T_END = 16.0f;
+
+    const int frames = (int)(T_END / dt);
+    for (int f = 0; f <= frames; f++) {
+        const float t = f * dt;
+
+        in.rcData[4] = (t >= T_ARM) ? 1.0f : -1.0f;
+        in.rcData[5] = 1.0f;
+
+        const SimState& st = sim.getSimState();
+        if (st.armed) {
+            armedSeen = true;
+            float u = -0.3f + 0.5f * (2.0f - position[1]) - 0.4f * st.stateOutput.linearVelocity.y;
+            u = clamp(u, -1.0f, 0.6f);
+            const float maxStep = 2.0f * dt;
+            throttle = clamp(u, throttle - maxStep, throttle + maxStep);
+        } else {
+            throttle = -1.0f;
+        }
+        in.rcData[2] = throttle;
+
+        sim.update(in);
+
+        const StateOutput& out = sim.getStateUpdate();
+        quat q { out.orientation.x, out.orientation.y, out.orientation.z, out.orientation.w };
+        basis = quat_to_mat3(q);
+        copy(in.rotation, basis);
+        in.angularVelocity = out.angularVelocity;
+        in.linearVelocity  = out.linearVelocity;
+
+        vec3 vel;
+        copy(vel, out.linearVelocity);
+        position = position + vel * dt;
+        groundManifold(position, basis, in);
+
+        if (t >= T_ARM + 8.0f) {
+            minAlt = std::min(minAlt, position[1]);
+            maxAlt = std::max(maxAlt, position[1]);
+        }
+
+        if (f == (int)(T_CHECK / dt)) {
+            for (int i = 0; i < 4; i++) {
+                const float physicsRpm = st.motorsState[i].rpm;
+                const float fcRpm = BF::dshotTelemetryRpm(i);
+                printf("[rpmfilter] motor %d: physics %.0f rpm, firmware sees %.0f rpm\n",
+                       i, physicsRpm, fcRpm);
+                if (physicsRpm < 1000.0f) {
+                    printf("FAIL: motor %d not spinning in hover?\n", i);
+                    rc = 1;
+                } else if (std::fabs(fcRpm - physicsRpm) / physicsRpm > 0.05f) {
+                    printf("FAIL: telemetry rpm off by >5%%\n");
+                    rc = 1;
+                }
+            }
+            if (!BF::dshotTelemetryActive()) {
+                printf("FAIL: dshot telemetry not active\n");
+                rc = 1;
+            }
+            if (!BF::rpmFilterEnabled()) {
+                printf("FAIL: RPM filter not enabled\n");
+                rc = 1;
+            }
+        }
+    }
+
+    if (!armedSeen) { printf("FAIL: never armed\n"); rc = 1; }
+    if (armedSeen && (minAlt < 1.0f || maxAlt > 3.0f)) {
+        printf("FAIL: hover out of band [%.2f, %.2f] with RPM filter active\n", minAlt, maxAlt);
+        rc = 1;
+    } else if (armedSeen) {
+        printf("[rpmfilter] hover band [%.2f, %.2f] with the RPM filter running\n", minAlt, maxAlt);
+    }
+    printf(rc == 0 ? "PASS\n" : "FAIL\n");
+    return rc;
+}
+
 int main(int argc, char** argv)
 {
     if (argc > 1 && strcmp(argv[1], "--drop-test") == 0) {
         return dropTest();
+    }
+    if (argc > 1 && strcmp(argv[1], "--turtle-test") == 0) {
+        return turtleTest();
+    }
+    if (argc > 1 && strcmp(argv[1], "--rpmfilter-test") == 0) {
+        return rpmFilterTest();
     }
     if (argc > 1 && strcmp(argv[1], "--crash-test") == 0) {
         return crashTest();

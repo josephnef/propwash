@@ -49,12 +49,24 @@ add_test(NAME contact_drop COMMAND pw-tester --drop-test)
 add_test(NAME crash_scenario COMMAND pw-tester --crash-test)
 set_tests_properties(crash_scenario PROPERTIES TIMEOUT 120)
 
-# Virtual DSHOT ESC (PROPWASH_DSHOT=1): boot grace clears under a DSHOT
+# Virtual DSHOT ESC (the default protocol now): boot grace clears under a DSHOT
 # protocol, the quad arms + hovers through the virtual ESC's throttle
 # mapping, and SPIN_DIRECTION commands sent through the stock
 # dshot_command.c queue land in pw_motor_dir (the crashflip prerequisite).
 add_test(NAME dshot_device COMMAND pw-tester --dshot-test)
 set_tests_properties(dshot_device PROPERTIES TIMEOUT 120)
+
+# Turtle mode end to end: settle inverted, arm with the crashflip box,
+# reversed props pivot the quad over its duct edge (an emergent
+# contact-solver maneuver), then a normal re-arm restores spin directions.
+add_test(NAME turtle_flip COMMAND pw-tester --turtle-test)
+set_tests_properties(turtle_flip PROPERTIES TIMEOUT 120)
+
+# Bidirectional-DSHOT eRPM: the virtual ESC encodes physics-true rpm into
+# real eRPM period frames, the stock stack decodes them, and the firmware's
+# RPM filter runs — telemetry rpm must match physics rpm during a hover.
+add_test(NAME rpm_filter COMMAND pw-tester --rpmfilter-test)
+set_tests_properties(rpm_filter PROPERTIES TIMEOUT 120)
 
 # Contact/damage over the wire: scripted drops onto the client-built ground
 # manifold -> damage bands + crash latch + REPAIR read back from PW_STATE_OUT.

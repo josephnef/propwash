@@ -137,10 +137,14 @@ namespace SimITL{
       }
 
       simState.microsPassed = BF::pw_micros_passed;
-      simState.motorsState[0].pwm = BF::pw_motors_pwm[0] / 1000.0f;
-      simState.motorsState[1].pwm = BF::pw_motors_pwm[1] / 1000.0f;
-      simState.motorsState[2].pwm = BF::pw_motors_pwm[2] / 1000.0f;
-      simState.motorsState[3].pwm = BF::pw_motors_pwm[3] / 1000.0f;
+      for (int i = 0; i < 4; i++) {
+        simState.motorsState[i].pwm = BF::pw_motors_pwm[i] / 1000.0f;
+        // spin direction commanded over virtual DSHOT (crashflip)
+        simState.motorsState[i].spinDir = BF::pw_motor_dir[i];
+        // physics-true rpm for the virtual ESC's eRPM telemetry (one tick
+        // stale — 50 us — exactly like a real ESC's last-known value)
+        BF::pw_motor_rpm[i] = simState.motorsState[i].rpm;
+      }
 
       return schedulerExecuted;
     }
@@ -150,8 +154,9 @@ namespace SimITL{
     }
 
     // Configure aux modes matching the CineLog35 switch plan (CONFIG.md):
-    // ARM on ch5 (AUX1), ANGLE on ch6 (AUX2). Applied in RAM post-init —
-    // equivalent to `aux` CLI entries without touching the eeprom.
+    // ARM on ch5 (AUX1), ANGLE on ch6 (AUX2), FLIP OVER AFTER CRASH (turtle)
+    // on ch7 (AUX3). Applied in RAM post-init — equivalent to `aux` CLI
+    // entries without touching the eeprom.
     void configureDefaultModes(){
       BF::modeActivationCondition_t* arm = BF::modeActivationConditionsMutable(0);
       arm->modeId = BF::BOXARM;
@@ -165,8 +170,16 @@ namespace SimITL{
       angle->range.startStep = CHANNEL_VALUE_TO_STEP(1700);
       angle->range.endStep   = CHANNEL_VALUE_TO_STEP(2100);
 
+      // Turtle activates when ARMING with this box active (and a DSHOT
+      // protocol); harmless dead switch under forced PWM.
+      BF::modeActivationCondition_t* flip = BF::modeActivationConditionsMutable(2);
+      flip->modeId = BF::BOXFLIPOVERAFTERCRASH;
+      flip->auxChannelIndex = 2; // AUX3 = rc ch7
+      flip->range.startStep = CHANNEL_VALUE_TO_STEP(1700);
+      flip->range.endStep   = CHANNEL_VALUE_TO_STEP(2100);
+
       BF::analyzeModeActivationConditions();
-      printf("[pw] aux modes configured: ARM=AUX1, ANGLE=AUX2\n");
+      printf("[pw] aux modes configured: ARM=AUX1, ANGLE=AUX2, TURTLE=AUX3\n");
     }
 
     // Bench/test relaxation: runaway-takeoff prevention misfires against an
@@ -187,6 +200,30 @@ namespace SimITL{
 
     int motorSpinDirection(int index){
       return (index >= 0 && index < 4) ? BF::pw_motor_dir[index] : 0;
+    }
+
+    void saveConfig(){
+      BF::writeEEPROM();
+    }
+
+    void setSmallAngle(int degrees){
+      BF::imuConfigMutable()->small_angle = (uint8_t)degrees;
+    }
+
+    void setDshotBidir(bool on){
+      BF::motorConfigMutable()->dev.useDshotTelemetry = on ? 1 : 0;
+    }
+
+    float dshotTelemetryRpm(int index){
+      return (index >= 0 && index < 4) ? BF::getDshotRpm((uint8_t)index) : 0.0f;
+    }
+
+    bool dshotTelemetryActive(){
+      return BF::isDshotTelemetryActive();
+    }
+
+    bool rpmFilterEnabled(){
+      return BF::isRpmFilterEnabled();
     }
 
     void takeStateSnapshot(){

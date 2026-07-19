@@ -93,6 +93,7 @@ var _rc := [0.0, 0.0, -1.0, 0.0, -1.0, 1.0, -1.0, -1.0]
 var _throttle := -1.0
 var _armed_sw := false
 var _angle_sw := true
+var _turtle_sw := false   # ch7 = FLIP OVER AFTER CRASH box (arm to flip)
 
 # RC handset (joystick) state. EdgeTX "Joystick (Channels)" mode presents
 # CH1-8 as HID axes 0-7 = AETR + switches, which Godot normalises to -1..1 —
@@ -741,6 +742,7 @@ func _update_keyboard_rc(delta: float) -> void:
 	_rc[3] = yaw
 	_rc[4] = 1.0 if _armed_sw else -1.0
 	_rc[5] = 1.0 if _angle_sw else -1.0
+	_rc[6] = 1.0 if _turtle_sw else -1.0
 
 
 func _unhandled_key_input(event: InputEvent) -> void:
@@ -750,6 +752,12 @@ func _unhandled_key_input(event: InputEvent) -> void:
 				_armed_sw = not _armed_sw
 			KEY_Q:
 				_angle_sw = not _angle_sw
+			KEY_F:
+				# turtle: flip the switch while disarmed and upside down,
+				# then arm — the props reverse and the sticks flip you over
+				_turtle_sw = not _turtle_sw
+				_toast_msg("turtle switch ON — arm to flip" if _turtle_sw
+						else "turtle switch OFF")
 			KEY_R:
 				_udp.put_packet(PwProtocol.pack_command(PwProtocol.PW_CMD_RESET))
 				_pos = Vector3(0, HULL_REST_H, 0)
@@ -817,7 +825,7 @@ func _update_hud() -> void:
 			Input.get_joy_name(_js_dev),
 			_rc[0], _rc[1], _rc[2], _rc[3], _rc[4], _rc[5], _rc[6], _rc[7]]
 	else:
-		rc_line = "E arm | Q angle | R reset | %sWASD+arrows fly (keyboard)" % \
+		rc_line = "E arm | Q angle | F turtle | R reset | %sWASD+arrows fly (keyboard)" % \
 				("" if _strict else "T repair | ")
 	var dmg: Array = o.get("prop_damage", [0.0, 0.0, 0.0, 0.0])
 	var flags: int = o.get("crash_flags", 0)

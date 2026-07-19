@@ -83,6 +83,27 @@ namespace SimITL{
      * DSHOT ESC: +1 normal, -1 reversed (0 = bad index).
      */
     int motorSpinDirection(int index);
+
+    /** Persist the current config to the eeprom file (CLI `save` without
+     * the reboot). Test harness plumbing. */
+    void saveConfig();
+
+    /** RAM-set small_angle (deg) — arming-attitude limit; 180 allows
+     * arming inverted (the turtle prerequisite the real dump sets). */
+    void setSmallAngle(int degrees);
+
+    /** RAM-set dshot_bidir (bidirectional DSHOT telemetry). Takes effect
+     * on the next boot (the RPM filter samples it at gyro init). */
+    void setDshotBidir(bool on);
+
+    /** Firmware-side view of one motor's telemetry rpm (mechanical). */
+    float dshotTelemetryRpm(int index);
+
+    /** True once every motor has delivered eRPM telemetry. */
+    bool dshotTelemetryActive();
+
+    /** True when the gyro RPM filter is initialized and running. */
+    bool rpmFilterEnabled();
   }
 }
 
