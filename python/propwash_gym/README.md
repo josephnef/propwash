@@ -72,11 +72,11 @@ uv run pytest            # env-checker + arm/step/hover; skips if core not built
 - **ANGLE vs ACRO**: default is ANGLE (`angle_mode=True`) so the firmware
   self-levels and the RL problem is throttle/position. Pass `angle_mode=False`
   for raw ACRO stabilisation.
-- **Determinism**: the env defaults to `gyro_noise=0` (deterministic lockstep —
-  simulated time only advances on a step). Note the sim is **not yet
-  bit-reproducible across `reset()`s**: residual firmware state that
-  `BF::init()` doesn't clear varies between sessions (the repo's
-  `determinism_check` is red for the same reason — that's the M5 system-ID
-  work). Consequently Gymnasium's `check_env` step-determinism sub-check is a
-  known xfail; the rest of the API contract passes. Set `gyro_noise>0` to train
-  a policy robust to sensor noise.
+- **Determinism**: the env defaults to `gyro_noise=0`, and rollouts are
+  **bit-reproducible** — the same seed and actions give byte-identical
+  trajectories across `reset()`s and across processes. Simulated time only
+  advances on `step()`, and reset restores the firmware's writable static
+  state to a boot snapshot, so reset ≡ fresh process. Gymnasium's `check_env`
+  step-determinism sub-check is enforced (no xfail), gated core-side by the
+  `reset_determinism` / `cross_process_determinism` ctests. Set `gyro_noise>0`
+  to train a policy robust to sensor noise.

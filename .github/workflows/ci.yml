@@ -84,19 +84,22 @@ jobs:
 
       - name: Core tests (headless, no GPU / no joystick)
         run: |
-          # KNOWN WINDOWS LIMITATION — diff_roundtrip and real_tune_hover are
-          # skipped here (they still run on Linux/macOS). Both reconnect to the
-          # CLI after the firmware reboots (`save`), and on Windows that
-          # reconnect intermittently times out: the dyad listener stops
-          # accepting, so the connect hangs until the backlog times out.
-          # Suspected cause is the stale tcpPort_t client state that survives an
-          # in-process systemReset (onAccept then dyad_close()s a connection
-          # dyad may already have freed); resetting that state on reboot is the
-          # likely fix. Everything the tests below cover is solid on Windows:
-          # BF boots/arms/hovers (headless_scenario), the UDP wire protocol
-          # (udp_e2e) and the real OSD render (osd_render).
+          # diff_roundtrip and real_tune_hover used to be skipped here: the
+          # CLI reconnect after the in-process `save` reboot intermittently
+          # timed out on Windows. Root cause was in the vendored dyad's accept
+          # loop: an aborted backlog connection fails the accept() itself with
+          # WSAECONNRESET on Windows (Linux discards those silently), and dyad
+          # fell through and fabricated a CONNECTED stream around
+          # INVALID_SOCKET — the bogus ACCEPT event made serial_tcp.c's
+          # newest-client-wins onAccept drop the HEALTHY connection every time
+          # a retrying client left a corpse in the backlog. Fixed in
+          # extern/betaflightext/src/main/compat/dyad/dyad.c
+          # (stream_acceptPendingConnections), plus a deterministic client
+          # teardown on the reboot path (serial_tcp.c tcpReconfigure). The
+          # full core suite runs here now; only the Godot client tests are
+          # excluded (no godot binary on this runner).
           ctest --test-dir build --output-on-failure \
-            -E 'godot_client|flythrough|real_tune_hover|diff_roundtrip'
+            -E 'godot_client|flythrough'
 
   python-gym:
     runs-on: ubuntu-latest

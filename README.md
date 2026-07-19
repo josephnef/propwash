@@ -20,7 +20,7 @@ Betaflight OSD overlaid, live motor RPM in the HUD.*
 ## Why
 
 Every other sim reimplements or approximates the flight controller. propwash
-runs the genuine article, which makes it uniquely suited to three things a
+runs the genuine article, which makes it uniquely suited to four things a
 normal sim can't do:
 
 1. **Train on your exact tune** — same PIDs, rates, filters, arming/failsafe
@@ -28,8 +28,9 @@ normal sim can't do:
    and the RPM filter running on bidirectional-DSHOT eRPM that the virtual
    ESC derives from the physics' true motor speeds.
 2. **Deterministic lockstep** — identical inputs produce byte-identical
-   trajectories, so it can back a reproducible RL gym and replay real blackbox
-   logs for sim-vs-real validation.
+   trajectories, across runs, processes and resets, and the test suite gates
+   it ([Determinism](#determinism)). That's what backs a reproducible RL gym
+   and blackbox replay for sim-vs-real validation.
 3. **Configurator-compatible** — the real Betaflight Configurator connects over
    TCP and tunes it live, exactly like a bench quad.
 4. **Crashes are real** — contacts are resolved as forces inside the physics
@@ -100,22 +101,38 @@ two lockstep scheduler patches and the OSD/CLI plumbing.
 
 ## Build
 
-No external dependencies — just a C/C++ toolchain and CMake. (The joystick uses
-the Linux kernel `js` API directly; no SDL2.)
+No external dependencies — just a C/C++ toolchain and CMake.
 
 ```bash
 git clone --recursive https://github.com/<you>/propwash
 cd propwash
 cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build -j
-ctest --test-dir build            # headless: boot, hover, determinism, OSD, real-tune
+ctest --test-dir build            # self-tests: boot, hover, crashes, determinism, OSD, real-tune
 ```
 
-Requires: CMake ≥ 3.20, GCC ≥ 12 or Clang, Linux x86_64. (Builds clean on
-GCC 16; the pinned Betaflight needs a couple of `-Wno-error` for newer GCC,
-already handled in `extern/CMakeLists.txt`.)
+Requires CMake ≥ 3.20 and GCC ≥ 12 or Clang. (Builds clean on GCC 16; the
+pinned Betaflight needs a couple of `-Wno-error` for newer GCC, already handled
+in `extern/CMakeLists.txt`.)
 
 If you cloned without `--recursive`: `git submodule update --init --recursive`.
+
+### Platforms
+
+CI builds and tests every push on all three ([`ci.yml`](.github/workflows/ci.yml)):
+
+| platform | status |
+|---|---|
+| Linux (x86_64) | primary — full test suite, joystick support |
+| macOS (arm64) | full test suite (AppleClang; `-dead_strip` replaces the GNU linker script) |
+| Windows (MinGW-w64) | full headless test suite under MSYS2/Ninja |
+
+Your radio works on all three, by different paths: on Linux the core reads
+the handset directly (kernel `js` API, no SDL2); on macOS/Windows the Godot
+client reads it through Godot's cross-platform input and injects RC over the
+wire — the core's RC priority falls through when it has no local joystick.
+Only the core-side `--js-calibrate` wizard is Linux-specific. The Godot
+client runs in CI on Linux and macOS (pinned Godot 4.7.1).
 
 ## Fly it
 
@@ -129,29 +146,43 @@ tools/bfcli/load_config.sh                 # writes ./eeprom.bin
 PROPWASH_EEPROM=$PWD/eeprom.bin godot --path client-godot
 ```
 
-The Godot client spawns `build/propwash-core` itself. Controls:
+The Godot client spawns `build/propwash-core` itself.
 
-- **RadioMaster Pocket / any EdgeTX handset** in USB Joystick mode — auto-detected
-  by name, RC read directly by the core. Calibrate once:
-  `./build/propwash-core --js-calibrate`.
+### Controls
+
+- **RadioMaster Pocket / any EdgeTX handset** in USB Joystick mode —
+  auto-detected by name. On Linux the core reads it directly (calibrate once:
+  `./build/propwash-core --js-calibrate`); on macOS/Windows the Godot client
+  reads it and injects RC over the wire.
 - **No radio** — keyboard: arrows = right stick, `W`/`S` throttle, `A`/`D` yaw,
   `E` arm, `Q` angle toggle, `F` turtle switch, `T` repair in place, `R` reset
   to pad.
-- **Crashes have consequences.** Gates, trees and the ground are solid; hitting
-  them costs momentum and props. The HUD shows per-motor damage, a hard impact
-  puts up a `CRASHED` banner, and a wrecked quad genuinely cannot hover (the
-  thrust isn't there any more). Disarm and press `T` to repair + set the quad
-  upright where it lies, or `R` to reset to the pad. `PROPWASH_STRICT=1`
-  disables `T` for deliberate practice — a crash then always ends the flight.
-  If your dump sets `crash_recovery = DISARM`, the firmware's own crash
-  detection disarms you exactly as on hardware (`CRASH DETECTED` banner; cycle
-  the ARM switch to clear). And when you end up upside-down: disarm, flip the
-  turtle switch (`F`), arm, and roll — the props reverse over real DSHOT
-  spin-direction commands and the quad pivots itself upright over a duct
-  edge, exactly the crashflip maneuver from the real quad.
-- **Wind** — `PROPWASH_WIND="3,0,0" PROPWASH_GUST=1.5 godot --path client-godot`
-  gives a 3 m/s steady wind with 1.5 m/s gusts. Deterministic: the same flags
-  reproduce the same run; calm runs are byte-identical to a build without wind.
+- **Won't arm?** The core prints a `[pw][rc]` log line with the 8 RC channels
+  and a decoded arming-block reason on every change — read that before touching
+  the switch mapping.
+
+### Crashes, damage and turtle mode
+
+Gates, trees and the ground are solid; hitting them costs momentum and props.
+The HUD shows per-motor damage, a hard impact puts up a `CRASHED` banner, and a
+wrecked quad genuinely cannot hover (the thrust isn't there any more). Disarm
+and press `T` to repair + set the quad upright where it lies, or `R` to reset
+to the pad. `PROPWASH_STRICT=1` disables `T` for deliberate practice — a crash
+then always ends the flight. If your dump sets `crash_recovery = DISARM`, the
+firmware's own crash detection disarms you exactly as on hardware
+(`CRASH DETECTED` banner; cycle the ARM switch to clear). And when you end up
+upside-down: disarm, flip the turtle switch (`F`), arm, and roll — the props
+reverse over real DSHOT spin-direction commands and the quad pivots itself
+upright over a duct edge, exactly the crashflip maneuver from the real quad.
+
+### Wind
+
+`PROPWASH_WIND="3,0,0" PROPWASH_GUST=1.5 godot --path client-godot` gives a
+3 m/s steady wind with 1.5 m/s gusts. Deterministic: the same flags reproduce
+the same run; calm runs are byte-identical to a build without wind.
+
+### Configurator and the real OSD
+
 - **Betaflight Configurator** connects any time to TCP `127.0.0.1:5761` (MSP/CLI)
   and tunes it live.
 - The **real Betaflight OSD** is overlaid on the FPV view — crisp, above the
@@ -162,14 +193,12 @@ The Godot client spawns `build/propwash-core` itself. Controls:
   real angular rate (a whip-pan blows the bitrate budget and recovers). Tuned to
   be subtle: real O3 footage is clean, so if you can point at an individual
   effect it is turned up too far. `PROPWASH_GOGGLE=off` shows the raw render.
+
+### Display and performance
+
 - **Second monitor** — if one is attached the sim opens fullscreen on it, leaving
   the primary free for the Configurator and logs. Override with
   `PROPWASH_SCREEN=off` (stay windowed) or `PROPWASH_SCREEN=<index>` (0-based).
-- **Lockstep rate** — the client drives the core at a fixed **250 Hz**, one packet
-  per step, and consumes exactly one reply per frame. It is deliberately not tied
-  to your monitor: the rate is an input to the simulation, so varying it makes
-  runs unreproducible. 1/250 also divides exactly into the core's 50 µs tick
-  quantum. Display smoothness comes from physics interpolation instead.
 - **Quality tiers** — `low`/`medium`/`high`, auto-selected from what the GPU
   actually has to sustain (width × height × refresh), so a 240 Hz panel keeps its
   framerate and a 60 Hz one gets the prettier version. **Every tier renders at
@@ -179,6 +208,11 @@ The Godot client spawns `build/propwash-core` itself. Controls:
   than let a heavy scene starve the sim. `PROPWASH_SCALE=<0.5-1.0>` exists as an
   explicit opt-in for a GPU that genuinely can't drive the panel — it is never
   applied by default.
+- **Lockstep rate** — the client drives the core at a fixed **250 Hz**,
+  deliberately not tied to your monitor: the rate is an input to the simulation,
+  so varying it would make runs unreproducible. Display smoothness comes from
+  physics interpolation instead (details in
+  [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)).
 
 ### Environment variables
 
@@ -205,6 +239,7 @@ discoverable by reading the source.
 | `PROPWASH_NO_JS=1` | spawn the core with `--no-js` (scripted harnesses) |
 | `PROPWASH_CONTACT_LOG=1` | print every new contact event (surface, depth) |
 | `PROPWASH_FORCE_PWM=1` | (core env) force the old PWM motor protocol instead of the dump's DSHOT |
+| `PROPWASH_DUMP_STATE=<path>` | (core env) dump the firmware's writable statics for determinism bisection (`tools/tester/state_diff.py`) |
 
 ### Loading the pilot's real tune
 
@@ -226,15 +261,39 @@ board and must not apply to a virtual gyro — critically `align_board_roll`
 ```bash
 ./build/propwash-core [--server|--realtime|--js-calibrate] [--port 9100] \
                       [--eeprom path] [--js /dev/input/jsN | --no-js] \
-                      [--wind x,y,z] [--gust amp]
+                      [--duration s] [--wind x,y,z] [--gust amp]
 ```
+
+## Determinism
+
+Identical inputs produce **byte-identical** trajectories — across runs, across
+processes, and across resets. A reset restores the firmware's writable static
+state to a snapshot taken right after the first boot
+(`core/sim/static_snapshot.h`), so reset ≡ fresh process; and the client is
+the clock, so simulated time only advances when a client steps.
+
+This isn't aspirational — the test suite gates it:
+
+- `cross_process_determinism` — two fresh cores fed identical inputs (one with
+  its sends jittered past the recv timeout) produce byte-identical output.
+- `reset_determinism` — one core, the identical input tape played twice around
+  a `PW_CMD_RESET`, byte-identical streams.
+- the gym enforces Gymnasium's `check_env` step-determinism sub-check.
+
+Two ways to forfeit it, both opt-in: `--realtime` (the core free-runs on the
+wall clock), and attaching the Configurator *during* a run you care about (MSP
+traffic on TCP 5761 arrives on a wall-clock thread). Debugging a regression:
+the failing check prints the first divergent frame + field, and
+`PROPWASH_DUMP_STATE` + `tools/tester/state_diff.py` bisect residual state to
+exact symbols.
 
 ## Reinforcement learning (gym)
 
 [`python/propwash_gym/`](python/propwash_gym/) is a
 [Gymnasium](https://gymnasium.farama.org/) environment: each env owns one
 `propwash-core` subprocess and drives it in `frame_id` lockstep, so the policy
-trains against the pilot's real firmware and the rollouts are reproducible.
+trains against the pilot's real firmware and the rollouts are bit-reproducible
+([Determinism](#determinism)).
 
 ```bash
 cd python/propwash_gym
@@ -246,8 +305,7 @@ uv run python examples/ppo_hover.py --timesteps 20000   # PPO smoke run
 The env task is a hover (arm → hold altitude, level and still). Action is
 `[throttle, roll, pitch, yaw]`; observation is
 `quat | angvel | linvel | pos_error | motor_rpm`. See its
-[README](python/propwash_gym/README.md) for the spaces, reward and the
-determinism caveat.
+[README](python/propwash_gym/README.md) for the spaces and reward.
 
 ## Matching the real quad (blackbox system ID)
 
@@ -259,8 +317,7 @@ step that certifies it for sim-vs-real work. Two replay modes:
   physics, end-to-end).
 - **Physics-only replay** (`PW_MOTOR_IN`) feeds the log's recorded motor outputs
   straight into the physics, bypassing the firmware — isolating physics-model
-  error from PID error, and **bit-reproducible across cores** (the firmware
-  residual state that limits closed-loop determinism is out of the loop).
+  error from PID error, so a bad fit points at the physics, not the tune.
 
 A derivative-free fitter then adjusts `PW_INIT` physics parameters to minimise
 the gyro+accel error against the log. `PW_INIT` re-parameterises physics on a
@@ -273,24 +330,27 @@ parameter it was hidden from. A real log drops in through
 
 ## Status
 
-Working: in-process Betaflight 4.5.2, deterministic lockstep, physics + stable
-hover, real collision physics (solid world, contact forces the firmware feels,
-per-motor crash damage, repair/reset flow, wind + gusts, ground effect), UDP
-protocol, Godot FPV client with the real OSD and a cinewhoop model,
+Working: in-process Betaflight 4.5.2, deterministic lockstep — byte-identical
+across processes and resets, test-gated ([Determinism](#determinism)) — physics
++ stable hover, real collision physics (solid world, contact forces the
+firmware feels, per-motor crash damage, repair/reset flow, wind + gusts, ground
+effect), a virtual DSHOT ESC (the dump's dshot600 is the default protocol,
+turtle mode works end-to-end, the RPM filter runs on real bidirectional-DSHOT
+eRPM), UDP protocol, Godot FPV client with the real OSD and a cinewhoop model,
 CLI/Configurator data path, real-tune loading, joystick calibration, autonomous
 gate fly-through, a **[Gymnasium environment](python/propwash_gym/)** (RL,
 `uv`-managed, subprocess-per-env, `frame_id` lockstep), and a
 **[blackbox replay + system-ID pipeline](tools/sysid/)** (RC & physics-only
-replay, physics-parameter fitting over `PW_INIT`). **16 headless self-tests**
-cover boot/MSP identity, hover, contact settling (level *and* inverted), the
-crash→repair lifecycle, damage over the wire, OSD render, real-tune hover, the
-Godot client's detection, repair flow and gate fly-through (now with clearance
-asserts against solid gates), the gym env-checker + hover, and physics-only
-replay reproducibility + parameter recovery — all with the real core in the loop.
+replay, physics-parameter fitting over `PW_INIT`). **22 self-tests** (15
+always, +6 with a Godot binary, +1 with Python) cover it with the real core in
+the loop: boot/MSP identity, hover, contact settling (level *and* inverted),
+the crash→repair lifecycle, damage over the wire, DSHOT + turtle mode + the
+RPM filter, both determinism gates, wire-codec parity, OSD render, real-tune
+hover, the Godot client's detection, repair flow and gate fly-through (with
+clearance asserts against solid gates), the gym env-checker + hover, and
+physics-only replay reproducibility + parameter recovery.
 
-Planned: Quest 3 / OpenXR build. Physics-only replay is already bit-reproducible
-across cores; extending that to the closed loop (the last gap for a fully
-deterministic gym across resets) tracks the firmware residual-state work.
+Planned: Quest 3 / OpenXR build.
 
 ## Prior art & credits
 

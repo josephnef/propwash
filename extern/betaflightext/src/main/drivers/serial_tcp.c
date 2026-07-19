@@ -25,8 +25,12 @@
 */
 
 /*
- * propwash: vendored from stock drivers/serial_tcp.c (BF 4.5.2), the ONLY
- * change being dyad thread-safety. dyad is single-threaded by design, but
+ * propwash: vendored from stock drivers/serial_tcp.c (BF 4.5.2). Changes:
+ * dyad thread-safety (below), a deterministic client teardown on the
+ * in-process reboot path (tcpReconfigure), and snapshot-exclusion exports for
+ * the deterministic reset (pw_serial_tcp_*_range).
+ *
+ * Thread-safety: dyad is single-threaded by design, but
  * propwash pumps dyad_update() on a dedicated worker thread (pw_sitl.c's
  * tcpThread) while the Betaflight scheduler (the sim thread) calls dyad here
  * from tcpReconfigure() (dyad_newStream/dyad_listenEx at init) and tcpDataOut()
@@ -68,11 +72,36 @@ extern void pw_dyad_unlock(void);
 
 static const struct serialPortVTable tcpVTable; // Forward
 static tcpPort_t tcpSerialPorts[SERIAL_PORT_COUNT];
-static bool tcpPortInitialized[SERIAL_PORT_COUNT];
-static bool tcpStart = false;
+// propwash: grouped so the deterministic-reset snapshot can exclude it as one
+// range (like dyad's pw_dyad_state).
+static struct {
+    bool portInitialized[SERIAL_PORT_COUNT];
+    bool started;
+} tcpInit;
 bool tcpIsStart(void)
 {
-    return tcpStart;
+    return tcpInit.started;
+}
+
+/* propwash: the deterministic-reset snapshot must not restore this file's
+ * state — it is host-side connection plumbing, not firmware state (the same
+ * category as dyad's globals). Restoring tcpSerialPorts writes snapshot-time
+ * dyad_Stream pointers back into s->conn/s->serv: at best that NULLs a live
+ * client's slot (a Configurator attached across a PW_CMD_RESET went
+ * half-dead, replies never sent), at worst it resurrects a pointer dyad has
+ * since freed and the next newest-client-wins accept dyad_close()s freed
+ * memory. Restoring tcpInit would forget ports opened after the snapshot and
+ * re-listen on a bound port at the next reset. Registered in bf.cpp BEFORE
+ * the snapshot is taken. */
+void pw_serial_tcp_state_range(void **addr, unsigned long *size)
+{
+    *addr = tcpSerialPorts;
+    *size = sizeof(tcpSerialPorts);
+}
+void pw_serial_tcp_init_range(void **addr, unsigned long *size)
+{
+    *addr = &tcpInit;
+    *size = sizeof(tcpInit);
 }
 static void onData(dyad_Event *e)
 {
@@ -119,8 +148,24 @@ static void onAccept(dyad_Event *e)
 }
 static tcpPort_t* tcpReconfigure(tcpPort_t *s, int id)
 {
-    if (tcpPortInitialized[id]) {
+    if (tcpInit.portInitialized[id]) {
+        // propwash: the in-process reboot path (`save` -> systemReset ->
+        // init() -> serTcpOpen). On real hardware a reboot drops the USB/VCP
+        // connection; mirror that and end the old client deterministically
+        // instead of leaving its teardown to interleave with the next accept
+        // on a slow host. dyad_end flushes the pending response (`save`'s
+        // output) before closing; onClose then clears the slot on the worker
+        // thread. s->conn, when set, always points at a live stream — every
+        // dyad close path emits DYAD_EVENT_CLOSE first, and onClose clears a
+        // matching slot before the stream can be destroyed.
         fprintf(stderr, "port is already initialized!\n");
+        if (s->conn != NULL) {
+            pw_dyad_lock();
+            if (s->conn != NULL) {
+                dyad_end(s->conn);
+            }
+            pw_dyad_unlock();
+        }
         return s;
     }
 
@@ -135,8 +180,8 @@ static tcpPort_t* tcpReconfigure(tcpPort_t *s, int id)
         return NULL;
     }
 
-    tcpStart = true;
-    tcpPortInitialized[id] = true;
+    tcpInit.started = true;
+    tcpInit.portInitialized[id] = true;
 
     s->connected = false;
     s->clientCount = 0;
@@ -184,12 +229,19 @@ serialPort_t *serTcpOpen(int id, serialReceiveCallbackPtr rxCallback, void *rxCa
     s->port.vTable = &tcpVTable;
 
     // common serial initialisation code should move to serialPort::init()
+    // propwash: on the in-process reboot path the dyad worker can be inside
+    // onData (tcpDataIn) for a still-connected client — take the buffer locks
+    // for the index reset instead of racing it.
+    pthread_mutex_lock(&s->rxLock);
     s->port.rxBufferHead = s->port.rxBufferTail = 0;
-    s->port.txBufferHead = s->port.txBufferTail = 0;
     s->port.rxBufferSize = RX_BUFFER_SIZE;
-    s->port.txBufferSize = TX_BUFFER_SIZE;
     s->port.rxBuffer = s->rxBuffer;
+    pthread_mutex_unlock(&s->rxLock);
+    pthread_mutex_lock(&s->txLock);
+    s->port.txBufferHead = s->port.txBufferTail = 0;
+    s->port.txBufferSize = TX_BUFFER_SIZE;
     s->port.txBuffer = s->txBuffer;
+    pthread_mutex_unlock(&s->txLock);
 
     // callback works for IRQ-based RX ONLY
     s->port.rxCallback = rxCallback;

@@ -229,13 +229,20 @@ namespace SimITL{
     void takeStateSnapshot(){
       if (SimITL::snapshotTaken()) return;
       // lifetime/concurrency hazards the restore must never touch: dyad's
-      // connection state (realloc'd fd arrays, mutated by the pump thread)
-      // and the dyad mutex (held during the restore itself)
+      // connection state (realloc'd fd arrays, mutated by the pump thread),
+      // the dyad mutex (held during the restore itself), and serial_tcp's
+      // port state (live dyad_Stream pointers + which-ports-listen flags —
+      // restoring those orphans a connected Configurator's slot at best and
+      // resurrects a freed stream pointer at worst)
       void* addr = nullptr;
       unsigned long size = 0;
       BF::pw_dyad_state_range(&addr, &size);
       SimITL::snapshotExclude(addr, (size_t)size);
       BF::pw_dyad_mutex_range(&addr, &size);
+      SimITL::snapshotExclude(addr, (size_t)size);
+      BF::pw_serial_tcp_state_range(&addr, &size);
+      SimITL::snapshotExclude(addr, (size_t)size);
+      BF::pw_serial_tcp_init_range(&addr, &size);
       SimITL::snapshotExclude(addr, (size_t)size);
       SimITL::snapshotTake();
     }

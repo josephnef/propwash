@@ -98,11 +98,15 @@ namespace SimITL{
 
       // dyad serialisation + the address ranges the deterministic-reset
       // snapshot must exclude (dyad's live connection state; the mutex the
-      // restore itself holds) — pw_sitl.c and the vendored dyad.c
+      // restore itself holds; serial_tcp's port state — live stream pointers
+      // and which-ports-listen flags) — pw_sitl.c, the vendored dyad.c and
+      // the vendored serial_tcp.c
       void pw_dyad_lock(void);
       void pw_dyad_unlock(void);
       void pw_dyad_state_range(void **addr, unsigned long *size);
       void pw_dyad_mutex_range(void **addr, unsigned long *size);
+      void pw_serial_tcp_state_range(void **addr, unsigned long *size);
+      void pw_serial_tcp_init_range(void **addr, unsigned long *size);
 
     } // end extern "C"
   }

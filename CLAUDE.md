@@ -17,7 +17,7 @@ No external dependencies (kernel `js` API, not SDL2). One pinned submodule.
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo && cmake --build build -j
-ctest --test-dir build            # 21 headless tests (+ gym_hover if uv-synced); ~2.5 min
+ctest --test-dir build            # 22 ctests: 15 always, +6 with a godot binary, +gym_hover if uv-synced; ~2.5 min
 ```
 
 The Betaflight submodule builds as a static lib (`extern/`). Source list is
@@ -34,6 +34,7 @@ if the firmware version changes.
 | `crash_scenario` | crash lifecycle: rest never damages; 10 m drop = structural crash; a wrecked quad cannot hover (physics, not script); REPAIR restores hover |
 | `collision_e2e` | damage bands over the wire: 1.2 m drop → small damage, 10 m → crash latch, REPAIR clears (reads `prop_damage`/`crash_flags`) |
 | `udp_e2e` | Python client drives the wire protocol, hovers |
+| `codec_parity` | the two Python wire codecs (GPL `tools/tester/pw_udp.py` vs the gym's MIT `protocol.py`) agree field-for-field — changing one alone goes red |
 | `diff_roundtrip` | apply a `diff all` over CLI → save → in-process reboot → settings survive |
 | `osd_render` | real `osd.c` renders through the fake displayport → `PW_OSD` |
 | `real_tune_hover` | bake the real diff → fresh boot has `p_pitch=53`, `align_board_roll=0` → hovers |
@@ -42,7 +43,8 @@ if the firmware version changes.
 | `quality_tiers` | render tier selection rule as a pure function (cases a single machine can't produce) |
 | `fpv_cull` | FPV cull mask + prop→motor index map — invariants a rewrite has already silently dropped once |
 | `client_collision` | client detection: hull vs analytic ground + engine-query gate tubes, slop depenetration, Godot→sim manifold conversion |
-| `gym_hover` | the Python Gymnasium env spawns a real core, arms + hovers, and passes the env-checker (step-determinism sub-check xfail'd — see below) |
+| `repair_flow` | crash from 10 m, repair in place: damage/latch cleared, quad upright, and no stale-echo pose flicker — the one-deep-pipeline bug that made `T` "not work" |
+| `gym_hover` | the Python Gymnasium env spawns a real core, arms + hovers, and passes the env-checker including the step-determinism sub-check (enforced) |
 | `sysid_selfcheck` | physics-only motor replay (`PW_MOTOR_IN`) is bit-reproducible across cores; the fitter recovers a hidden physics parameter from a synthetic reference |
 | `dshot_device` | virtual DSHOT ESC: boot grace clears, arms + hovers on dshot600 (the default protocol now), SPIN_DIRECTION commands through the stock command queue land in `pw_motor_dir` |
 | `turtle_flip` | crashflip end to end: settle inverted, arm with the turtle box, reversed props pivot the quad over its duct edge (emergent contact-solver maneuver), normal re-arm restores directions |
@@ -50,13 +52,17 @@ if the firmware version changes.
 | `reset_determinism` | one core, the identical input tape twice around `PW_CMD_RESET` → byte-identical streams (fails on any stray rand()/clock in the sim path, or anything leaking through the snapshot reset) |
 | `cross_process_determinism` | two fresh cores, identical inputs (one send-jittered) → byte-identical output — the headline claim, gated |
 
-`godot_client`/`flythrough` only run if a `godot` binary is found (see
-`find_program(GODOT_BIN ...)` in `CMakeLists.txt`). `gym_hover` only runs if a
-Python with `numpy`+`gymnasium` is found — prefer `python/propwash_gym/.venv`
-(run `uv sync` there first, then re-run `cmake -B build` so it's detected).
+The six client tests (`godot_client`, `flythrough`, `quality_tiers`,
+`fpv_cull`, `client_collision`, `repair_flow`) only run if a `godot` binary is
+found (see `find_program(GODOT_BIN ...)` in `CMakeLists.txt`). `gym_hover` only
+runs if a Python with `numpy`+`gymnasium` is found — prefer
+`python/propwash_gym/.venv` (run `uv sync` there first, then re-run
+`cmake -B build` so it's detected).
 Tests that bind ports must not overlap — leftover `propwash-core` processes
 cause spurious failures; kill strays before running
-(`pkill -f build/propwash-core`).
+(`pkill -f build/propwash-core`). A physically-connected joystick has RC
+priority and will hijack the headless tests — autotest/demo spawn the core
+with `--no-js`.
 
 ## How the pieces fit
 
@@ -85,9 +91,10 @@ cause spurious failures; kill strays before running
   step, client-side position integration + `ground_manifold`. Carries its own
   MIT copy of the wire codec (`protocol.py`) rather than importing the GPL
   `tools/tester/pw_udp.py`. `reset()` drives arming (gyro-cal warm-up → ARM);
-  defaults `gyro_noise=0`. **Known gap:** the sim is not bit-reproducible across
-  `reset()`s in the closed loop (same reason `determinism_check` is unwired), so
-  Gymnasium's step-determinism check is an xfail.
+  defaults `gyro_noise=0`. Rollouts are bit-reproducible across `reset()`s
+  (the core's snapshot reset makes reset ≡ fresh process), so Gymnasium's
+  step-determinism check is enforced — gated core-side by
+  `reset_determinism`/`cross_process_determinism`.
 - **`tools/sysid/`** — blackbox replay + system ID (stdlib Python). Reuses
   `tools/tester/pw_udp.py` and adds `PW_INIT` + `PW_MOTOR_IN` codecs (`wire.py`).
   Two replay modes: RC (`PW_STATE_IN`, firmware in the loop) and physics-only
@@ -95,14 +102,71 @@ cause spurious failures; kill strays before running
   directly and skips `BF::update`). The fitter (`sysid.hooke_jeeves`) injects
   candidate physics via `PW_INIT` (→ `reinitPhysics` on a live core, no
   respawn) and minimises gyro+accel RMSE. Physics-only replay is bit-exact
-  across cores — the firmware residual state that limits closed-loop determinism
-  is out of the loop, which is why the gym's is xfail'd but this is gated tight.
+  across cores and isolates physics-model error from PID error — a bad fit
+  points at the physics, not the tune.
 
 ## Non-obvious things that will bite you (learned the hard way)
+
+### Timing, lockstep and the scheduler
 
 - **Tick rate must exceed the PID rate.** At exactly 8 kHz, RX/MSP never run
   (scheduler only services them between gyro boundaries) → `rcData` frozen, no
   arming. 20 kHz fixes it.
+- **`--server` must boot BF immediately and idle-tick** — otherwise an idle core
+  (no client) leaves MSP/CLI/Configurator dead. But the idle tick must NOT fire
+  while a client is driving: it advances the same accumulator the client does, so
+  any packet later than the 5 ms recv timeout used to inject simulated time
+  nobody asked for and made runs unreproducible. That is what `PW_CMD_LOCKSTEP`
+  (the default) enforces; `PW_CMD_REALTIME` opts back into free-running.
+- **The client is the clock.** It sends a fixed 250 Hz timestep and consumes
+  exactly one `PW_STATE_OUT` per frame (a one-deep pipeline). Both matter for
+  reproducibility: 1/250 divides exactly into the 50 µs tick quantum, and
+  draining a variable number of replies made the client's lag vary run to run.
+- **First client contact resets the sim.** Before a client attaches the core is
+  idle-ticking, so how much simulated time has already elapsed depends on process
+  startup. Without the reset that showed up as a different battery voltage on
+  frame 0 of every run.
+
+### Firmware statics and determinism
+
+- **`BF::init()` does not clear the firmware's statics** — scheduler task
+  stats, IMU quaternion, PID state, gyro calibration progress, RX latches and
+  OSD timers all survive an in-process re-init (142 residue ranges measured).
+  That is why `Sim::reset` rewinds the process's writable static sections to
+  a snapshot taken right after the first boot (`core/sim/static_snapshot.h`)
+  before calling `init()`. Exclusions (dyad's live connection state, the held
+  dyad mutex, serial_tcp's port state — live `dyad_Stream` pointers and
+  which-ports-listen flags — and the snapshot's own bookkeeping) must be
+  registered BEFORE the snapshot is taken; dyad's globals live in one exported
+  struct (`pw_dyad_state`, patches/dyad-globals-struct.diff) and serial_tcp
+  exports `pw_serial_tcp_*_range` for exactly this.
+  Debugging a determinism regression: the failing check prints the first
+  divergent frame + field; `PROPWASH_DUMP_STATE` + `state_diff.py` bisect
+  any residue to exact symbols.
+- **The damage/contact path must not call `randf()`** — one extra draw shifts
+  the whole noise stream and every trajectory after it. Wind gusts use
+  SimplexNoise (a pure function of sim time + seed) for the same reason.
+
+### Contact and damage
+
+- **Contact response must be forces, not velocity edits.** The virtual
+  accelerometer reads `total_force/mass` — a velocity edit is invisible to it,
+  so the firmware would never feel touchdown or a crash. That is why the core
+  resolves the client's contact manifold inside the tick (`contactForces` in
+  `physics.cpp`) and why `PW_STATE_IN` velocities are ignored as of v2.
+- **Resting contact needs speculative points + depth continuity.** A quad
+  rocking on an asymmetric contact set never settled: separated points
+  re-impacted undamped during the 4 ms client-frame gap, and the client's
+  rectangle-rule position integration re-anchored depths with an O(a·dt²)
+  error every frame. Fix: clients report near-contacts (≤5 mm) at depth 0
+  (one-sided dampers), and the core keeps its evolved depth for persisting
+  contacts unless the client disagrees by >2 mm.
+- **Damage thresholds are approach SPEEDS, never forces** — a parked quad has
+  v_n ≈ 0 no matter how hard it presses, so rest can't accumulate damage and
+  retuning the contact spring never retunes damage.
+
+### Betaflight build & config quirks
+
 - **DSHOT needed a virtual ESC AND a virtual-time fix.** Stock SITL never
   compiles the dshot stack (`common_pre.h` gates `USE_DSHOT` on `!SITL`); the
   ext `target.h` wrapper re-enables it and `pw_sitl.c` provides the virtual
@@ -120,55 +184,17 @@ cause spurious failures; kill strays before running
   segfault. The vendored `cli.c` makes the guard unconditional.
 - **Opening the CLI sets `ARMING_DISABLED_CLI`** until a clean `exit`. Load the
   tune in one instance, fly a fresh one (never touches the CLI).
+- **`accept()` itself fails for aborted backlog connections on Windows**
+  (`WSAECONNRESET`; Linux discards them silently). Stock dyad fell through
+  that failure and fabricated a CONNECTED stream around `INVALID_SOCKET` —
+  the bogus ACCEPT made serial_tcp's newest-client-wins `onAccept` drop the
+  *healthy* CLI/MSP connection whenever a retrying client left a corpse in
+  the backlog (the old Windows-CI reconnect-after-`save` timeout). The
+  vendored dyad.c skips the corpse and keeps draining; the reboot path also
+  ends the old client deterministically (`tcpReconfigure`).
 - **`align_board_roll = 180`** in the real diff (FC mounted inverted) must be
   zeroed for the sim — the virtual gyro is already airframe-aligned, else it
   flies upside-down. That's what `config/sitl-overrides.txt` is for.
-- **`--server` must boot BF immediately and idle-tick** — otherwise an idle core
-  (no client) leaves MSP/CLI/Configurator dead. But the idle tick must NOT fire
-  while a client is driving: it advances the same accumulator the client does, so
-  any packet later than the 5 ms recv timeout used to inject simulated time
-  nobody asked for and made runs unreproducible. That is what `PW_CMD_LOCKSTEP`
-  (the default) enforces; `PW_CMD_REALTIME` opts back into free-running.
-- **The client is the clock.** It sends a fixed 250 Hz timestep and consumes
-  exactly one `PW_STATE_OUT` per frame (a one-deep pipeline). Both matter for
-  reproducibility: 1/250 divides exactly into the 50 µs tick quantum, and
-  draining a variable number of replies made the client's lag vary run to run.
-- **First client contact resets the sim.** Before a client attaches the core is
-  idle-ticking, so how much simulated time has already elapsed depends on process
-  startup. Without the reset that showed up as a different battery voltage on
-  frame 0 of every run.
-- **A physically-connected joystick has RC priority** and will hijack the
-  headless tests — autotest/demo spawn the core with `--no-js`.
-- **Contact response must be forces, not velocity edits.** The virtual
-  accelerometer reads `total_force/mass` — a velocity edit is invisible to it,
-  so the firmware would never feel touchdown or a crash. That is why the core
-  resolves the client's contact manifold inside the tick (`contactForces` in
-  `physics.cpp`) and why `PW_STATE_IN` velocities are ignored as of v2.
-- **Resting contact needs speculative points + depth continuity.** A quad
-  rocking on an asymmetric contact set never settled: separated points
-  re-impacted undamped during the 4 ms client-frame gap, and the client's
-  rectangle-rule position integration re-anchored depths with an O(a·dt²)
-  error every frame. Fix: clients report near-contacts (≤5 mm) at depth 0
-  (one-sided dampers), and the core keeps its evolved depth for persisting
-  contacts unless the client disagrees by >2 mm.
-- **Damage thresholds are approach SPEEDS, never forces** — a parked quad has
-  v_n ≈ 0 no matter how hard it presses, so rest can't accumulate damage and
-  retuning the contact spring never retunes damage.
-- **The damage/contact path must not call `randf()`** — one extra draw shifts
-  the whole noise stream and every trajectory after it. Wind gusts use
-  SimplexNoise (a pure function of sim time + seed) for the same reason.
-- **`BF::init()` does not clear the firmware's statics** — scheduler task
-  stats, IMU quaternion, PID state, gyro calibration progress, RX latches and
-  OSD timers all survive an in-process re-init (142 residue ranges measured).
-  That is why `Sim::reset` rewinds the process's writable static sections to
-  a snapshot taken right after the first boot (`core/sim/static_snapshot.h`)
-  before calling `init()`. Exclusions (dyad's live connection state, the held
-  dyad mutex, the snapshot's own bookkeeping) must be registered BEFORE the
-  snapshot is taken; dyad's globals live in one exported struct
-  (`pw_dyad_state`, patches/dyad-globals-struct.diff) for exactly this.
-  Debugging a determinism regression: the failing check prints the first
-  divergent frame + field; `PROPWASH_DUMP_STATE` + `state_diff.py` bisect
-  any residue to exact symbols.
 - **Betaflight source uses `#pragma GCC poison sprintf snprintf`** unless
   `SIMULATOR_BUILD` is defined; keep that define on the BF lib.
 
@@ -182,6 +208,9 @@ cause spurious failures; kill strays before running
   `[pw][contact] t=… n=… surface=… depth=…` — the tool for "did I actually
   touch that gate" and for verifying a course change keeps the demo clear.
 - MSP identity / live config: `python3 tools/bfcli/pw_cli.py run "version"`.
+- Determinism regression: the failing check prints the first divergent frame +
+  field; `PROPWASH_DUMP_STATE=<path>` (core env) + `tools/tester/state_diff.py`
+  bisect residual static state to exact symbols.
 
 ## Conventions
 
