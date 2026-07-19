@@ -1,4 +1,5 @@
 #include "server.h"
+#include <chrono>
 
 #include <cstdio>
 #include <cstring>
@@ -116,6 +117,19 @@ void Server::sendTo(const void* payload, uint16_t len, uint8_t type)
     sendto(mFd, (const char*)buf, sizeof(hdr) + len, 0, (sockaddr*)&dst, sizeof(dst));
 }
 
+/* Wall-clock milliseconds. Used ONLY to decide whether a client is still
+ * driving the sim — never to advance simulated time. */
+static uint64_t nowMillis()
+{
+    return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+/* A client is considered gone after this long without a PW_STATE_IN, at which
+ * point idle-ticking resumes so the Configurator stays alive. Generous: a
+ * stalled client must not silently hand time back to the idle tick. */
+static constexpr uint64_t CLIENT_IDLE_MS = 250;
+
 static void applyInit(const PwInit& p, StateInit& s)
 {
     for (int i = 0; i < 4; i++) {
@@ -142,6 +156,7 @@ static void applyInit(const PwInit& p, StateInit& s)
     s.maxPropWashSpeed      = p.max_propwash_speed;
     s.propWashAngleOfAttack = p.propwash_angle_of_attack;
     s.propWashFactor        = p.propwash_factor;
+    s.seed                  = p.seed;   /* was declared on the wire but ignored */
 }
 
 void Server::run(SimITL::Sim& sim, const StateInit& defaultInit, Joystick* js)
@@ -152,6 +167,10 @@ void Server::run(SimITL::Sim& sim, const StateInit& defaultInit, Joystick* js)
 
     bool booted = false;
     bool rcOverrideActive = false;
+    // Lockstep is the protocol's documented default (PW_CMD_LOCKSTEP): the core
+    // advances only on PW_STATE_IN. PW_CMD_REALTIME switches to free-running.
+    bool lockstep = true;
+    uint64_t lastStateInMs = 0;
     float rcOverride[8] = {0, 0, -1, 0, -1, -1, -1, -1};
     uint64_t stateInCount = 0;
 
@@ -176,12 +195,29 @@ void Server::run(SimITL::Sim& sim, const StateInit& defaultInit, Joystick* js)
         ssize_t n = recvfrom(mFd, (char*)buf, sizeof(buf), 0, (sockaddr*)&src, &srcLen);
 
         if (n < 0) {
-            // recv timeout: no client packet. Keep the firmware's scheduler
-            // (hence MSP/CLI/Configurator) alive with a small idle tick using
-            // the last-known input. Only fires when no client is driving —
-            // when one is, packets arrive faster than the timeout.
-            input.delta = 0.005f;
-            sim.update(input);
+            // Recv timeout. Idle-tick to keep the firmware's scheduler (hence
+            // MSP/CLI/Configurator) alive while nothing is driving the sim —
+            // without this an idle core leaves the Configurator dead.
+            //
+            // But ONLY while nothing is driving. This used to fire
+            // unconditionally, on the assumption that "when a client is
+            // driving, packets arrive faster than the timeout". That is an
+            // assumption, not an enforcement: any packet later than 5 ms — GC,
+            // scheduler jitter, or the whole client boot window — injected 5 ms
+            // of simulated time nobody asked for, into the same accumulator the
+            // client drives. Two identical input sequences therefore diverged,
+            // which broke the project's central determinism claim.
+            //
+            // In lockstep mode (the protocol's documented default) a live
+            // client is the sole source of time. PW_CMD_REALTIME opts back into
+            // free-running for anyone who wants it.
+            const bool clientDriving =
+                lockstep && stateInCount > 0 &&
+                (nowMillis() - lastStateInMs) < CLIENT_IDLE_MS;
+            if (!clientDriving) {
+                input.delta = 0.005f;
+                sim.update(input);
+            }
             continue;
         }
         if (n < (ssize_t)sizeof(PwHeader)) continue;
@@ -223,6 +259,28 @@ void Server::run(SimITL::Sim& sim, const StateInit& defaultInit, Joystick* js)
             if (hdr.payload_len < sizeof(PwStateIn)) break;
             PwStateIn p;
             memcpy(&p, payload, sizeof(p));
+
+            // Wall clock is read here for one purpose only: deciding whether a
+            // client is still driving, so the idle tick knows to stay out of
+            // the way. It never influences how far the sim advances.
+            lastStateInMs = nowMillis();
+
+            // This was never incremented. Everything keyed off it was
+            // therefore stuck at zero: the "throttled to ~15 Hz" OSD send
+            // below fired on every single frame (0 % 8 == 0), as did the RC
+            // heartbeat log.
+            stateInCount++;
+
+            if (stateInCount == 1) {
+                // First contact. Until now the core has been idle-ticking to
+                // keep MSP/CLI alive, and how much simulated time that covered
+                // depends on when the client happened to start — which showed
+                // up as a different battery state on frame 0 of every run.
+                // Discard it so a client session always begins from the same
+                // physics state. Firmware is deliberately NOT re-inited here:
+                // a Configurator may already be attached and mid-session.
+                sim.resetPhysicsOnly(initState);
+            }
 
             boot();
 
@@ -316,10 +374,26 @@ void Server::run(SimITL::Sim& sim, const StateInit& defaultInit, Joystick* js)
             if (hdr.payload_len < sizeof(PwCommand)) break;
             PwCommand p;
             memcpy(&p, payload, sizeof(p));
-            if (p.command == PW_CMD_RESET) {
+            switch (p.command) {
+            case PW_CMD_RESET:
                 printf("[pw][net] RESET\n");
-                sim.reinitPhysics(initState);
+                sim.reset(initState);
                 rcOverrideActive = false;
+                break;
+            case PW_CMD_LOCKSTEP:
+                // The protocol's documented default: time advances only on
+                // PW_STATE_IN, which is what makes runs reproducible.
+                lockstep = true;
+                printf("[pw][net] LOCKSTEP\n");
+                break;
+            case PW_CMD_REALTIME:
+                // Free-running: the core self-ticks on the recv timeout even
+                // while a client is connected. Reproducibility is forfeit.
+                lockstep = false;
+                printf("[pw][net] REALTIME (sim is no longer reproducible)\n");
+                break;
+            default:
+                break;
             }
             break;
         }

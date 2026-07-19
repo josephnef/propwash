@@ -48,14 +48,14 @@ int main(int argc, char** argv)
 
     StateInput in {};
     inputDefaults(in);
-    in.gyroBaseNoiseAmp = 0.0002f; // keep noise, but deterministic via SimplexNoise
+    in.gyroBaseNoiseAmp = 0.0002f; // noise on, but from the sim-owned seeded RNG
 
     Sim& sim = Sim::getInstance();
     sim.init(init);
     BF::configureDefaultModes();
     BF::disableRunawayTakeoff();
 
-    const float dt = 1.0f / 250.0f; // 250 Hz client frame, 32 firmware ticks each
+    const float dt = 1.0f / 250.0f; // 250 Hz client frame = 80 firmware ticks each
     in.delta = dt;
 
     vec3 position {0, 0, 0};

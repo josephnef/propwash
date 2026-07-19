@@ -98,12 +98,22 @@ var _shot_times := [3.0, 8.0, 12.0, 16.0]
 #   PROPWASH_SCREEN=2     force a screen index (0-based)
 const SCREEN_ENV := "PROPWASH_SCREEN"
 
-# Lockstep rate is raised to match the monitor, never blindly — see
-# _match_tick_rate. A 60 Hz setup must not pay for frames it cannot show.
-#   PROPWASH_TICK=<hz>    pin the rate (0 keeps the project default)
-const TICK_ENV := "PROPWASH_TICK"
-const TICK_MIN := 100   # the long-tested baseline; never go below it
-const TICK_MAX := 240   # don't melt a CPU on an exotic 360/500 Hz panel
+# Lockstep rate. FIXED, and deliberately not tied to the monitor.
+#
+# The client is the sole source of simulated time, so the rate it sends at is an
+# input to the simulation. Varying it — per monitor, or mid-flight from a
+# framerate watchdog — made runs unreproducible: three identical demo runs ended
+# 20 cm apart. A constant rate is what makes "identical inputs, identical
+# trajectory" true for the client path, not just the headless one.
+#
+# 250 Hz because 1/250 = 4000 us divides exactly into the core's 50 us tick
+# quantum: 80 ticks per packet, no sub-tick residue carried between frames.
+# 240 Hz would leave 16 us over and vary the tick count frame to frame.
+#
+# Display smoothness is handled by physics interpolation, not by matching the
+# panel — so a high-refresh monitor loses nothing here.
+const PW_SIM_HZ := 250
+const PW_SIM_DT := 1.0 / float(PW_SIM_HZ)
 
 # Quality tiers. Auto-selected from the monitor's frame budget so a high-refresh
 # setup keeps its framerate and a 60 Hz one gets the pretty version.
@@ -119,15 +129,6 @@ var _q := {}
 # fallback_to_opengl3 has quietly dropped us onto the Compatibility renderer.
 var _has_rd := true
 
-# Lockstep watchdog. Heavy art threatening framerate is not just a smoothness
-# problem here: _physics_process blocks waiting on the core, and Godot will run
-# up to max_physics_steps_per_frame of those per rendered frame, so a GPU-bound
-# scene can starve the lockstep and change flight behaviour. If render rate
-# falls far below the tick rate for a sustained period, give the tick rate back.
-const WATCHDOG_RATIO := 0.6
-const WATCHDOG_GRACE := 3.0    # seconds below threshold before acting
-var _wd_low_for := 0.0
-var _wd_fps := 60.0
 
 # DJI O3 goggle-feed treatment (shaders/goggle.gdshader). Set PROPWASH_GOGGLE=off
 # to see the raw render. Effects that are basically free run at every tier — the
@@ -184,6 +185,10 @@ func _ready() -> void:
 		# capture through the whole gate run
 		_shot_times = [4.0, 7.0, 9.0, 11.0, 13.0, 15.0, 17.0, 19.0]
 	_parse_js_env()
+	# before _setup_display: that returns early under headless/autotest, and the
+	# sim rate has to be identical on every path or the tests do not exercise
+	# what the client actually does
+	_pin_sim_rate()
 	_setup_display()
 	_resolve_quality()   # before _build_world: tree count is baked at build time
 	_build_world()
@@ -280,24 +285,6 @@ func _apply_quality_to_env(e: Environment, sun: DirectionalLight3D) -> void:
 		e.volumetric_fog_temporal_reprojection_enabled = false
 
 
-# Give the tick rate back if the GPU can't keep up -- see WATCHDOG_RATIO.
-func _watchdog(delta: float) -> void:
-	if _autotest or DisplayServer.get_name() == "headless":
-		return
-	_wd_fps = lerpf(_wd_fps, 1.0 / maxf(delta, 0.0001), 0.05)
-	var tick := Engine.physics_ticks_per_second
-	if tick <= TICK_MIN or _wd_fps >= float(tick) * WATCHDOG_RATIO:
-		_wd_low_for = 0.0
-		return
-	_wd_low_for += delta
-	if _wd_low_for < WATCHDOG_GRACE:
-		return
-	_wd_low_for = 0.0
-	var next: int = maxi(TICK_MIN, int(tick * 0.75))
-	Engine.physics_ticks_per_second = next
-	print("[pw][gfx] %.0f fps under a %d Hz lockstep — dropping to %d Hz to keep"
-			% [_wd_fps, tick, next] + " the sim in step")
-
 
 func _setup_display() -> void:
 	# --headless has no real DisplayServer, and the autotests assert on stdout,
@@ -318,7 +305,6 @@ func _setup_display() -> void:
 				DisplayServer.screen_get_size(screen)])
 	# whichever screen we ended up on, windowed or not
 	_active_screen = screen if screen >= 0 else win.current_screen
-	_match_tick_rate(_active_screen)
 
 
 # Screen to go fullscreen on, or -1 to stay windowed where we are.
@@ -343,27 +329,11 @@ func _target_screen() -> int:
 	return -1
 
 
-# Lockstep rate follows the monitor. The client sends one PW_STATE_IN per
-# physics frame, so this is also the pose update rate — below the refresh it
-# shows as a staircase. It costs CPU (and core work) per tick, so only spend
-# that when the panel can actually display it: a 60 Hz screen stays at the
-# 100 Hz baseline it has always run, a 240 Hz one goes to 240.
-func _match_tick_rate(screen: int) -> void:
-	var pin := OS.get_environment(TICK_ENV)
-	if pin.is_valid_int():
-		var forced := int(pin)
-		if forced > 0:
-			Engine.physics_ticks_per_second = forced
-			print("[pw][display] lockstep pinned to %d Hz" % forced)
-		return   # 0/invalid: leave the project default alone
-	var refresh := DisplayServer.screen_get_refresh_rate(screen)
-	if refresh <= 0.0:
-		return   # some drivers report -1; keep the default rather than guess
-	var hz := clampi(int(round(refresh)), TICK_MIN, TICK_MAX)
-	if hz == Engine.physics_ticks_per_second:
-		return
-	Engine.physics_ticks_per_second = hz
-	print("[pw][display] %.0f Hz screen -> %d Hz lockstep" % [refresh, hz])
+# The lockstep rate is fixed (see PW_SIM_HZ) and is NOT derived from the
+# display. Godot's physics rate is pinned to it so one _physics_process call
+# maps to exactly one simulation step of PW_SIM_DT.
+func _pin_sim_rate() -> void:
+	Engine.physics_ticks_per_second = PW_SIM_HZ
 
 
 func _spawn_core() -> void:
@@ -386,7 +356,6 @@ func _spawn_core() -> void:
 
 
 func _process(delta: float) -> void:
-	_watchdog(delta)
 	_update_goggle(delta)
 
 
@@ -407,7 +376,7 @@ func _physics_process(delta: float) -> void:
 	var sim_lv := Vector3(_linvel.x, _linvel.y, -_linvel.z)
 	var contact := _pos.y <= REST_H + 0.01
 
-	var pkt := PwProtocol.pack_state_in(_frame_id, delta, _rc,
+	var pkt := PwProtocol.pack_state_in(_frame_id, PW_SIM_DT, _rc,
 			sim_pos, sim_rot, sim_av, sim_lv, 16.8, contact)
 	_udp.put_packet(pkt)
 

@@ -40,6 +40,15 @@ add_test(NAME udp_e2e
   COMMAND bash ${CMAKE_SOURCE_DIR}/tools/tester/run_e2e.sh $<TARGET_FILE:propwash-core>)
 set_tests_properties(udp_e2e PROPERTIES TIMEOUT 120)
 
+# Client-driven determinism: two fresh cores, identical input sequences, one of
+# them with sends deliberately delayed past the core's 5 ms recv timeout. The
+# project's central claim ("identical inputs => identical trajectories") had
+# never been tested through the UDP protocol at all.
+add_test(NAME determinism_udp
+  COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/tester/determinism_check.py
+    $<TARGET_FILE:propwash-core>)
+set_tests_properties(determinism_udp PROPERTIES TIMEOUT 180)
+
 # CLI/Configurator data path: apply the pilot's diff over TCP 5761, save,
 # reboot in-process, verify the tune survives (the M3 core deliverable).
 add_test(NAME diff_roundtrip

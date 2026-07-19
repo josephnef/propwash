@@ -80,6 +80,11 @@ struct StateInit{
 
   float ambientTemp = 0.0f;
 
+  /* Noise RNG seed. 0 means "use the built-in default", so existing callers
+   * that leave it zero still get a fixed, reproducible stream. Carried on the
+   * wire as PwInit.seed, which was declared for exactly this and never read. */
+  uint32_t seed = 0;
+
   GpsData gps {};
 
   //eeprom file name

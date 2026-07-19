@@ -25,6 +25,16 @@ namespace SimITL{
       /** Re-initialise the physics only (crash reset). */
       void reinitPhysics(const StateInit& stateInit);
 
+      /* Full reset: firmware re-init, physics, noise RNG and the sub-tick
+       * accumulator. PW_CMD_RESET used to restore only a fraction of this, so
+       * a reset run did not match a freshly started one. */
+      void reset(const StateInit& stateInit);
+
+      /* Physics, noise RNG and sub-tick accumulator only — no firmware touch.
+       * Used at first client contact, where re-initing the firmware could
+       * disturb an already-attached Configurator session. */
+      void resetPhysicsOnly(const StateInit& stateInit);
+
       /**
        * Advance the simulation by stateInput.delta seconds, in fixed
        * DELTA-sized firmware/physics ticks (accumulator).
