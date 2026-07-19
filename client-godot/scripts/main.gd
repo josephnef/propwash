@@ -1,7 +1,12 @@
 # propwash Godot client (MIT): first flyable.
 #
 # Spawns propwash-core, drives it in lockstep (one PW_STATE_IN per physics
-# frame), applies the returned pose to the drone, owns ground collision.
+# frame), applies the returned pose to the drone, and owns collision
+# DETECTION: a 5-sphere hull is tested against the world each frame (analytic
+# ground plane + engine shape queries for gates/trees) and the resulting
+# contact manifold is sent to the core, which resolves it as forces inside
+# the physics tick. The client never resolves collision response itself —
+# velocities are core-authoritative as of protocol v2.
 #
 # The sim frame is y-up with +z forward and Unity-style handedness (SimITL
 # physics lineage); Godot is y-up right-handed with -z forward. Conversion:
@@ -23,8 +28,27 @@ extends Node3D
 # headless run (no .godot import cache yet)
 const PwProtocol = preload("res://scripts/protocol.gd")
 
+# Default core port. PROPWASH_PORT overrides it — the ctest harnesses each
+# use their own port so tests never collide with (or hijack) a live flying
+# session on 9100, whose handset would win RC priority and "fly" the test.
 const CORE_PORT := 9100
-const REST_H := 0.12   # drone body height when resting on the ground (gear)
+var _core_port := CORE_PORT
+
+# Collision hull: belly (battery stack) + 4 duct spheres, mirroring the
+# PW_HULL_* constants in protocol/propwash_protocol.h — every sender derives
+# its manifolds from the same five spheres. Godot frame (x symmetric, z
+# symmetric, so the coordinates match the sim-frame values).
+const HULL_SPHERES := [
+	[Vector3(0.0, 0.030, 0.0), 0.045],       # belly
+	[Vector3( 0.054, 0.010, -0.054), 0.030], # FR duct
+	[Vector3(-0.054, 0.010, -0.054), 0.030], # FL duct
+	[Vector3( 0.054, 0.010,  0.054), 0.030], # RR duct
+	[Vector3(-0.054, 0.010,  0.054), 0.030], # RL duct
+]
+const HULL_REST_H := 0.020    # body-origin height resting on flat ground
+const CONTACT_SLOP := 0.004   # depenetration residual left for the core spring
+const CONTACT_MARGIN := 0.005 # speculative band: report near-contacts at depth 0
+const MAX_CONTACTS := 6
 
 var _udp := PacketPeerUDP.new()
 var _core_pid := -1
@@ -33,12 +57,36 @@ var _frame_id := 0
 var _drone: Node3D
 var _hud: Label
 var _osd: Label       # 16x30 Betaflight OSD overlay, monospace, centered
+var _crash_banner: Label   # big center-screen CRASHED — not a squint-sized HUD row
+var _crash_hint: Label
+var _toast: Label          # transient on-screen action feedback (T/R keys)
+var _toast_until := 0.0
 
-# client-owned pose state (fed back to the core each frame)
-var _pos := Vector3(0, REST_H, 0)   # start resting on the pad, not clipping ground
-var _rot := Quaternion.IDENTITY   # sim frame
-var _angvel := Vector3.ZERO       # sim frame
-var _linvel := Vector3.ZERO       # sim frame
+# Betaflight 4.5.2 arming-disable bit for its native crash detection
+# (ARMING_DISABLED_CRASH_DETECTED) — lights when the dump has
+# `set crash_recovery = DISARM` and the firmware itself killed the motors.
+const ARMING_CRASH_DETECTED := 1 << 6
+
+# client-owned pose state (fed back to the core each frame), Godot frame
+var _pos := Vector3(0, HULL_REST_H, 0)   # start resting on the pad
+var _rot := Quaternion.IDENTITY
+var _angvel := Vector3.ZERO
+var _linvel := Vector3.ZERO
+var _prev_pos := Vector3(0, HULL_REST_H, 0)  # for the anti-tunnel sweep
+
+# contact manifold detected this frame, already converted to the sim frame
+# (sent with the next PW_STATE_IN)
+var _pending_contacts: Array = []
+# A client-side pose override (R reset / T repair) is answered one frame
+# late: the reply consumed right after the override was produced from the
+# packet sent BEFORE it. Applying that stale pose forks the trajectory into
+# two alternating lineages (the one-deep pipeline echoes both forever), so
+# the override sets this and exactly one reply's pose is skipped.
+var _skip_stale_pose := 0
+var _sphere_cache := {}       # radius -> SphereShape3D, reused across frames
+var _strict := false          # PROPWASH_STRICT=1: no T-repair, crashes are final
+var _contact_log := false     # PROPWASH_CONTACT_LOG=1: print contact events
+var _was_touching := false
 
 # keyboard rc state
 var _rc := [0.0, 0.0, -1.0, 0.0, -1.0, 1.0, -1.0, -1.0]
@@ -87,6 +135,12 @@ const ACRO_PITCH_SIGN := 1.0  # loop stability (regulation was stable at +1)
 const ACRO_ROLL_SIGN := 1.0
 const GATE_ALT := 1.0         # gate centre height
 var _des_pitch := 0.0         # ramped setpoint (rad)
+# gate-plane clearance tracking: with solid gates, "passed the gate" must
+# also mean "did not clip it" — recorded while crossing each gate plane
+var _gate_max_absx := 0.0
+var _gate_min_y := 1e9
+var _gate_max_y := -1e9
+var _max_dmg := 0.0           # worst prop damage seen during the run
 
 # screenshot capture (PROPWASH_SHOTS=/dir): save frames at set times
 var _shot_dir := ""
@@ -184,6 +238,11 @@ func _ready() -> void:
 	_autotest = OS.get_environment("PROPWASH_AUTOTEST") == "1"
 	_demo = OS.get_environment("PROPWASH_DEMO")
 	_shot_dir = OS.get_environment("PROPWASH_SHOTS")
+	_strict = OS.get_environment("PROPWASH_STRICT") == "1"
+	_contact_log = OS.get_environment("PROPWASH_CONTACT_LOG") == "1"
+	var port_env := OS.get_environment("PROPWASH_PORT")
+	if port_env.is_valid_int():
+		_core_port = int(port_env)
 	if _demo == "acro":
 		# capture through the whole gate run
 		_shot_times = [4.0, 7.0, 9.0, 11.0, 13.0, 15.0, 17.0, 19.0]
@@ -196,7 +255,7 @@ func _ready() -> void:
 	_resolve_quality()   # before _build_world: tree count is baked at build time
 	_build_world()
 	_spawn_core()
-	_udp.connect_to_host("127.0.0.1", CORE_PORT)
+	_udp.connect_to_host("127.0.0.1", _core_port)
 
 
 func _exit_tree() -> void:
@@ -346,13 +405,23 @@ func _spawn_core() -> void:
 	if not FileAccess.file_exists(path):
 		push_warning("propwash-core not found at %s — start it manually" % path)
 		return
-	var args := ["--port", str(CORE_PORT)]
+	var args := ["--port", str(_core_port)]
 	var eeprom := OS.get_environment("PROPWASH_EEPROM")
 	if not eeprom.is_empty():
 		args += ["--eeprom", eeprom]
+	# wind, forwarded to the core (which owns all aerodynamics):
+	#   PROPWASH_WIND="x,y,z"  steady m/s, sim frame (+z = toward the gates)
+	#   PROPWASH_GUST="1.5"    gust amplitude m/s on top
+	var wind := OS.get_environment("PROPWASH_WIND")
+	if not wind.is_empty():
+		args += ["--wind", wind]
+	var gust := OS.get_environment("PROPWASH_GUST")
+	if not gust.is_empty():
+		args += ["--gust", gust]
 	# autotest / demo drive RC from the script — a physically-connected Pocket
-	# would otherwise override it (joystick has priority) and hijack the run
-	if _autotest or _demo == "acro":
+	# would otherwise override it (joystick has priority) and hijack the run.
+	# PROPWASH_NO_JS=1 forces the same for scripted harnesses (tests).
+	if _autotest or _demo == "acro" or OS.get_environment("PROPWASH_NO_JS") == "1":
 		args += ["--no-js"]
 	_core_pid = OS.create_process(path, args)
 	print("propwash-core pid ", _core_pid)
@@ -360,6 +429,27 @@ func _spawn_core() -> void:
 
 func _process(delta: float) -> void:
 	_update_goggle(delta)
+	_update_toast()
+
+
+func _toast_msg(text: String) -> void:
+	print("[pw][ui] ", text)
+	if _toast == null:
+		return
+	_toast.text = text
+	_toast.visible = true
+	_toast.modulate.a = 1.0
+	_toast_until = _boot_elapsed + 2.5
+
+
+func _update_toast() -> void:
+	if _toast == null or not _toast.visible:
+		return
+	var left := _toast_until - _boot_elapsed
+	if left <= 0.0:
+		_toast.visible = false
+	elif left < 0.5:
+		_toast.modulate.a = left / 0.5   # quick fade instead of a hard pop
 
 
 func _physics_process(delta: float) -> void:
@@ -377,10 +467,19 @@ func _physics_process(delta: float) -> void:
 	# angular velocity is a pseudovector: mirror(z) maps it to (-x, -y, +z)
 	var sim_av := Vector3(-_angvel.x, -_angvel.y, _angvel.z)
 	var sim_lv := Vector3(_linvel.x, _linvel.y, -_linvel.z)
-	var contact := _pos.y <= REST_H + 0.01
+	var contact := _pending_contacts.size() > 0
+
+	# per-motor ground effect from motor height over the flat field: thrust
+	# gains up to +27% below ~half a prop diameter (core applies 1 + 0.7*ge^2)
+	var ge := [0.0, 0.0, 0.0, 0.0]
+	var xf := Transform3D(Basis(_rot), _pos)
+	for g in range(4):
+		var h: float = (xf * MOTOR_OFFSETS[g]).y
+		ge[RPM_FOR_PROP[g]] = clampf(1.0 - h / GE_FADE_H, 0.0, 1.0)
 
 	var pkt := PwProtocol.pack_state_in(_frame_id, PW_SIM_DT, _rc,
-			sim_pos, sim_rot, sim_av, sim_lv, 16.8, contact)
+			sim_pos, sim_rot, sim_av, sim_lv, 16.8, contact,
+			_pending_contacts, ge)
 	_udp.put_packet(pkt)
 
 	# --- consume exactly one STATE_OUT per frame
@@ -421,7 +520,7 @@ func _physics_process(delta: float) -> void:
 		# don't cry wolf during the core's ~1-2 s boot (joystick enumerate +
 		# Betaflight init + UDP bind)
 		if not _await_warned and (_got_first_reply or _boot_elapsed > 4.0):
-			push_warning("no reply from propwash-core (is it running on udp:%d?)" % CORE_PORT)
+			push_warning("no reply from propwash-core (is it running on udp:%d?)" % _core_port)
 			_await_warned = true
 		return
 	if spun and _got_first_reply:
@@ -433,37 +532,138 @@ func _physics_process(delta: float) -> void:
 	_frame_id += 1
 
 	# --- back to Godot frame
-	var q: Quaternion = out.rotation
-	_rot = Quaternion(-q.x, -q.y, q.z, q.w).normalized()
+	if _skip_stale_pose > 0:
+		# pose override in flight: consume the reply (keeps the pipeline in
+		# step) but hold our overridden pose; velocities are core-owned and
+		# continuous, so they apply as usual
+		_skip_stale_pose -= 1
+	else:
+		var q: Quaternion = out.rotation
+		_rot = Quaternion(-q.x, -q.y, q.z, q.w).normalized()
 	var lv: Vector3 = out.linvel
 	_linvel = Vector3(lv.x, lv.y, -lv.z)
 	var av: Vector3 = out.angvel
 	_angvel = Vector3(-av.x, -av.y, av.z)
 
-	var armed: bool = out.get("armed", false)
+	_prev_pos = _pos
 	_pos += _linvel * delta
 
-	# --- ground plane (client owns collision), body rests at REST_H
-	if _pos.y <= REST_H:
-		_pos.y = REST_H
-		if armed:
-			if _linvel.y < 0.0:
-				_linvel.y = 0.0
-			_angvel = Vector3.ZERO
-		else:
-			# disarmed on the pad: sit still and settle level, don't drift
-			# with physics noise (a real quad just sits there). The settle
-				# below is frame-rate independent: 0.2 per tick at the original
-				# 100 Hz, same wall-clock rate at 240.
-			_linvel = Vector3.ZERO
-			_angvel = Vector3.ZERO
-			_rot = _rot.slerp(Quaternion.IDENTITY, 1.0 - pow(0.8, delta * 100.0))
+	# --- collision detection (the core resolves the response as forces):
+	# analytic ground plane + engine shape queries against gates/trees,
+	# depenetration with a slop residual, manifold queued for the next send.
+	# No velocity zeroing, no forced leveling — physics owns rest behavior,
+	# which is exactly what lets the quad tumble and lie inverted.
+	_detect_contacts()
+
+	# sanity floor: never expected to fire; a detection bug must be loud
+	# rather than an infinite fall
+	if _pos.y < -2.0:
+		push_warning("fell through the world at %s — detection bug?" % str(_pos))
+		_pos.y = HULL_REST_H + 0.03
 
 	_drone.transform = Transform3D(Basis(_rot), _pos)
 	_spin_props(delta)
 	_update_hud()
 	if _autotest:
 		_autotest_check(delta)
+
+
+# ------------------------------------------------------------- collision
+# Detect hull/world contacts, depenetrate the client-owned position with a
+# slop residual (the core's spring keeps holding the rest), and queue the
+# manifold in sim-frame form for the next send. Spheres within CONTACT_MARGIN
+# of a surface are reported at depth 0: the core arms them as one-sided
+# dampers, so a corner about to re-impact between frames is damped instead of
+# pumping a standing wobble (see Physics::advanceContactDepths).
+func _detect_contacts() -> void:
+	_pending_contacts = []
+	var basis := Basis(_rot)
+	var space: PhysicsDirectSpaceState3D = null
+	if _drone.get_world_3d() != null:
+		space = _drone.get_world_3d().direct_space_state
+
+	# anti-tunnel: at 30 m/s the quad moves 12 cm per frame — a thin gate tube
+	# fits between two poses. Sweep the belly sphere along the frame's motion
+	# and clip to the first obstacle hit. (The ground can't tunnel: its
+	# analytic depth below only grows with penetration.)
+	var motion := _pos - _prev_pos
+	if space != null and motion.length() > 0.05:
+		var sweep := PhysicsShapeQueryParameters3D.new()
+		sweep.shape = _sphere(HULL_SPHERES[0][1])
+		sweep.transform = Transform3D(Basis.IDENTITY,
+				_prev_pos + basis * HULL_SPHERES[0][0])
+		sweep.motion = motion
+		var frac := space.cast_motion(sweep)
+		if frac[0] < 1.0:
+			_pos = _prev_pos + motion * frac[0]
+
+	# candidate contacts: exact ground plane + engine queries for obstacles
+	var found: Array = []
+	for s in HULL_SPHERES:
+		var center: Vector3 = _pos + basis * s[0]
+		var r: float = s[1]
+		var gd: float = r - center.y
+		if gd > -CONTACT_MARGIN:
+			found.append({world_point = Vector3(center.x, center.y - r, center.z),
+					normal = Vector3.UP, depth = gd,
+					surface = PwProtocol.SURF_GROUND})
+		if space == null:
+			continue
+		var q := PhysicsShapeQueryParameters3D.new()
+		q.shape = _sphere(r + CONTACT_MARGIN)
+		q.transform = Transform3D(Basis.IDENTITY, center)
+		var rest := space.get_rest_info(q)
+		if rest.is_empty():
+			continue
+		var n: Vector3 = rest.normal
+		var depth: float = (r + CONTACT_MARGIN) - (center - rest.point).dot(n) \
+				- CONTACT_MARGIN
+		var surface: int = PwProtocol.SURF_OBJECT
+		var collider := instance_from_id(rest.collider_id)
+		if collider != null and collider.has_meta("pw_surface"):
+			surface = collider.get_meta("pw_surface")
+		found.append({world_point = rest.point, normal = n,
+				depth = depth, surface = surface})
+
+	# depenetrate deepest-first; later contacts see the shift already taken
+	found.sort_custom(func(a, b): return a.depth > b.depth)
+	var shift := Vector3.ZERO
+	for c in found:
+		var d: float = c.depth - shift.dot(c.normal)
+		if d > CONTACT_SLOP:
+			shift += c.normal * (d - CONTACT_SLOP)
+	_pos += shift
+
+	# queue in the sim frame (mirror z; normals are true vectors: negate z)
+	for c in found:
+		if _pending_contacts.size() >= MAX_CONTACTS:
+			break
+		var d: float = c.depth - shift.dot(c.normal)
+		var p_body: Vector3 = basis.inverse() * (c.world_point - _pos)
+		_pending_contacts.append({
+			point_body = Vector3(p_body.x, p_body.y, -p_body.z),
+			normal_world = Vector3(c.normal.x, c.normal.y, -c.normal.z),
+			depth = maxf(d, 0.0),
+			surface = c.surface,
+		})
+
+	if _contact_log:
+		var touching := _pending_contacts.size() > 0
+		if touching and not _was_touching:
+			var deepest: Dictionary = _pending_contacts[0]
+			print("[pw][contact] t=%.2f n=%d surface=%d depth=%.4f pos=%s" % [
+					_boot_elapsed, _pending_contacts.size(), deepest.surface,
+					deepest.depth, str(_pos)])
+		_was_touching = touching
+
+
+func _sphere(r: float) -> SphereShape3D:
+	var key := snappedf(r, 0.0001)
+	if not _sphere_cache.has(key):
+		var s := SphereShape3D.new()
+		s.radius = r
+		_sphere_cache[key] = s
+	return _sphere_cache[key]
 
 
 # Manual flight: prefer a live RC handset, fall back to the keyboard. Checked
@@ -552,15 +752,48 @@ func _unhandled_key_input(event: InputEvent) -> void:
 				_angle_sw = not _angle_sw
 			KEY_R:
 				_udp.put_packet(PwProtocol.pack_command(PwProtocol.PW_CMD_RESET))
-				_pos = Vector3(0, 0, 0)
+				_pos = Vector3(0, HULL_REST_H, 0)
+				_prev_pos = _pos
 				_rot = Quaternion.IDENTITY
 				_linvel = Vector3.ZERO
 				_angvel = Vector3.ZERO
 				_throttle = -1.0
 				_armed_sw = false
+				_skip_stale_pose = 1
 				# a teleport, not motion — without this the interpolator
 				# smears the drone from where it was back to the pad
 				_drone.reset_physics_interpolation()
+				_toast_msg("reset to pad")
+			KEY_T:
+				_repair_in_place()
+
+
+# T: repair + flip upright where it lies — like walking over and fixing the
+# quad by hand, so you don't lose the spot. Disarmed only (you don't grab
+# spinning props), and disabled entirely in strict mode (PROPWASH_STRICT=1:
+# a crash ends the flight; only R resets). Pose is client-owned, so leveling
+# roll/pitch while keeping yaw is a legal pose correction; the core clears
+# damage via PW_CMD_REPAIR.
+func _repair_in_place() -> void:
+	if _strict:
+		_toast_msg("repair disabled (strict mode) — R to reset")
+		return
+	if not _last_out.is_empty() and _last_out.armed:
+		# you don't grab spinning props — the banner says so too
+		_toast_msg("disarm first (E / ARM switch), then T to repair")
+		return
+	_udp.put_packet(PwProtocol.pack_command(PwProtocol.PW_CMD_REPAIR))
+	var fwd: Vector3 = Basis(_rot) * Vector3(0, 0, -1)
+	fwd.y = 0.0
+	if fwd.length() < 0.05:
+		_rot = Quaternion.IDENTITY
+	else:
+		_rot = Basis.looking_at(fwd.normalized(), Vector3.UP).get_rotation_quaternion()
+	_pos.y = maxf(_pos.y, HULL_REST_H + 0.05)   # small pop clear of the ground
+	_prev_pos = _pos
+	_skip_stale_pose = 1
+	_drone.reset_physics_interpolation()
+	_toast_msg("repaired — props replaced")
 
 
 func _update_osd(lines: PackedStringArray) -> void:
@@ -584,11 +817,51 @@ func _update_hud() -> void:
 			Input.get_joy_name(_js_dev),
 			_rc[0], _rc[1], _rc[2], _rc[3], _rc[4], _rc[5], _rc[6], _rc[7]]
 	else:
-		rc_line = "E arm | Q angle | R reset | WASD+arrows fly (keyboard)"
-	_hud.text = "%s   alt %5.1f m   vbat %4.1f V   thr %4.1f\nrpm %5.0f %5.0f %5.0f %5.0f   dis 0x%x\n%s" % [
+		rc_line = "E arm | Q angle | R reset | %sWASD+arrows fly (keyboard)" % \
+				("" if _strict else "T repair | ")
+	var dmg: Array = o.get("prop_damage", [0.0, 0.0, 0.0, 0.0])
+	var flags: int = o.get("crash_flags", 0)
+	var dmg_line := "dmg %3.0f%% %3.0f%% %3.0f%% %3.0f%%" % [
+			dmg[0] * 100.0, dmg[1] * 100.0, dmg[2] * 100.0, dmg[3] * 100.0]
+	if flags & 1:
+		dmg_line += "   CRASHED — %s" % ("R to reset" if _strict else "T to repair")
+	if flags & 2:
+		dmg_line += "   CRASH-REC"
+	_update_crash_banner(flags, o.arming_disable, o.armed)
+	_hud.text = "%s   alt %5.1f m   vbat %4.1f V   thr %4.1f\nrpm %5.0f %5.0f %5.0f %5.0f   dis 0x%x\n%s\n%s" % [
 		"ARMED" if o.armed else "DISARMED", _pos.y, o.vbat, _throttle,
 		o.motor_rpm[0], o.motor_rpm[1], o.motor_rpm[2], o.motor_rpm[3],
-		o.arming_disable, rc_line]
+		o.arming_disable, dmg_line, rc_line]
+
+
+# Center-screen crash state. Sim structural crash (bit0) is primary; the
+# firmware's own crash-detection disarm (dump-driven `crash_recovery =
+# DISARM`) gets its own banner, because the quad is intact there and the fix
+# is cycling the ARM switch, not repairing.
+func _update_crash_banner(flags: int, arming_disable: int, armed: bool) -> void:
+	if _crash_banner == null:
+		return
+	var text := ""
+	var hint := ""
+	if flags & 1:
+		text = "CRASHED"
+		if _strict:
+			hint = "press R to reset"
+		elif armed:
+			# T is (rightly) refused while armed — say so, or T "doesn't work"
+			hint = "disarm first (E / ARM switch), then T to repair"
+		else:
+			hint = "press T to repair — R to reset"
+	elif arming_disable & ARMING_CRASH_DETECTED:
+		text = "CRASH DETECTED"
+		hint = "firmware disarmed — cycle the ARM switch"
+	_crash_banner.visible = text != ""
+	_crash_hint.visible = text != ""
+	if text != "":
+		_crash_banner.text = text
+		_crash_hint.text = hint
+		# slow pulse: reads as a live alert, not a stuck overlay
+		_crash_banner.modulate.a = 0.72 + 0.28 * sin(_boot_elapsed * 5.0)
 
 
 # --------------------------------------------------------------- autotest
@@ -669,6 +942,17 @@ func _update_acro_demo_rc(delta: float) -> void:
 	if _at_time >= 9.0 and _at_time <= 17.0:
 		_at_alts.append(_pos.y)
 
+	# gates are solid now: record clearance while crossing each gate plane,
+	# and the worst damage — a silent scrape must fail the run
+	for gz in [-6.0, -14.0, -22.0]:
+		if absf(_pos.z - gz) < 0.5:
+			_gate_max_absx = maxf(_gate_max_absx, absf(_pos.x))
+			_gate_min_y = minf(_gate_min_y, _pos.y)
+			_gate_max_y = maxf(_gate_max_y, _pos.y)
+	if not _last_out.is_empty():
+		for d in _last_out.get("prop_damage", []):
+			_max_dmg = maxf(_max_dmg, d)
+
 	if _at_time >= 22.0:
 		var min_alt := 1e9
 		for a in _at_alts:
@@ -678,8 +962,14 @@ func _update_acro_demo_rc(delta: float) -> void:
 		var flew_through := _pos.z < -30.0
 		var stayed_up := _at_alts.size() > 0 and min_alt > 0.7
 		var on_line := absf(_pos.x) < 3.0
-		var ok := _at_armed_seen and flew_through and stayed_up and on_line
+		# posts at x = +/-1.2, bar at 2.05: require real clearance margins
+		var cleared := _gate_max_absx < 0.9 and _gate_min_y > 0.35 and _gate_max_y < 1.85
+		var undamaged := _max_dmg < 0.05
+		var ok := _at_armed_seen and flew_through and stayed_up and on_line \
+				and cleared and undamaged
 		print("[demo] fly-through: end=%s min_alt=%.2f armed=%s" % [str(_pos), min_alt, str(_at_armed_seen)])
+		print("[demo] gate clearance: |x|max=%.2f y=[%.2f, %.2f] max_dmg=%.3f" % [
+				_gate_max_absx, _gate_min_y, _gate_max_y, _max_dmg])
 		print("[demo] %s" % ("PASS" if ok else "FAIL"))
 		get_tree().quit(0 if ok else 1)
 
@@ -701,8 +991,19 @@ func _autotest_check(delta: float) -> void:
 		for a in _at_alts:
 			lo = minf(lo, a)
 			hi = maxf(hi, a)
-		var ok := _at_armed_seen and _at_alts.size() > 0 and lo > 1.5 and hi < 2.5 and _osd_glyphs > 0
-		print("[autotest] hover band [%.2f, %.2f] armed_seen=%s osd_glyphs=%d" % [lo, hi, str(_at_armed_seen), _osd_glyphs])
+		# a clean arm-and-hover must end with zero damage and no crash latch —
+		# resting on the pad and taking off never counts as an impact
+		var dmg_ok := true
+		var flags: int = 0
+		if not _last_out.is_empty():
+			flags = _last_out.get("crash_flags", 0)
+			for d in _last_out.get("prop_damage", []):
+				if d > 0.0:
+					dmg_ok = false
+		var ok := _at_armed_seen and _at_alts.size() > 0 and lo > 1.5 and hi < 2.5 \
+				and _osd_glyphs > 0 and dmg_ok and flags == 0
+		print("[autotest] hover band [%.2f, %.2f] armed_seen=%s osd_glyphs=%d dmg_ok=%s flags=%d" % [
+				lo, hi, str(_at_armed_seen), _osd_glyphs, str(dmg_ok), flags])
 		print("[autotest] %s" % ("PASS" if ok else "FAIL"))
 		get_tree().quit(0 if ok else 1)
 
@@ -727,6 +1028,18 @@ var _prop_angles := [0.0, 0.0, 0.0, 0.0]
 # which is independent confirmation the mapping is right rather than plausible.
 const RPM_FOR_PROP := [1, 3, 0, 2]
 const PROP_SPIN := [1.0, -1.0, -1.0, 1.0]
+
+# Motor positions in the Godot frame (FR, FL, RR, RL — forward is -z), shared
+# by the drone model and the per-motor ground-effect estimate. Matches the
+# physics profile's +/-54 mm.
+const MOTOR_OFFSETS := [
+	Vector3( 0.054, 0.0, -0.054),  # front-right
+	Vector3(-0.054, 0.0, -0.054),  # front-left
+	Vector3( 0.054, 0.0,  0.054),  # rear-right
+	Vector3(-0.054, 0.0,  0.054),  # rear-left
+]
+# ground effect fades out ~1.5 prop diameters (3.5" props = 0.089 m) up
+const GE_FADE_H := 1.5 * 0.089
 
 # Visual layer for airframe parts the O3 physically cannot see. The FPV camera's
 # cull mask excludes it; a chase camera could still render them.
@@ -807,14 +1120,8 @@ func _build_drone_model(root: Node3D) -> void:
 	_hide_from_fpv(pod)
 
 	# 4 ducts + motors + props at the motor positions (Godot: forward = -z)
-	var motors := [
-		Vector3( 0.054, 0.0, -0.054),  # front-right
-		Vector3(-0.054, 0.0, -0.054),  # front-left
-		Vector3( 0.054, 0.0,  0.054),  # rear-right
-		Vector3(-0.054, 0.0,  0.054),  # rear-left
-	]
 	for i in range(4):
-		var p: Vector3 = motors[i]
+		var p: Vector3 = MOTOR_OFFSETS[i]
 
 		# duct ring (torus lip) — the hallmark of a ducted whoop
 		var duct := MeshInstance3D.new()
@@ -984,8 +1291,9 @@ func _build_ground() -> void:
 	var ground := MeshInstance3D.new()
 	var plane := PlaneMesh.new()
 	plane.size = Vector2(GROUND_SIZE, GROUND_SIZE)
-	# NOTE: deliberately flat and un-displaced. _physics_process owns collision as
-	# a hard `_pos.y <= REST_H` test against y=0, so any visual relief would
+	# NOTE: deliberately flat and un-displaced. _detect_contacts() tests the
+	# hull analytically against the y=0 plane (exact, engine-independent, and
+	# the same math as the C++/python harnesses), so any visual relief would
 	# desync -- the drone would sink into hills and hover over valleys.
 	var smat := ShaderMaterial.new()
 	smat.shader = load("res://shaders/ground.gdshader")
@@ -1173,6 +1481,21 @@ func _scatter_trees(mesh: Mesh, count: int, width: float, tint: Color) -> void:
 		var v := rng.randf_range(0.72, 1.28)
 		mm.set_instance_color(i, Color(tint.r * v, tint.g * v, tint.b * v * 0.95))
 
+		# trunk collision: a vertical capsule per tree. Trunk only — the
+		# crowns are visually porous alpha cards, and a canopy collider would
+		# block what clearly looks flyable-through.
+		var body := StaticBody3D.new()
+		body.set_meta("pw_surface", PwProtocol.SURF_TREE)
+		var shape := CollisionShape3D.new()
+		var cap := CapsuleShape3D.new()
+		cap.radius = clampf(0.09 * w, 0.05, 0.5)
+		cap.height = 0.9 * h
+		shape.shape = cap
+		shape.position = Vector3(0, 0.45 * h, 0)
+		body.add_child(shape)
+		body.position = t.origin
+		_world.add_child(body)
+
 	var mmi := MultiMeshInstance3D.new()
 	mmi.multimesh = mm
 	# 95-475 m out: their shadows are invisible but would pollute every cascade
@@ -1248,6 +1571,20 @@ func _add_tube(parent: Node3D, from: Vector3, to: Vector3, radius: float) -> voi
 		mi.rotate(axis, Vector3.UP.angle_to(dir))
 	parent.add_child(mi)
 
+	# matching collision capsule (gates are solid now); the rounded caps
+	# overreach each end by `radius`, along the tube axis only — outside the
+	# opening, so the flyable gap is exactly the visual gap
+	var body := StaticBody3D.new()
+	body.set_meta("pw_surface", PwProtocol.SURF_GATE)
+	var shape := CollisionShape3D.new()
+	var cap := CapsuleShape3D.new()
+	cap.radius = radius
+	cap.height = mesh.height + 2.0 * radius
+	shape.shape = cap
+	body.add_child(shape)
+	body.transform = mi.transform
+	parent.add_child(body)
+
 
 func _build_gate(z: float, idx: int) -> void:
 	_gate_materials()
@@ -1283,6 +1620,16 @@ func _build_gate(z: float, idx: int) -> void:
 		foot.mesh = fm
 		foot.position = Vector3(sx * GATE_HALF, 0.022, 0)
 		gate.add_child(foot)
+
+		var body := StaticBody3D.new()
+		body.set_meta("pw_surface", PwProtocol.SURF_OBJECT)
+		var shape := CollisionShape3D.new()
+		var box := BoxShape3D.new()
+		box.size = fm.size
+		shape.shape = box
+		body.add_child(shape)
+		body.position = foot.position
+		gate.add_child(body)
 
 
 func _build_goggle_layer() -> void:
@@ -1439,3 +1786,50 @@ func _build_world() -> void:
 	_osd.add_theme_color_override("font_outline_color", Color(0, 0, 0))
 	_osd.add_theme_constant_override("outline_size", 2)   # DJI's is a tight shadow
 	ui.add_child(_osd)
+
+	# Crash banner: a crash must be unmissable. Center-screen, above the OSD
+	# grid, big pulsing red — the HUD damage row stays as the detail readout.
+	_crash_banner = Label.new()
+	_crash_banner.set_anchors_preset(Control.PRESET_CENTER)
+	_crash_banner.grow_horizontal = Control.GROW_DIRECTION_BOTH
+	_crash_banner.grow_vertical = Control.GROW_DIRECTION_BOTH
+	_crash_banner.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_crash_banner.add_theme_font_size_override("font_size", 46)
+	_crash_banner.add_theme_color_override("font_color", Color(1.0, 0.22, 0.15))
+	_crash_banner.add_theme_color_override("font_outline_color", Color(0, 0, 0))
+	_crash_banner.add_theme_constant_override("outline_size", 8)
+	_crash_banner.offset_top -= 170
+	_crash_banner.offset_bottom -= 170
+	_crash_banner.visible = false
+	ui.add_child(_crash_banner)
+
+	_crash_hint = Label.new()
+	_crash_hint.set_anchors_preset(Control.PRESET_CENTER)
+	_crash_hint.grow_horizontal = Control.GROW_DIRECTION_BOTH
+	_crash_hint.grow_vertical = Control.GROW_DIRECTION_BOTH
+	_crash_hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_crash_hint.add_theme_font_size_override("font_size", 20)
+	_crash_hint.add_theme_color_override("font_color", Color(1, 1, 1))
+	_crash_hint.add_theme_color_override("font_outline_color", Color(0, 0, 0))
+	_crash_hint.add_theme_constant_override("outline_size", 4)
+	_crash_hint.offset_top -= 122
+	_crash_hint.offset_bottom -= 122
+	_crash_hint.visible = false
+	ui.add_child(_crash_hint)
+
+	# Action feedback toast: every key that declines or acts must say so ON
+	# SCREEN — a console print does not exist for a pilot in goggles. Lower
+	# center, clear of the OSD grid and the crash banner.
+	_toast = Label.new()
+	_toast.set_anchors_preset(Control.PRESET_CENTER)
+	_toast.grow_horizontal = Control.GROW_DIRECTION_BOTH
+	_toast.grow_vertical = Control.GROW_DIRECTION_BOTH
+	_toast.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_toast.add_theme_font_size_override("font_size", 22)
+	_toast.add_theme_color_override("font_color", Color(1.0, 0.78, 0.25))
+	_toast.add_theme_color_override("font_outline_color", Color(0, 0, 0))
+	_toast.add_theme_constant_override("outline_size", 5)
+	_toast.offset_top += 210
+	_toast.offset_bottom += 210
+	_toast.visible = false
+	ui.add_child(_toast)

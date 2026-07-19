@@ -36,6 +36,16 @@ struct GpsData{
   int32_t alt = 0;
 };
 
+// One hull/world contact, mirrors PwContact (client-detected, core-resolved).
+// pointBody is in the quad's body frame; normalWorld is a unit vector in the
+// world frame pointing from the surface toward the quad.
+struct ContactPoint{
+  Vec3F pointBody {};
+  Vec3F normalWorld {};
+  float depth = 0.0f;
+  uint8_t surface = 0;
+};
+
 // initial quad settings.
 struct StateInit{
   float motorKV[4]    = {}; // KV
@@ -67,8 +77,16 @@ struct StateInit{
   float quadBatCapacity = 0.0f;
   Vec3F quadMotorPos[4] {};
 
+  // Wind: mean world-frame flow plus simplex-noise gusts. The gust field is
+  // a pure function of sim time + seed (no RNG stream consumption), so calm
+  // (all zero) builds are bit-identical to pre-wind builds and windy runs
+  // are reproducible given the same flags.
+  Vec3F windMean {};          // m/s, sim world frame
+  float windGustAmp = 0.0f;   // m/s gust amplitude (0 = steady wind only)
+  float windGustFreq = 0.5f;  // gust rate scale
+
   // prop wash starts at this speed in m/s
-  float minPropWashSpeed = 1.0f; 
+  float minPropWashSpeed = 1.0f;
   // prop wash reacheas peak at this speed in m/s
   float maxPropWashSpeed = 18.0f;
   // max prop wash angle of attack (0.0 = 180 degrees in reverse trust dir)
@@ -122,8 +140,12 @@ struct StateInput{
   // charged battery voltage
   float vbat = 0.0f;
 
-  // 1 true 0 false
+  // 1 = any contact active (summary of contactCount)
   uint8_t contact = 0;
+
+  // contact manifold for this frame; persists across the frame's sub-ticks
+  uint8_t contactCount = 0;
+  ContactPoint contacts[6] {};
 };
 
 //simulation output for game
@@ -139,8 +161,14 @@ struct StateOutput{
   // status
   int32_t motorStatus[4] {};
 
+  // effective per-motor damage 0..1 (max of client input and accumulated)
+  float propDamage[4] {};
+
   // beeper on (1) / off (0)
   uint8_t beep = 0U;
+
+  // bit0 sim crashed latch, bit1 BF crash recovery, bit2 BF turtle (reserved)
+  uint8_t crashFlags = 0U;
 
   uint8_t osd[16*30] {};
 };

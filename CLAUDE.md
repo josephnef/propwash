@@ -30,14 +30,18 @@ if the firmware version changes.
 | ctest | proves |
 |-------|--------|
 | `headless_scenario` | BF boots, MSP identity = `BTFL 4.5.2`, arms, angle-hover; prints `STATE_HASH` (printed, not asserted) |
+| `contact_drop` | contact solver: 0.5 m drops (level + inverted) settle dead still on physics alone; the inverted one STAYS inverted |
+| `crash_scenario` | crash lifecycle: rest never damages; 10 m drop = structural crash; a wrecked quad cannot hover (physics, not script); REPAIR restores hover |
+| `collision_e2e` | damage bands over the wire: 1.2 m drop → small damage, 10 m → crash latch, REPAIR clears (reads `prop_damage`/`crash_flags`) |
 | `udp_e2e` | Python client drives the wire protocol, hovers |
 | `diff_roundtrip` | apply a `diff all` over CLI → save → in-process reboot → settings survive |
 | `osd_render` | real `osd.c` renders through the fake displayport → `PW_OSD` |
 | `real_tune_hover` | bake the real diff → fresh boot has `p_pitch=53`, `align_board_roll=0` → hovers |
-| `godot_client` | the actual GDScript client arms + hovers headless (`--headless`, autotest) |
-| `flythrough` | autonomous angle-mode gate run |
+| `godot_client` | the actual GDScript client arms + hovers headless (`--headless`, autotest); must end with zero damage |
+| `flythrough` | autonomous angle-mode gate run — gates are SOLID; asserts real clearance + zero damage |
 | `quality_tiers` | render tier selection rule as a pure function (cases a single machine can't produce) |
 | `fpv_cull` | FPV cull mask + prop→motor index map — invariants a rewrite has already silently dropped once |
+| `client_collision` | client detection: hull vs analytic ground + engine-query gate tubes, slop depenetration, Godot→sim manifold conversion |
 
 `godot_client`/`flythrough` only run if a `godot` binary is found (see
 `find_program(GODOT_BIN ...)` in `CMakeLists.txt`). Tests that bind ports must
@@ -61,8 +65,11 @@ strays before running (`pkill -f build/propwash-core`).
   the Configurator can attach before a client), idle-ticks *only while no client
   is driving* (keeps MSP/CLI alive), streams `PW_STATE_OUT` + `PW_OSD`.
 - **`client-godot/`** — Godot 4, pure GDScript. Spawns the core, drives it in
-  lockstep, owns collision, converts sim↔Godot handedness (mirror z; quat -x,-y;
-  angular velocity is a pseudovector: -x,-y,+z).
+  lockstep, owns collision *detection* (5-sphere hull vs analytic ground +
+  engine shape queries for gates/trees → contact manifold on the wire; the
+  core resolves contacts as forces — the client never edits velocities),
+  converts sim↔Godot handedness (mirror z; quat -x,-y; angular velocity is a
+  pseudovector: -x,-y,+z).
 
 ## Non-obvious things that will bite you (learned the hard way)
 
@@ -96,6 +103,24 @@ strays before running (`pkill -f build/propwash-core`).
   frame 0 of every run.
 - **A physically-connected joystick has RC priority** and will hijack the
   headless tests — autotest/demo spawn the core with `--no-js`.
+- **Contact response must be forces, not velocity edits.** The virtual
+  accelerometer reads `total_force/mass` — a velocity edit is invisible to it,
+  so the firmware would never feel touchdown or a crash. That is why the core
+  resolves the client's contact manifold inside the tick (`contactForces` in
+  `physics.cpp`) and why `PW_STATE_IN` velocities are ignored as of v2.
+- **Resting contact needs speculative points + depth continuity.** A quad
+  rocking on an asymmetric contact set never settled: separated points
+  re-impacted undamped during the 4 ms client-frame gap, and the client's
+  rectangle-rule position integration re-anchored depths with an O(a·dt²)
+  error every frame. Fix: clients report near-contacts (≤5 mm) at depth 0
+  (one-sided dampers), and the core keeps its evolved depth for persisting
+  contacts unless the client disagrees by >2 mm.
+- **Damage thresholds are approach SPEEDS, never forces** — a parked quad has
+  v_n ≈ 0 no matter how hard it presses, so rest can't accumulate damage and
+  retuning the contact spring never retunes damage.
+- **The damage/contact path must not call `randf()`** — one extra draw shifts
+  the whole noise stream and every trajectory after it. Wind gusts use
+  SimplexNoise (a pure function of sim time + seed) for the same reason.
 - **Betaflight source uses `#pragma GCC poison sprintf snprintf`** unless
   `SIMULATOR_BUILD` is defined; keep that define on the BF lib.
 
@@ -113,6 +138,11 @@ strays before running (`pkill -f build/propwash-core`).
   for zero gain). GDScript for the client. Python (stdlib) for tools/tests.
 - Match the surrounding style. Keep `protocol/propwash_protocol.h` free of any
   Betaflight include — it is the GPL/MIT boundary.
+- A wire-format change touches exactly four codecs: `propwash_protocol.h`
+  (+ the `static_assert` sizes in `server.cpp`), `server.cpp`,
+  `tools/tester/pw_udp.py` (all python tests import it — don't re-inline
+  struct strings), and `client-godot/scripts/protocol.gd`. Bump `PW_VERSION`;
+  mismatches are dropped on both sides.
 - When you modify a vendored stock Betaflight file, update its recorded diff in
   `extern/betaflightext/patches/`.
 - Commit or push only when asked. End commit messages with the Co-Authored-By

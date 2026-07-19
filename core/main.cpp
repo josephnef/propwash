@@ -38,6 +38,8 @@ int main(int argc, char** argv)
     bool calibrate = false;
     double duration = 0.0;
     uint16_t port = 9100;
+    float windMean[3] = {0.0f, 0.0f, 0.0f};
+    float windGust = 0.0f;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--eeprom") && i + 1 < argc) {
@@ -54,12 +56,23 @@ int main(int argc, char** argv)
             realtime = true;
         } else if (!strcmp(argv[i], "--duration") && i + 1 < argc) {
             duration = atof(argv[++i]);
+        } else if (!strcmp(argv[i], "--wind") && i + 1 < argc) {
+            // steady wind "x,y,z" in m/s, sim world frame (+z = toward the
+            // gates as the quad sits on the pad)
+            if (sscanf(argv[++i], "%f,%f,%f",
+                       &windMean[0], &windMean[1], &windMean[2]) != 3) {
+                fprintf(stderr, "--wind wants x,y,z (m/s)\n");
+                return 2;
+            }
+        } else if (!strcmp(argv[i], "--gust") && i + 1 < argc) {
+            windGust = (float)atof(argv[++i]);
         } else if (!strcmp(argv[i], "--server")) {
             realtime = false;
         } else {
             fprintf(stderr,
                 "usage: %s [--server|--realtime|--js-calibrate] [--port N] "
-                "[--eeprom path] [--js /dev/input/jsN | --no-js] [--duration s]\n",
+                "[--eeprom path] [--js /dev/input/jsN | --no-js] [--duration s] "
+                "[--wind x,y,z] [--gust amp]\n",
                 argv[0]);
             return 2;
         }
@@ -78,6 +91,13 @@ int main(int argc, char** argv)
 
     StateInit init {};
     profileCineLog35(init, eeprom);
+    init.windMean = { windMean[0], windMean[1], windMean[2] };
+    init.windGustAmp = windGust;
+    if (windMean[0] != 0.0f || windMean[1] != 0.0f || windMean[2] != 0.0f
+        || windGust > 0.0f) {
+        printf("[pw] wind: mean (%.1f, %.1f, %.1f) m/s, gust %.1f m/s\n",
+               windMean[0], windMean[1], windMean[2], windGust);
+    }
 
     Sim& sim = Sim::getInstance();
 

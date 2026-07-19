@@ -3,7 +3,7 @@
 class_name PwProtocol
 
 const MAGIC := 0x48535750  # "PWSH"
-const VERSION := 1
+const VERSION := 2
 
 const PW_INIT := 1
 const PW_INIT_ACK := 2
@@ -14,6 +14,15 @@ const PW_RC_OVERRIDE := 6
 const PW_COMMAND := 7
 
 const PW_CMD_RESET := 1
+const PW_CMD_REPAIR := 6
+
+const MAX_CONTACTS := 6
+
+# PwSurfaceType
+const SURF_GROUND := 0
+const SURF_GATE := 1
+const SURF_TREE := 2
+const SURF_OBJECT := 3
 
 
 static func _header(type: int, payload_len: int) -> StreamPeerBuffer:
@@ -28,11 +37,16 @@ static func _header(type: int, payload_len: int) -> StreamPeerBuffer:
 
 # PwStateIn: frame_id u32, dt f32, rc[8] f32, pos 3f, quat wxyz 4f,
 # angvel 3f, linvel 3f, gyro_noise f32, prop_damage 4f, ground_effect 4f,
-# vbat f32, contact u8  => 133 bytes payload
+# vbat f32, contact u8, contact_count u8, 6x contact (point_body 3f,
+# normal_world 3f, depth f32, surface u8)  => 308 bytes payload
+#
+# contacts: Array of {point_body: Vector3, normal_world: Vector3,
+# depth: float, surface: int}, already converted to the sim frame.
 static func pack_state_in(frame_id: int, dt: float, rc: Array,
 		pos: Vector3, rot: Quaternion, angvel: Vector3, linvel: Vector3,
-		vbat: float, contact: bool) -> PackedByteArray:
-	var b := _header(PW_STATE_IN, 133)
+		vbat: float, contact: bool, contacts: Array = [],
+		ground_effect: Array = []) -> PackedByteArray:
+	var b := _header(PW_STATE_IN, 308)
 	b.put_u32(frame_id)
 	b.put_float(dt)
 	for i in range(8):
@@ -43,17 +57,40 @@ static func pack_state_in(frame_id: int, dt: float, rc: Array,
 	b.put_float(linvel.x); b.put_float(linvel.y); b.put_float(linvel.z)
 	b.put_float(0.0002)  # gyro noise amp
 	for i in range(4):
-		b.put_float(0.0)  # prop damage
+		b.put_float(0.0)  # prop damage (external/scripted; unused here)
 	for i in range(4):
-		b.put_float(0.0)  # ground effect
+		b.put_float(ground_effect[i] if i < ground_effect.size() else 0.0)
 	b.put_float(vbat)
 	b.put_u8(1 if contact else 0)
+	var n: int = mini(contacts.size(), MAX_CONTACTS)
+	b.put_u8(n)
+	for i in range(MAX_CONTACTS):
+		if i < n:
+			var c: Dictionary = contacts[i]
+			var p: Vector3 = c.point_body
+			var nrm: Vector3 = c.normal_world
+			b.put_float(p.x); b.put_float(p.y); b.put_float(p.z)
+			b.put_float(nrm.x); b.put_float(nrm.y); b.put_float(nrm.z)
+			b.put_float(c.depth)
+			b.put_u8(c.surface)
+		else:
+			for j in range(7):
+				b.put_float(0.0)
+			b.put_u8(0)
 	return b.data_array
 
 
 static func pack_command(cmd: int) -> PackedByteArray:
 	var b := _header(PW_COMMAND, 4)
 	b.put_u32(cmd)
+	return b.data_array
+
+
+# PwRcOverride: rc[8] f32. Server priority: joystick > override > packet rc.
+static func pack_rc_override(rc: Array) -> PackedByteArray:
+	var b := _header(PW_RC_OVERRIDE, 32)
+	for i in range(8):
+		b.put_float(rc[i])
 	return b.data_array
 
 
@@ -76,9 +113,10 @@ static func unpack_osd(pkt: PackedByteArray) -> PackedStringArray:
 	return lines
 
 
-# PwStateOut (114 bytes): frame_id u32, sim_time u64, quat wxyz, angvel,
+# PwStateOut (131 bytes): frame_id u32, sim_time u64, quat wxyz, angvel,
 # linvel, pos, accel, motor_rpm 4f, motor_status 4u8, armed u8,
-# arming u32, mode u32, beeper u8, vbat f32, amperage f32
+# arming u32, mode u32, beeper u8, vbat f32, amperage f32,
+# prop_damage 4f, crash_flags u8
 static func unpack_state_out(pkt: PackedByteArray) -> Dictionary:
 	var b := StreamPeerBuffer.new()
 	b.big_endian = false
@@ -106,4 +144,6 @@ static func unpack_state_out(pkt: PackedByteArray) -> Dictionary:
 	out.beeper = b.get_u8() == 1
 	out.vbat = b.get_float()
 	out.amperage = b.get_float()
+	out.prop_damage = [b.get_float(), b.get_float(), b.get_float(), b.get_float()]
+	out.crash_flags = b.get_u8()
 	return out

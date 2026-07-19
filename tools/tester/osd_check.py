@@ -5,49 +5,42 @@ max7456 displayport into osdScreen[] and reach the client as PW_OSD packets.
 
 Spawns the core itself. Exit 0 = a non-empty OSD grid was received.
 """
-import os
 import socket
-import struct
-import subprocess
 import sys
-import tempfile
-import time
 
-MAGIC = 0x48535750
-HDR = struct.Struct("<IBBH")
-SIN = struct.Struct("<If8f3f4f3f3ff4f4ffB")
-PW_STATE_IN, PW_OSD = 3, 5
+import pw_udp
 
 
 def main():
     core = sys.argv[1] if len(sys.argv) > 1 else "build/propwash-core"
     port = 9112
-    eeprom = tempfile.mktemp(suffix=".bin")
-    if os.path.exists(eeprom):
-        os.remove(eeprom)
 
-    proc = subprocess.Popen([core, "--server", "--no-js", "--port", str(port),
-                             "--eeprom", eeprom],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc, eeprom = pw_udp.spawn(core, port)
     try:
-        time.sleep(2.0)
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         addr = ("127.0.0.1", port)
         grid = None
+
+        # constant resting pose + ground manifold (the position is a fixed
+        # input tape here; the manifold is what keeps the core resting on its
+        # contact springs instead of free-falling under a pinned pose)
+        pos = [0.0, 0.0, 0.0]
+        contacts = pw_udp.ground_manifold(pos, (1.0, 0.0, 0.0, 0.0))
 
         best = 0
         for f in range(500):
             arm = 1.0 if f > 60 else -1.0
             rc = [0, 0, -1, 0, arm, 1.0, -1, -1]
-            payload = SIN.pack(f, 0.02, *rc, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                               0.0002, *([0] * 4), *([0] * 4), 16.8, 1)
-            s.sendto(HDR.pack(MAGIC, 1, PW_STATE_IN, len(payload)) + payload, addr)
+            pkt = pw_udp.pack_state_in(f, 0.02, rc, pos, (1, 0, 0, 0),
+                                       (0, 0, 0), (0, 0, 0), contact=1,
+                                       contacts=contacts)
+            s.sendto(pkt, addr)
             s.settimeout(0.05)
             try:
                 while True:
                     d, _ = s.recvfrom(2048)
-                    _, _, typ, _ = HDR.unpack(d[:8])
-                    if typ == PW_OSD:
+                    _, _, typ, _ = pw_udp.HDR.unpack(d[:8])
+                    if typ == pw_udp.PW_OSD:
                         g = d[8:8 + 480]
                         # keep the grid with the most content: the OSD refreshes
                         # asynchronously, so any single packet may be mid-clear
@@ -73,13 +66,7 @@ def main():
         print("OSD CHECK PASS" if ok else "OSD CHECK FAIL")
         return 0 if ok else 1
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-        if os.path.exists(eeprom):
-            os.remove(eeprom)
+        pw_udp.stop(proc, eeprom)
 
 
 if __name__ == "__main__":
