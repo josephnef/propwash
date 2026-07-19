@@ -1,8 +1,24 @@
 diff --git a/extern/betaflight/lib/main/dyad/dyad.c b/extern/betaflightext/src/main/compat/dyad/dyad.c
-index bb7f2cb..b9b0d8b 100644
+index bb7f2cb..9033b17 100644
 --- a/extern/betaflight/lib/main/dyad/dyad.c
 +++ b/extern/betaflightext/src/main/compat/dyad/dyad.c
-@@ -299,25 +299,40 @@ struct dyad_Stream {
+@@ -42,7 +42,14 @@
+ #include <errno.h>
+ #include <limits.h>
+ 
+-#include "dyad.h"
++/* propwash: the STOCK header, by explicit path. A plain "dyad.h" resolves to
++ * the wrapper sitting in this same directory (quote-include searches the
++ * file's own dir first), and on Windows the wrapper's #include_next then
++ * restarts from the first -I entry — this directory again — so #pragma once
++ * swallows it and the real header never loads. The wrapper's BAUD_* undefs
++ * only matter for TUs that also include io/serial.h, which this one never
++ * does. */
++#include "../../../../../betaflight/lib/main/dyad/dyad.h"
+ 
+ #define DYAD_VERSION "0.2.1"
+ 
+@@ -299,25 +306,40 @@ struct dyad_Stream {
  #define DYAD_FLAG_WRITTEN (1 << 1)
  
  
@@ -55,7 +71,7 @@ index bb7f2cb..b9b0d8b 100644
    }
    exit(EXIT_FAILURE);
  }
-@@ -334,7 +349,7 @@ static dyad_Event createEvent(int type) {
+@@ -334,7 +356,7 @@ static dyad_Event createEvent(int type) {
  static void stream_destroy(dyad_Stream *stream);
  
  static void destroyClosedStreams(void) {
@@ -64,7 +80,7 @@ index bb7f2cb..b9b0d8b 100644
    while (stream) {
      if (stream->state == DYAD_STATE_CLOSED) {
        dyad_Stream *next = stream->next;
-@@ -351,20 +366,20 @@ static void stream_emitEvent(dyad_Stream *stream, dyad_Event *e);
+@@ -351,20 +373,20 @@ static void stream_emitEvent(dyad_Stream *stream, dyad_Event *e);
  
  static void updateTickTimer(void) {
    /* Update tick timer */
@@ -90,7 +106,7 @@ index bb7f2cb..b9b0d8b 100644
    }
  }
  
-@@ -374,7 +389,7 @@ static void updateStreamTimeouts(void) {
+@@ -374,7 +396,7 @@ static void updateStreamTimeouts(void) {
    dyad_Stream *stream;
    dyad_Event e = createEvent(DYAD_EVENT_TIMEOUT);
    e.msg = "stream timed out";
@@ -99,7 +115,7 @@ index bb7f2cb..b9b0d8b 100644
    while (stream) {
      if (stream->timeout) {
        if (currentTime - stream->lastActivity > stream->timeout) {
-@@ -404,12 +419,12 @@ static void stream_destroy(dyad_Stream *stream) {
+@@ -404,12 +426,12 @@ static void stream_destroy(dyad_Stream *stream) {
    e.msg = "the stream has been destroyed";
    stream_emitEvent(stream, &e);
    /* Remove from list and decrement count */
@@ -114,7 +130,7 @@ index bb7f2cb..b9b0d8b 100644
    /* Destroy and free */
    vec_deinit(&stream->listeners);
    vec_deinit(&stream->lineBuffer);
-@@ -689,28 +704,28 @@ void dyad_update(void) {
+@@ -689,28 +711,28 @@ void dyad_update(void) {
    updateStreamTimeouts();
  
    /* Create fd sets for select() */
@@ -151,7 +167,7 @@ index bb7f2cb..b9b0d8b 100644
          break;
      }
      stream = stream->next;
-@@ -723,25 +738,25 @@ void dyad_update(void) {
+@@ -723,25 +745,25 @@ void dyad_update(void) {
       * because the type of timeval's fields don't agree across platforms */
      #pragma warning(disable: 4244)
    #endif
@@ -185,7 +201,7 @@ index bb7f2cb..b9b0d8b 100644
            stream_handleReceivedData(stream);
            if (stream->state == DYAD_STATE_CLOSED) {
              break;
-@@ -750,13 +765,13 @@ void dyad_update(void) {
+@@ -750,13 +772,13 @@ void dyad_update(void) {
  
  	FALLTHROUGH;
        case DYAD_STATE_CLOSING:
@@ -201,7 +217,7 @@ index bb7f2cb..b9b0d8b 100644
            /* Check socket for error */
            int optval = 0;
            socklen_t optlen = sizeof(optval);
-@@ -772,7 +787,7 @@ void dyad_update(void) {
+@@ -772,7 +794,7 @@ void dyad_update(void) {
            e.msg = "connected to server";
            stream_emitEvent(stream, &e);
          } else if (
@@ -210,7 +226,7 @@ index bb7f2cb..b9b0d8b 100644
          ) {
            /* Handle failed connection */
  connectFailed:
-@@ -781,7 +796,7 @@ connectFailed:
+@@ -781,7 +803,7 @@ connectFailed:
          break;
  
        case DYAD_STATE_LISTENING:
@@ -219,7 +235,7 @@ index bb7f2cb..b9b0d8b 100644
            stream_acceptPendingConnections(stream);
          }
          break;
-@@ -817,12 +832,12 @@ void dyad_init(void) {
+@@ -817,12 +839,12 @@ void dyad_init(void) {
  
  void dyad_shutdown(void) {
    /* Close and destroy all the streams */
@@ -236,7 +252,7 @@ index bb7f2cb..b9b0d8b 100644
  #ifdef _WIN32
    WSACleanup();
  #endif
-@@ -848,23 +863,23 @@ double dyad_getTime(void) {
+@@ -848,23 +870,23 @@ double dyad_getTime(void) {
  
  
  int dyad_getStreamCount(void) {
@@ -265,7 +281,7 @@ index bb7f2cb..b9b0d8b 100644
    return old;
  }
  
-@@ -880,9 +895,9 @@ dyad_Stream *dyad_newStream(void) {
+@@ -880,9 +902,9 @@ dyad_Stream *dyad_newStream(void) {
    stream->sockfd = INVALID_SOCKET;
    stream->lastActivity = dyad_getTime();
    /* Add to list and increment count */

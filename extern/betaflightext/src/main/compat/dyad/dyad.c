@@ -42,7 +42,14 @@
 #include <errno.h>
 #include <limits.h>
 
-#include "dyad.h"
+/* propwash: the STOCK header, by explicit path. A plain "dyad.h" resolves to
+ * the wrapper sitting in this same directory (quote-include searches the
+ * file's own dir first), and on Windows the wrapper's #include_next then
+ * restarts from the first -I entry — this directory again — so #pragma once
+ * swallows it and the real header never loads. The wrapper's BAUD_* undefs
+ * only matter for TUs that also include io/serial.h, which this one never
+ * does. */
+#include "../../../../../betaflight/lib/main/dyad/dyad.h"
 
 #define DYAD_VERSION "0.2.1"
 

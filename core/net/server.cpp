@@ -11,6 +11,16 @@
 #include <mach-o/loader.h>
 #include <mach-o/ldsyms.h>
 #include <mach/vm_prot.h>
+#elif defined(__linux__)
+// linker section boundaries — file scope + C linkage, or the references
+// mangle to namespace-qualified symbols and fail to link (see
+// static_snapshot.cpp for the same trap)
+extern "C" {
+extern char __data_start[];
+extern char _edata[];
+extern char __bss_start[];
+extern char _end[];
+}
 #endif
 
 #if defined(_WIN32)
@@ -186,7 +196,6 @@ static void dumpStaticState(const char* path)
     fclose(f);
     printf("[pw][dump] static state -> %s\n", path);
 #elif defined(__linux__)
-    extern char __data_start[], _edata[], __bss_start[], _end[];
     FILE* f = fopen(path, "wb");
     if (!f) { perror("[pw][dump] fopen"); return; }
     // NOTE: addresses are the RUNTIME ones; with a PIE binary, symbolizing

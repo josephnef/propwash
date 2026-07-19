@@ -12,6 +12,17 @@
 #include <mach/vm_prot.h>
 #elif defined(_WIN32)
 #include <windows.h>
+#elif defined(__linux__)
+// The linker-provided section boundary symbols. Declared at FILE scope with
+// C linkage: inside a namespace (or a function within one) they mangle to a
+// namespace-qualified C++ symbol and never bind to the linker's globals —
+// undefined reference at link time.
+extern "C" {
+extern char __data_start[];
+extern char _edata[];
+extern char __bss_start[];
+extern char _end[];
+}
 #endif
 
 namespace SimITL {
@@ -78,7 +89,6 @@ namespace SimITL {
       }
       return true;
 #elif defined(__linux__)
-      extern char __data_start[], _edata[], __bss_start[], _end[];
       fn((uintptr_t)__data_start, (size_t)(_edata - __data_start));
       fn((uintptr_t)__bss_start, (size_t)(_end - __bss_start));
       return true;
