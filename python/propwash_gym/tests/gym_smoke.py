@@ -29,19 +29,13 @@ def main():
     from gymnasium.utils.env_checker import check_env
     env = PropwashEnv(episode_seconds=2.0, arm_seconds=5.4)
     try:
+        # Includes Gymnasium >=1.0's step-determinism assertion: two resets
+        # plus identical actions must yield identical observations. Holds
+        # since the core's snapshot/restore reset (reset ≡ fresh process,
+        # gated by reset_determinism / cross_process_determinism); enforced
+        # here so a regression fails the gym smoke too.
         check_env(env, skip_render_check=True)
-        print("1. gymnasium env-checker: PASS")
-    except AssertionError as e:
-        # Gymnasium >=1.0 folds a step-determinism assertion into check_env.
-        # The sim is NOT yet bit-reproducible across resets (residual firmware
-        # state BF::init() doesn't clear — the same reason the repo's
-        # determinism_check is not a gating test; M5 territory). Every other
-        # API-contract check ran and passed before this point.
-        if "Deterministic step observations" not in str(e):
-            raise
-        print("1. gymnasium env-checker: PASS (API contract); "
-              "step-determinism XFAIL — sim not bit-reproducible across "
-              "resets yet (repo M5)")
+        print("1. gymnasium env-checker: PASS (incl. step determinism)")
     finally:
         env.close()
 
