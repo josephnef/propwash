@@ -22,23 +22,17 @@ core = pytest.mark.skipif(not _have_core(), reason="propwash-core not built")
 
 @core
 def test_gymnasium_env_checker():
-    """The env obeys the Gymnasium API contract.
-
-    NB: Gymnasium >=1.0 folds a step-determinism assertion into check_env. The
-    sim is not yet bit-reproducible across resets (residual firmware state
-    BF::init() doesn't clear — the repo's determinism_check is red for the same
-    reason; M5). We accept that one sub-check as a known xfail; everything else
-    the checker asserts must pass.
-    """
+    """The env obeys the Gymnasium API contract — INCLUDING the >=1.0
+    step-determinism assertion (two resets + identical actions => identical
+    observations). That sub-check was a known xfail until the core gained its
+    snapshot/restore reset (reset ≡ fresh process, gated core-side by the
+    reset_determinism / cross_process_determinism ctests); it is enforced
+    here so a regression fails the gym too."""
     from gymnasium.utils.env_checker import check_env
     env = PropwashEnv(episode_seconds=2.0, arm_seconds=5.4)
     try:
         # skip_render_check: this env has no render mode
         check_env(env, skip_render_check=True)
-    except AssertionError as e:
-        if "Deterministic step observations" not in str(e):
-            raise
-        pytest.xfail("sim not bit-reproducible across resets yet (repo M5)")
     finally:
         env.close()
 
