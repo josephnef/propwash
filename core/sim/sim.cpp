@@ -55,8 +55,13 @@ namespace SimITL{
     total_delta = 0;              // drop any sub-tick residue
     mPhysics.initState(stateInit);  // also reseeds the noise RNG
     mPhysics.reset();             // integrator/filter/phase state
-    BF::resetRcData();
+    // resetRcData AFTER init, not before. Betaflight latches switch state
+    // during init, so clearing the channels first and then initialising left
+    // the previous flight's arm switch still flagged (ARM_SWITCH survived a
+    // reset). Clearing afterwards gives the firmware neutral sticks to
+    // evaluate against.
     BF::init();
+    BF::resetRcData();
     BF::configureDefaultModes();
     BF::disableRunawayTakeoff();
   }

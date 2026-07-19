@@ -61,6 +61,9 @@ var _js_invert := [false, false, false, false, false, false, false, false]
 var _last_out := {}
 var _await_warned := false
 var _got_first_reply := false
+# frames where the reply was not already queued — should stay at 0 in normal
+# operation; a rising count means the core is not keeping up
+var _slow_replies := 0
 var _boot_elapsed := 0.0      # wall time since start, for the no-reply grace
 
 # autotest (PROPWASH_AUTOTEST=1): no keyboard/radio — arm at t=5.2 s, run
@@ -380,43 +383,26 @@ func _physics_process(delta: float) -> void:
 			sim_pos, sim_rot, sim_av, sim_lv, 16.8, contact)
 	_udp.put_packet(pkt)
 
-	# --- lockstep wait
+	# --- consume exactly one STATE_OUT per frame
 	#
-	# This budget must not be tight. In lockstep the core advances the moment it
-	# receives the packet, so giving up here does NOT undo that work: the sim has
-	# moved and the client simply skips its own pose update, leaving the two out
-	# of step. Measured over a demo run, an 8 ms budget silently dropped between
-	# 0 and 16 of 5500 frames depending on machine load, and that variation was
-	# the client's remaining source of run-to-run divergence.
+	# The packet for this frame has just been sent. Rather than blocking until
+	# ITS reply comes back, take the oldest reply still queued — normally the
+	# previous frame's, which the core produced a whole frame ago and is already
+	# waiting. That is a one-deep pipeline: the pose applied is one step behind
+	# the packet just sent, consistently.
 	#
-	# 60 ms is far beyond any observed round-trip (measured mean 2-71 us), so a
-	# timeout now means something is genuinely wrong and the warning below is
-	# worth reading, rather than being routine loss.
-	var got := false
-	for i in range(6000):
-		if _udp.get_available_packet_count() > 0:
-			got = true
-			break
-		OS.delay_usec(10)
-	if not got:
-		# don't cry wolf during the core's ~1-2 s boot (joystick enumerate +
-		# Betaflight init + UDP bind). Only warn once we've either seen a reply
-		# before (a real mid-flight dropout) or waited out the startup grace.
-		if not _await_warned and (_got_first_reply or _boot_elapsed > 4.0):
-			push_warning("no reply from propwash-core (is it running on udp:%d?)" % CORE_PORT)
-			_await_warned = true
-		return
-	_await_warned = false
-	_got_first_reply = true
-
-	# Keep waiting until the STATE_OUT for THIS frame arrives. The core
-	# interleaves PW_OSD on the same socket, so the first packet available is
-	# often an OSD frame. Draining once and giving up if it happened not to
-	# contain a STATE_OUT skipped the pose update for that frame — and left the
-	# real reply to be consumed a frame late, putting client and core out of
-	# step. Measured over a demo run that lost 0-16 of 5500 frames depending on
-	# load, which was the client's remaining source of run-to-run divergence.
+	# Consistently is what matters. Exactly one reply is consumed per frame, so
+	# the client and core stay in step and the lag is identical on every run —
+	# a fixed lag costs nothing in a lockstep sim, where the property is
+	# identical inputs producing identical trajectories, not zero latency.
+	# The previous code drained however many packets happened to have arrived
+	# and kept the newest, so the effective lag varied with timing.
+	#
+	# It also means the spin below effectively never runs: the reply is already
+	# there. It stays only as a backstop, so a genuinely dead core is reported
+	# rather than silently skipped.
 	var out := {}
+	var spun := false
 	for _spin in range(6000):
 		while _udp.get_available_packet_count() > 0:
 			var raw := _udp.get_packet()
@@ -426,11 +412,23 @@ func _physics_process(delta: float) -> void:
 			var d := PwProtocol.unpack_state_out(raw)
 			if not d.is_empty():
 				out = d
+				break                      # exactly one, never "keep newest"
 		if not out.is_empty():
 			break
+		spun = true
 		OS.delay_usec(10)
 	if out.is_empty():
+		# don't cry wolf during the core's ~1-2 s boot (joystick enumerate +
+		# Betaflight init + UDP bind)
+		if not _await_warned and (_got_first_reply or _boot_elapsed > 4.0):
+			push_warning("no reply from propwash-core (is it running on udp:%d?)" % CORE_PORT)
+			_await_warned = true
 		return
+	if spun and _got_first_reply:
+		_slow_replies += 1
+	_await_warned = false
+	_got_first_reply = true
+
 	_last_out = out
 	_frame_id += 1
 
