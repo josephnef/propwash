@@ -1,0 +1,34 @@
+[project]
+name = "propwash-gym"
+version = "0.1.0"
+description = "Gymnasium environment for the propwash FPV simulator (real Betaflight in the loop)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "propwash contributors" }]
+dependencies = [
+    "gymnasium>=0.29",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+# heavy, only needed to run examples/ppo_hover.py — `uv sync --extra rl`
+rl = [
+    "stable-baselines3>=2.3",
+    "torch>=2.2",
+]
+
+[project.entry-points."gymnasium.envs"]
+# lets `gymnasium.make("propwash/Hover-v0")` work after `import propwash_gym`
+__root__ = "propwash_gym.__init__:register_envs"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/propwash_gym"]
+
+[tool.uv]
+# the sim core is a sibling C++ build, not a Python dep; nothing to add here
+package = true
