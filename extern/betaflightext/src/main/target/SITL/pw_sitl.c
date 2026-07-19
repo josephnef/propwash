@@ -300,6 +300,8 @@ pwmOutputPort_t *pwmGetMotors(void)
     return motors;
 }
 
+bool pwmIsMotorEnabled(uint8_t index);
+
 static float pwmConvertFromExternal(uint16_t externalValue)
 {
     return (float)externalValue;
@@ -389,6 +391,143 @@ motorDevice_t *motorPwmDevInit(const motorDevConfig_t *motorConfig, uint16_t _id
 
     return &motorPwmDevice;
 }
+
+#ifdef USE_DSHOT
+/* ------------------------------------------------------------------ */
+/* virtual DSHOT ESC                                                    */
+/*                                                                      */
+/* Replaces drivers/dshot_dpwm.c (hardware DMA device, excluded from    */
+/* bf_sources.txt): with a DSHOT protocol selected, motorDevInit routes */
+/* here. Throttle (48..2047) maps onto the same pw_motors_pwm sink the  */
+/* PWM device fills; DSHOT commands arrive through the stock            */
+/* dshot_command.c queue exactly as on hardware, and the only ones a    */
+/* virtual ESC acts on are the spin-direction pair (crashflip).         */
+/* ------------------------------------------------------------------ */
+
+#include "drivers/dshot.h"
+#include "drivers/dshot_command.h"
+#include "drivers/dshot_dpwm.h"
+#include "drivers/pwm_output_dshot_shared.h"
+
+/* per-motor spin direction as commanded over virtual DSHOT: +1 normal,
+ * -1 reversed. Read by the physics glue (reversed-thrust model). */
+int8_t pw_motor_dir[MAX_SUPPORTED_MOTORS] = {1, 1, 1, 1, 1, 1, 1, 1};
+
+/* dshot_command.c's allMotorsAreIdle() inspects the last written packet
+ * through this hardware-shaped struct; only protocolControl.value matters
+ * on a virtual ESC. */
+static motorDmaOutput_t pwDshotDma[MAX_SUPPORTED_MOTORS];
+
+/* referenced by the vendored cli.c (`dshot telemetry_info`); no DMA IRQs
+ * exist on a virtual ESC, so the counters stay zero */
+dshotDMAHandlerCycleCounters_t dshotDMAHandlerCycleCounters;
+
+motorDmaOutput_t *getMotorDmaOutput(uint8_t index)
+{
+    return &pwDshotDma[index];
+}
+
+static motorDevice_t dshotDevice; // forward
+
+static bool pwDshotEnable(void)
+{
+    dshotDevice.enabled = true;
+    return true;
+}
+
+static void pwDshotDisable(void)
+{
+    dshotDevice.enabled = false;
+}
+
+static void pwDshotWriteInt(uint8_t index, uint16_t value)
+{
+    if (index >= MAX_SUPPORTED_MOTORS) {
+        return;
+    }
+    /* the same substitution the hardware write path performs: while the
+     * command queue is ACTIVE, the throttle slot carries the command */
+    if (dshotCommandIsProcessing()) {
+        value = dshotCommandGetCurrent(index);
+        switch (value) {
+        case DSHOT_CMD_SPIN_DIRECTION_1:
+        case DSHOT_CMD_SPIN_DIRECTION_NORMAL:
+            pw_motor_dir[index] = 1;
+            break;
+        case DSHOT_CMD_SPIN_DIRECTION_2:
+        case DSHOT_CMD_SPIN_DIRECTION_REVERSED:
+            pw_motor_dir[index] = -1;
+            break;
+        default:
+            break; /* beeper/led/save: nothing to do on a virtual ESC */
+        }
+    }
+    pwDshotDma[index].protocolControl.value = value;
+
+    /* throttle band 48..2047 -> the same 0..1000 sink the PWM device
+     * fills; command/stop values (< 48) mean "no thrust" */
+    pw_motors_pwm[index] = value >= DSHOT_MIN_THROTTLE
+        ? (int16_t)(((int32_t)(value - DSHOT_MIN_THROTTLE) * 1000) / DSHOT_RANGE)
+        : 0;
+}
+
+static void pwDshotWrite(uint8_t index, float value)
+{
+    pwDshotWriteInt(index, (uint16_t)value);
+}
+
+static void pwDshotUpdateComplete(void)
+{
+    /* the hardware pattern (pwmCompleteDshotMotorUpdate): advance the
+     * command queue's delay/repeat state machine once per output cycle */
+    if (!dshotCommandQueueEmpty()) {
+        if (!dshotCommandOutputIsEnabled(dshotDevice.count)) {
+            return;
+        }
+    }
+}
+
+static void pwDshotShutdown(void)
+{
+    dshotDevice.enabled = false;
+}
+
+static motorDevice_t dshotDevice = {
+    .vTable = {
+        .postInit = motorPostInitNull,
+        .convertExternalToMotor = dshotConvertFromExternal,
+        .convertMotorToExternal = dshotConvertToExternal,
+        .enable = pwDshotEnable,
+        .disable = pwDshotDisable,
+        .isMotorEnabled = pwmIsMotorEnabled,
+        .decodeTelemetry = motorDecodeTelemetryNull,
+        .write = pwDshotWrite,
+        .writeInt = pwDshotWriteInt,
+        .updateComplete = pwDshotUpdateComplete,
+        .shutdown = pwDshotShutdown,
+    }
+};
+
+motorDevice_t *dshotPwmDevInit(const motorDevConfig_t *motorConfig, uint16_t _idlePulse, uint8_t motorCount, bool useUnsyncedPwm)
+{
+    UNUSED(motorConfig);
+    UNUSED(_idlePulse);
+    UNUSED(useUnsyncedPwm);
+
+    printf("[pw] virtual DSHOT ESC: %d motors\n", motorCount);
+
+    for (int i = 0; i < MAX_SUPPORTED_MOTORS && i < motorCount; i++) {
+        motors[i].enabled = true;
+        pw_motor_dir[i] = 1;
+        pwDshotDma[i].protocolControl.value = 0;
+    }
+    dshotDevice.count = motorCount;
+    dshotDevice.initialized = true;
+    dshotDevice.enabled = false;
+
+    return &dshotDevice;
+}
+#endif /* USE_DSHOT */
 
 /* ------------------------------------------------------------------ */
 /* ADC                                                                  */
@@ -528,6 +667,17 @@ bool useDshotTelemetry = false;
  */
 void targetPreInit(void)
 {
+    const char *dshotEnv = getenv("PROPWASH_DSHOT");
+    if (dshotEnv && dshotEnv[0] == '1') {
+        /* virtual DSHOT ESC: keep the configured protocol (the real quad's
+         * dump says dshot600). The boot-grace clearing needs a nonzero
+         * motor-enable timestamp; motorEnable() runs during init() at
+         * virtual millis()==0 and dshotStreamingCommandsAreEnabled() reads
+         * a zero stamp as "never enabled" — the glue re-stamps it on the
+         * first simulated tick (see BF::update). */
+        printf("[pw] targetPreInit: virtual DSHOT enabled (PROPWASH_DSHOT=1)\n");
+        return;
+    }
     motorConfigMutable()->dev.motorPwmProtocol = PWM_TYPE_STANDARD;
     motorConfigMutable()->dev.useUnsyncedPwm = true;
     printf("[pw] targetPreInit: forced motor protocol PWM (SITL override)\n");

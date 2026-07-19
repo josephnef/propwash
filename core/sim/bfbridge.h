@@ -43,6 +43,8 @@ namespace SimITL{
 
       #include "drivers/accgyro/accgyro_virtual.h"
       #include "drivers/pwm_output.h"
+      #include "drivers/motor.h"
+      #include "drivers/dshot_command.h"
 
       #include "rx/rx.h"
       #include "rx/msp.h"
@@ -84,6 +86,8 @@ namespace SimITL{
       extern uint64_t pw_micros_passed;
       extern int64_t  pw_sleep_timer;
       extern int16_t  pw_motors_pwm[];
+      // per-motor spin direction from the virtual DSHOT ESC (+1 / -1)
+      extern int8_t   pw_motor_dir[];
       void pw_set_eeprom_path(const char *path);
 
       // dyad serialisation + the address ranges the deterministic-reset

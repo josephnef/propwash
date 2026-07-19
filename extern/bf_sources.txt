@@ -70,7 +70,6 @@ drivers/display_canvas.c
 drivers/dma_common.c
 drivers/dshot.c
 drivers/dshot_command.c
-drivers/dshot_dpwm.c
 drivers/io.c
 drivers/light_led.c
 drivers/light_ws2811strip.c

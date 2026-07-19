@@ -25,5 +25,11 @@ set align_board_yaw = 0
 # crash signature — saturated mixer + gyro > crash_gthreshold — and sets
 # ARMING_DISABLED_CRASH_DETECTED until the ARM switch is cycled). The
 # sim-side damage model (prop damage, structural-crash latch) runs on top
-# either way. flip_over_after_crash (turtle) can NOT work on this target:
-# it is gated on a DSHOT motor protocol, and targetPreInit() forces PWM.
+# either way.
+#
+# Motor protocol: targetPreInit() still forces PWM by default, but a virtual
+# DSHOT ESC exists — run the core with PROPWASH_DSHOT=1 and the dump's
+# dshot600 applies as-is (boot grace clears, spin-direction commands reach
+# the physics via pw_motor_dir). That is the flip_over_after_crash (turtle)
+# prerequisite; the default flips to DSHOT once the reversed-spin prop model
+# and eRPM telemetry land.

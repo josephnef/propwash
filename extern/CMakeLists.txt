@@ -80,6 +80,10 @@ target_include_directories(bf_sitl PUBLIC
   # is found first and #include_next pulls the stock header beneath it
   "${CMAKE_CURRENT_SOURCE_DIR}/betaflightext/src/main/target/SITL"
   "${CMAKE_CURRENT_SOURCE_DIR}/betaflightext/src/main/io"
+  # sim-safe header shadows (build/atomic.h: the stock one is inline ARM
+  # assembly, pulled in once USE_DSHOT compiles dshot.c) — must precede
+  # the stock src/main
+  "${CMAKE_CURRENT_SOURCE_DIR}/betaflightext/src/main/simstubs"
   "${BF_ROOT}/src/main"
   "${BF_ROOT}/src/main/target/SITL"
   "${BF_ROOT}/lib/main/dyad"

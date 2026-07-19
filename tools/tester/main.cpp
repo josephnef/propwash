@@ -359,6 +359,131 @@ static int crashTest()
     return rc;
 }
 
+// --------------------------------------------------------------- dshot test
+/* --dshot-test: the virtual DSHOT ESC end to end. With PROPWASH_DSHOT=1 the
+ * forced-PWM override is skipped, so a fresh eeprom boots the Betaflight
+ * default protocol (DSHOT600 once USE_DSHOT is compiled). Asserts:
+ *   1. boot grace clears and the quad arms + hovers — proves the
+ *      motor-enable re-stamp, dshotStreamingCommandsAreEnabled(), and the
+ *      virtual ESC's throttle mapping (48..2047 -> thrust);
+ *   2. SPIN_DIRECTION commands sent through the STOCK dshot_command.c queue
+ *      (repeats, delays, all-motors-idle gating) land in pw_motor_dir. */
+static int dshotTest()
+{
+#if defined(_WIN32)
+    _putenv("PROPWASH_DSHOT=1");
+#else
+    setenv("PROPWASH_DSHOT", "1", 1);
+#endif
+    const char* eeprom = "pw-tester-dshot-eeprom.bin";
+    remove(eeprom);
+
+    StateInit init {};
+    profileCineLog35(init, eeprom);
+
+    StateInput in {};
+    inputDefaults(in);
+    in.gyroBaseNoiseAmp = 0.0002f;
+    const float dt = 1.0f / 250.0f;
+    in.delta = dt;
+
+    Sim& sim = Sim::getInstance();
+    sim.init(init);
+    BF::configureDefaultModes();
+    BF::disableRunawayTakeoff();
+
+    mat3 basis = identity;
+    vec3 position {0.0f, PW_HULL_REST_H, 0.0f};
+    copy(in.rotation, basis);
+
+    int rc = 0;
+    float throttle = -1.0f;
+    bool armedSeen = false;
+    float minAlt = 1e9f, maxAlt = -1e9f;
+
+    /* timeline: cal+grace to 6 s, arm, hover to 20 s, disarm, then the
+     * spin-direction command exchange while resting idle */
+    const float T_ARM = 6.0f, T_DISARM = 20.0f, T_REV = 21.0f, T_NORM = 22.0f;
+    const float T_END = 23.0f;
+
+    const int frames = (int)(T_END / dt);
+    for (int f = 0; f <= frames; f++) {
+        const float t = f * dt;
+
+        in.rcData[4] = (t >= T_ARM && t < T_DISARM) ? 1.0f : -1.0f;
+        in.rcData[5] = 1.0f;
+
+        const SimState& st = sim.getSimState();
+        if (st.armed) {
+            float u = -0.3f + 0.5f * (2.0f - position[1]) - 0.4f * st.stateOutput.linearVelocity.y;
+            u = clamp(u, -1.0f, 0.6f);
+            const float maxStep = 2.0f * dt;
+            throttle = clamp(u, throttle - maxStep, throttle + maxStep);
+        } else {
+            throttle = -1.0f;
+        }
+        in.rcData[2] = throttle;
+
+        if (f == (int)(T_REV / dt)) {
+            BF::sendSpinDirectionCommand(true);
+        }
+        if (f == (int)(T_NORM / dt)) {
+            for (int i = 0; i < 4 && rc == 0; i++) {
+                if (BF::motorSpinDirection(i) != -1) {
+                    printf("FAIL: motor %d dir %d after REVERSED\n",
+                           i, BF::motorSpinDirection(i));
+                    rc = 1;
+                }
+            }
+            BF::sendSpinDirectionCommand(false);
+        }
+
+        sim.update(in);
+
+        const StateOutput& out = sim.getStateUpdate();
+        quat q { out.orientation.x, out.orientation.y, out.orientation.z, out.orientation.w };
+        basis = quat_to_mat3(q);
+        copy(in.rotation, basis);
+        in.angularVelocity = out.angularVelocity;
+        in.linearVelocity  = out.linearVelocity;
+
+        vec3 vel;
+        copy(vel, out.linearVelocity);
+        position = position + vel * dt;
+        groundManifold(position, basis, in);
+
+        if (st.armed) armedSeen = true;
+        if (t >= T_ARM + 8.0f && t < T_DISARM) {
+            minAlt = std::min(minAlt, position[1]);
+            maxAlt = std::max(maxAlt, position[1]);
+        }
+        if (f % (int)(2.0f / dt) == 0) {
+            printf("[dshot] t=%5.1f alt=%6.2f armed=%d dis=0x%05x dir=%+d%+d%+d%+d\n",
+                   t, position[1], st.armed ? 1 : 0,
+                   (unsigned)st.armingDisabledFlags,
+                   BF::motorSpinDirection(0), BF::motorSpinDirection(1),
+                   BF::motorSpinDirection(2), BF::motorSpinDirection(3));
+        }
+    }
+
+    for (int i = 0; i < 4; i++) {
+        if (BF::motorSpinDirection(i) != 1) {
+            printf("FAIL: motor %d dir %d after NORMAL\n",
+                   i, BF::motorSpinDirection(i));
+            rc = 1;
+        }
+    }
+    if (!armedSeen) { printf("FAIL: never armed under DSHOT\n"); rc = 1; }
+    if (armedSeen && (minAlt < 1.0f || maxAlt > 3.0f)) {
+        printf("FAIL: dshot hover out of band [%.2f, %.2f]\n", minAlt, maxAlt);
+        rc = 1;
+    } else if (armedSeen) {
+        printf("[dshot] hover band [%.2f, %.2f] on the virtual DSHOT ESC\n", minAlt, maxAlt);
+    }
+    printf(rc == 0 ? "PASS\n" : "FAIL\n");
+    return rc;
+}
+
 int main(int argc, char** argv)
 {
     if (argc > 1 && strcmp(argv[1], "--drop-test") == 0) {
@@ -366,6 +491,9 @@ int main(int argc, char** argv)
     }
     if (argc > 1 && strcmp(argv[1], "--crash-test") == 0) {
         return crashTest();
+    }
+    if (argc > 1 && strcmp(argv[1], "--dshot-test") == 0) {
+        return dshotTest();
     }
     const char* eeprom = "pw-tester-eeprom.bin";
     if (argc > 1) eeprom = argv[1];

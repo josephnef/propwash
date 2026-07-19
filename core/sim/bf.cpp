@@ -82,6 +82,16 @@ namespace SimITL{
 
       BF::pw_micros_passed += dt;
 
+      // Virtual-time quirk: motorEnable() runs during init() when millis()
+      // is still 0, and dshotStreamingCommandsAreEnabled() reads a zero
+      // enable-stamp as "never enabled" — with a DSHOT protocol the
+      // boot-grace arming flag would then never clear. Re-stamp once real
+      // simulated time exists; self-neutralizes after the first tick.
+      if (BF::motorIsEnabled() && BF::motorGetMotorEnableTimeMs() == 0) {
+        BF::motorDisable();
+        BF::motorEnable();
+      }
+
       updateGyroAcc(simState);
 
       if (BF::pw_sleep_timer > 0) {
@@ -166,6 +176,17 @@ namespace SimITL{
     void disableRunawayTakeoff(){
       BF::pidConfigMutable()->runaway_takeoff_prevention = 0;
       printf("[pw] runaway takeoff prevention disabled (bench mode)\n");
+    }
+
+    void sendSpinDirectionCommand(bool reversed){
+      BF::dshotCommandWrite(ALL_MOTORS, 4,
+          reversed ? BF::DSHOT_CMD_SPIN_DIRECTION_REVERSED
+                   : BF::DSHOT_CMD_SPIN_DIRECTION_NORMAL,
+          BF::DSHOT_CMD_TYPE_INLINE);
+    }
+
+    int motorSpinDirection(int index){
+      return (index >= 0 && index < 4) ? BF::pw_motor_dir[index] : 0;
     }
 
     void takeStateSnapshot(){
