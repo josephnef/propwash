@@ -24,7 +24,11 @@
 // into the video, so it stays crisp -- it lives on a CanvasLayer above this.
 shader_type canvas_item;
 
-uniform sampler2D screen_tex : hint_screen_texture, filter_linear;
+// Reads TEXTURE -- the TextureRect's own texture, which IS the SubViewport the
+// 3D renders into. Deliberately NOT hint_screen_texture: that forces a
+// full-screen backbuffer copy every frame, measured at ~41 fps of a 212 fps
+// frame at 4.1 MP (a one-tap passthrough cost the same as this whole shader,
+// which is what identified the copy rather than the maths as the expense).
 
 // Fed from the sim each frame; angvel is known exactly, so rolling shutter and
 // codec stress need no motion-vector buffer and no frame history.
@@ -45,8 +49,8 @@ float hash12(vec2 p) {
 }
 
 void fragment() {
-	vec2 uv = SCREEN_UV;
-	vec2 px = SCREEN_PIXEL_SIZE;
+	vec2 uv = UV;
+	vec2 px = TEXTURE_PIXEL_SIZE;
 
 	// --- rolling shutter. Rows are scanned top to bottom, so a row read later is
 	// displaced by whatever the airframe did in between. For yaw this shear IS
@@ -61,13 +65,21 @@ void fragment() {
 	// --- chromatic aberration. Real O3 applies digital lens correction, so this
 	// is a whisper at the extreme corners and nothing at all across the middle
 	// two-thirds. The r^4 falloff keeps it out of the centre entirely.
+	// CA only where it is actually visible. r^4 already confines it to the
+	// corners, so across the middle of frame the extra two fetches were buying a
+	// difference of zero -- skip them there entirely.
 	vec2 c = uv - 0.5;
 	float r2 = dot(c, c);
-	vec2 off = c * r2 * r2 * ca_amt * 0.02;
-	vec3 col = vec3(
-		texture(screen_tex, uv + off).r,
-		texture(screen_tex, uv).g,
-		texture(screen_tex, uv - off).b);
+	vec3 col;
+	if (r2 > 0.10) {
+		vec2 off = c * r2 * r2 * ca_amt * 0.02;
+		col = vec3(
+			texture(TEXTURE, uv + off).r,
+			texture(TEXTURE, uv).g,
+			texture(TEXTURE, uv - off).b);
+	} else {
+		col = texture(TEXTURE, uv).rgb;
+	}
 
 	// --- H.264 stress. Not steady-state macroblocking: the convincing part is
 	// the transient. A whip-pan blows the bitrate budget, the frame softens, and
@@ -75,17 +87,18 @@ void fragment() {
 	// hard-snapping to it -- modern encoders lose detail before they show edges.
 	if (block_enable > 0.5 && block_strength > 0.004) {
 		vec2 bs = px * 16.0;
-		vec3 bcol = texture(screen_tex, (floor(uv / bs) + 0.5) * bs).rgb;
+		vec3 bcol = texture(TEXTURE, (floor(uv / bs) + 0.5) * bs).rgb;
 		col = mix(col, bcol, clamp(block_strength, 0.0, 0.45));
 	}
 
 	// --- unsharp mask: the single most recognisable O3 trait. Halos on every
 	// high-contrast edge, from an ISP that sharpens harder than it should.
-	vec3 blur = texture(screen_tex, uv + vec2(px.x, 0.0)).rgb
-	          + texture(screen_tex, uv - vec2(px.x, 0.0)).rgb
-	          + texture(screen_tex, uv + vec2(0.0, px.y)).rgb
-	          + texture(screen_tex, uv - vec2(0.0, px.y)).rgb;
-	col += (col - blur * 0.25) * sharpen_amt;
+	// 2 diagonal taps rather than a 4-tap cross: at 4.1 MP those two extra
+	// fetches cost more than the halo quality they buy, and the halo is what
+	// reads as "DJI ISP" either way
+	vec3 blur = texture(TEXTURE, uv + px).rgb
+	          + texture(TEXTURE, uv - px).rgb;
+	col += (col - blur * 0.5) * sharpen_amt;
 
 	// --- digital contrast: a gentle S-curve with slightly crushed blacks and a
 	// faintly cool cast. This is most of what separates "camera" from "render".

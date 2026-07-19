@@ -133,7 +133,7 @@ var _wd_fps := 60.0
 # to see the raw render. Effects that are basically free run at every tier — the
 # feed treatment IS the look, so it must not silently disappear on a fast panel.
 const GOGGLE_ENV := "PROPWASH_GOGGLE"
-var _goggle: ColorRect
+var _goggle: TextureRect
 var _goggle_mat: ShaderMaterial
 var _block_env := 0.0        # codec stress envelope: fast attack, slow decay
 var _feed_time := 0.0
@@ -165,6 +165,15 @@ var _cam: Camera3D
 # fullscreen transition reports the primary again on macOS, so both the tick
 # rate and the quality tier read this instead of asking twice.
 var _active_screen := 0
+
+# The 3D world renders into this SubViewport rather than straight to the screen,
+# and the goggle pass samples its texture directly. The reason is measured: a
+# canvas shader using hint_screen_texture forces a full-screen backbuffer copy
+# every frame, and at 4.1 MP that copy cost ~41 fps of a 212 fps frame -- a
+# one-tap passthrough shader measured identically to the full goggle shader,
+# which is what proved the cost was the copy and not the maths.
+var _subvp: SubViewport
+var _world: Node3D          # everything 3D parents here, not to self
 
 
 func _ready() -> void:
@@ -863,7 +872,7 @@ func _add_box(pos: Vector3, size: Vector3, color: Color) -> void:
 	mesh.material = _shared_material(color, 0.55, 0.0)
 	mi.mesh = mesh
 	mi.position = pos
-	add_child(mi)
+	_world.add_child(mi)
 
 
 func _build_sky_and_sun() -> void:
@@ -883,7 +892,7 @@ func _build_sky_and_sun() -> void:
 	sun.directional_shadow_split_2 = 0.15
 	sun.directional_shadow_split_3 = 0.40
 	sun.directional_shadow_fade_start = 0.9
-	add_child(sun)
+	_world.add_child(sun)
 
 	var env := WorldEnvironment.new()
 	var e := Environment.new()
@@ -899,6 +908,11 @@ func _build_sky_and_sun() -> void:
 	# the sky is the brightest thing in a daylit outdoor scene; at 1.0 against a
 	# sunlit field it rendered as dusk-navy with the field over-exposed
 	psm.energy_multiplier = 2.2
+	# The sun never moves in this scene, so the radiance map is static. AUTOMATIC
+	# keeps reprocessing it; QUALITY bakes it once and caches. Measured at ~15 fps
+	# of a 199 fps frame before this change.
+	sky.process_mode = Sky.PROCESS_MODE_QUALITY
+	sky.radiance_size = Sky.RADIANCE_SIZE_128
 	sky.sky_material = psm
 	e.background_mode = Environment.BG_SKY
 	e.sky = sky
@@ -936,7 +950,7 @@ func _build_sky_and_sun() -> void:
 
 	_apply_quality_to_env(e, sun)   # tier-dependent: shadows, glow, ssao, ssil, volfog
 	env.environment = e
-	add_child(env)
+	_world.add_child(env)
 	_env = e      # the exposure hunt drives tonemap_exposure each frame
 	_sun = sun
 
@@ -952,7 +966,7 @@ func _build_ground() -> void:
 	smat.shader = load("res://shaders/ground.gdshader")
 	plane.material = smat
 	ground.mesh = plane
-	add_child(ground)
+	_world.add_child(ground)
 
 
 # A ring of low-poly conifers at 80-300 m in ONE draw call. No assets, and it is
@@ -1138,7 +1152,7 @@ func _scatter_trees(mesh: Mesh, count: int, width: float, tint: Color) -> void:
 	mmi.multimesh = mm
 	# 95-475 m out: their shadows are invisible but would pollute every cascade
 	mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-	add_child(mmi)
+	_world.add_child(mmi)
 
 
 # ------------------------------------------------------------------ gates
@@ -1218,7 +1232,7 @@ func _build_gate(z: float, idx: int) -> void:
 	var gate := Node3D.new()
 	gate.position = Vector3(0, 0, z)
 	gate.rotate_y(rng.randf_range(-0.05, 0.05))   # nothing on a field is square
-	add_child(gate)
+	_world.add_child(gate)
 
 	# uprights and top bar -- the opening itself, unchanged from the box version
 	_add_tube(gate, Vector3(-GATE_HALF, 0.0, 0), Vector3(-GATE_HALF, GATE_H, 0), TUBE_R)
@@ -1257,7 +1271,10 @@ func _build_goggle_layer() -> void:
 	mat.set_shader_parameter("rs_amt", _q.goggle_rs)
 	_goggle_mat = mat
 
-	var rect := ColorRect.new()
+	var rect := TextureRect.new()
+	rect.texture = _subvp.get_texture()
+	rect.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	rect.stretch_mode = TextureRect.STRETCH_SCALE
 	rect.set_anchors_preset(Control.PRESET_FULL_RECT)
 	rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	rect.material = mat
@@ -1305,7 +1322,36 @@ func _update_auto_exposure(delta: float) -> void:
 	_env.tonemap_exposure = clampf(_ae, 0.85, 1.6)
 
 
+func _make_world_root() -> void:
+	# Headless, autotest and goggle-off all render straight to the root viewport:
+	# no goggle pass means no backbuffer copy to avoid, and keeping the tested
+	# headless path structurally identical is worth more than the symmetry.
+	if DisplayServer.get_name() == "headless" or _autotest \
+			or OS.get_environment(GOGGLE_ENV) == "off":
+		_world = self
+		return
+	_subvp = SubViewport.new()
+	_subvp.size = DisplayServer.window_get_size()
+	_subvp.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+	_subvp.handle_input_locally = false
+	# the quality settings belong on whichever viewport actually draws the 3D
+	_subvp.msaa_3d = _q.msaa
+	_subvp.use_debanding = true
+	_subvp.scaling_3d_mode = get_viewport().scaling_3d_mode
+	_subvp.scaling_3d_scale = get_viewport().scaling_3d_scale
+	add_child(_subvp)
+	_world = Node3D.new()
+	_subvp.add_child(_world)
+	get_window().size_changed.connect(_on_window_resized)
+
+
+func _on_window_resized() -> void:
+	if _subvp:
+		_subvp.size = DisplayServer.window_get_size()
+
+
 func _build_world() -> void:
+	_make_world_root()
 	_build_sky_and_sun()
 	_build_ground()
 	_build_treeline()
@@ -1315,7 +1361,7 @@ func _build_world() -> void:
 
 	# drone + FPV camera
 	_drone = Node3D.new()
-	add_child(_drone)
+	_world.add_child(_drone)
 	_build_drone_model(_drone)
 
 	# FPV camera where the DJI O3 sits on a CineLog35: front-top of the frame,

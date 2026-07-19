@@ -31,8 +31,13 @@ float band(float x, float w) {
 	return mix(0.5, s, 1.0 - smoothstep(0.15, 0.5, d));  // fade to average
 }
 
+// sin() based hashing is needlessly expensive for a full-screen surface; this
+// is the standard cheap integer-ish variant and is visually indistinguishable
+// at the scales this shader uses it.
 float hash(vec2 p) {
-	return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+	vec3 q = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
+	q += dot(q, q.yzx + 33.33);
+	return fract((q.x + q.y) * q.z);
 }
 
 float vnoise(vec2 p) {
@@ -52,9 +57,11 @@ void fragment() {
 
 	// three octaves of value noise so the field has large-scale patchiness and
 	// fine tonal break-up instead of reading as one flat green
-	float n = vnoise(p * 0.35) * 0.55
-	        + vnoise(p * 2.30) * 0.30
-	        + vnoise(p * 9.10) * 0.15;
+	// two octaves, not three: the third was ~9 m detail that the mow banding and
+	// the goggle grain already break up, so it cost a full noise evaluation per
+	// pixel for something invisible in motion
+	float n = vnoise(p * 0.35) * 0.65
+	        + vnoise(p * 2.30) * 0.35;
 
 	vec3 base = mix(grass_dark, grass_light, n);
 
