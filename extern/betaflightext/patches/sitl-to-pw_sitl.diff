@@ -1,5 +1,5 @@
 --- extern/betaflight/src/main/target/SITL/sitl.c	2026-07-17 21:28:36
-+++ extern/betaflightext/src/main/target/SITL/pw_sitl.c	2026-07-18 09:53:26
++++ extern/betaflightext/src/main/target/SITL/pw_sitl.c	2026-07-19 20:41:22
 @@ -1,21 +1,20 @@
  /*
 - * This file is part of Cleanflight and Betaflight.
@@ -45,7 +45,7 @@
  
  #include "common/maths.h"
  
-@@ -55,466 +55,230 @@
+@@ -55,466 +55,239 @@
  
  #include "rx/rx.h"
  
@@ -350,8 +350,15 @@
 -
 -    printf("udpRCThread end!!\n");
 -    return NULL;
--}
--
++/* propwash: the deterministic-reset snapshot must not restore this mutex —
++ * the restore runs while HOLDING it, and rewinding a held mutex to its
++ * boot (unlocked) bytes corrupts it for the unlock that follows. */
++void pw_dyad_mutex_range(void **addr, unsigned long *size)
++{
++    *addr = &pwDyadMutex;
++    *size = sizeof(pwDyadMutex);
+ }
+ 
 -static void* tcpThread(void* data)
 +static void *tcpThread(void *data)
  {
@@ -401,16 +408,23 @@
 -        printf("Create mainLoopLock error!\n");
 -        exit(1);
 -    }
--
--    ret = pthread_create(&tcpWorker, NULL, tcpThread, NULL);
--    if (ret != 0) {
--        printf("Create tcpWorker error!\n");
--        exit(1);
--    }
 +    SystemCoreClock = 500 * 1000000; /* virtual 500 MHz */
 +    pw_micros_passed = 0;
 +    pw_sleep_timer = 0;
  
+-    ret = pthread_create(&tcpWorker, NULL, tcpThread, NULL);
+-    if (ret != 0) {
+-        printf("Create tcpWorker error!\n");
+-        exit(1);
++    if (!tcpThreadStarted) {
++        int ret = pthread_create(&tcpWorker, NULL, tcpThread, NULL);
++        if (ret != 0) {
++            fprintf(stderr, "[pw] failed to create tcp thread\n");
++            exit(1);
++        }
++        tcpThreadStarted = true;
+     }
+-
 -    ret = udpInit(&pwmLink, simulator_ip, PORT_PWM, false);
 -    printf("[SITL] init PwmOut UDP link to gazebo %s:%d...%d\n", simulator_ip, PORT_PWM, ret);
 -
@@ -427,14 +441,7 @@
 -    if (ret != 0) {
 -        printf("Create udpWorker error!\n");
 -        exit(1);
-+    if (!tcpThreadStarted) {
-+        int ret = pthread_create(&tcpWorker, NULL, tcpThread, NULL);
-+        if (ret != 0) {
-+            fprintf(stderr, "[pw] failed to create tcp thread\n");
-+            exit(1);
-+        }
-+        tcpThreadStarted = true;
-     }
+-    }
 -
 -    ret = pthread_create(&udpWorkerRC, NULL, udpRCThread, NULL);
 -    if (ret != 0) {
@@ -641,7 +648,7 @@
      for (uint8_t servoIndex = 0; servoIndex < MAX_SUPPORTED_SERVOS; servoIndex++) {
          servos[servoIndex].enabled = true;
      }
-@@ -545,23 +309,14 @@
+@@ -545,23 +318,14 @@
  static bool pwmEnableMotors(void)
  {
      motorPwmDevice.enabled = true;
@@ -666,7 +673,7 @@
  }
  
  static void pwmWriteMotorInt(uint8_t index, uint16_t value)
-@@ -581,32 +336,13 @@
+@@ -581,32 +345,13 @@
  
  static void pwmCompleteMotorUpdate(void)
  {
@@ -702,7 +709,7 @@
      }
  }
  
-@@ -631,65 +367,81 @@
+@@ -631,65 +376,81 @@
      UNUSED(motorConfig);
      UNUSED(useUnsyncedPwm);
  
@@ -801,7 +808,7 @@
          }
      }
  }
-@@ -702,16 +454,15 @@
+@@ -702,16 +463,15 @@
          fwrite(eepromData, 1, sizeof(eepromData), eepromFd);
          fclose(eepromFd);
          eepromFd = NULL;
@@ -820,7 +827,7 @@
      return FLASH_COMPLETE;
  }
  
-@@ -719,34 +470,31 @@
+@@ -719,34 +479,31 @@
  {
      if ((addr >= (uintptr_t)eepromData) && (addr < (uintptr_t)ARRAYEND(eepromData))) {
          *((uint32_t*)addr) = value;
@@ -859,7 +866,7 @@
  }
  
  void IOHi(IO_t io)
-@@ -758,3 +506,20 @@
+@@ -758,3 +515,20 @@
  {
      UNUSED(io);
  }

@@ -35,6 +35,14 @@ namespace SimITL{
     printf("[pw] initializing betaflight\n");
     BF::setEepromFileName((const char *)stateInit.eepromName);
     BF::init();
+
+    // The canonical firmware state: captured once, right here, before any
+    // simulated time has passed. Every reset rewinds to this instead of
+    // trusting BF::init() to clear the firmware's statics — it doesn't
+    // (scheduler stats, IMU quaternion, PID state, gyro calibration, RX
+    // latches, OSD timers all survive an in-process re-init, which made
+    // every reset start from a slightly different state).
+    BF::takeStateSnapshot();
   }
 
   void Sim::reinitPhysics(const StateInit& stateInit){
@@ -53,6 +61,14 @@ namespace SimITL{
 
   void Sim::reset(const StateInit& stateInit){
     total_delta = 0;              // drop any sub-tick residue
+    // Rewind the firmware statics to the post-first-boot snapshot BEFORE
+    // re-running init: init() alone leaves dozens of statics carrying the
+    // previous session's history (calibration progress, scheduler stats,
+    // IMU/PID state, RC latches), so how much time had passed before the
+    // reset used to leak into the trajectory after it. The restore makes
+    // reset ≡ fresh process by construction; init() then re-reads the
+    // eeprom, so CLI-saved settings still survive.
+    BF::restoreStateSnapshot();
     mPhysics.initState(stateInit);  // also reseeds the noise RNG
     mPhysics.reset();             // integrator/filter/phase state
     // resetRcData AFTER init, not before. Betaflight latches switch state

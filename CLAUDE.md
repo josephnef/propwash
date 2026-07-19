@@ -17,7 +17,7 @@ No external dependencies (kernel `js` API, not SDL2). One pinned submodule.
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo && cmake --build build -j
-ctest --test-dir build            # 14 headless tests (+ gym_hover if uv-synced); ~2 min
+ctest --test-dir build            # 18 headless tests (+ gym_hover if uv-synced); ~2.5 min
 ```
 
 The Betaflight submodule builds as a static lib (`extern/`). Source list is
@@ -44,6 +44,8 @@ if the firmware version changes.
 | `client_collision` | client detection: hull vs analytic ground + engine-query gate tubes, slop depenetration, Godot→sim manifold conversion |
 | `gym_hover` | the Python Gymnasium env spawns a real core, arms + hovers, and passes the env-checker (step-determinism sub-check xfail'd — see below) |
 | `sysid_selfcheck` | physics-only motor replay (`PW_MOTOR_IN`) is bit-reproducible across cores; the fitter recovers a hidden physics parameter from a synthetic reference |
+| `reset_determinism` | one core, the identical input tape twice around `PW_CMD_RESET` → byte-identical streams (fails on any stray rand()/clock in the sim path, or anything leaking through the snapshot reset) |
+| `cross_process_determinism` | two fresh cores, identical inputs (one send-jittered) → byte-identical output — the headline claim, gated |
 
 `godot_client`/`flythrough` only run if a `godot` binary is found (see
 `find_program(GODOT_BIN ...)` in `CMakeLists.txt`). `gym_hover` only runs if a
@@ -143,6 +145,18 @@ cause spurious failures; kill strays before running
 - **The damage/contact path must not call `randf()`** — one extra draw shifts
   the whole noise stream and every trajectory after it. Wind gusts use
   SimplexNoise (a pure function of sim time + seed) for the same reason.
+- **`BF::init()` does not clear the firmware's statics** — scheduler task
+  stats, IMU quaternion, PID state, gyro calibration progress, RX latches and
+  OSD timers all survive an in-process re-init (142 residue ranges measured).
+  That is why `Sim::reset` rewinds the process's writable static sections to
+  a snapshot taken right after the first boot (`core/sim/static_snapshot.h`)
+  before calling `init()`. Exclusions (dyad's live connection state, the held
+  dyad mutex, the snapshot's own bookkeeping) must be registered BEFORE the
+  snapshot is taken; dyad's globals live in one exported struct
+  (`pw_dyad_state`, patches/dyad-globals-struct.diff) for exactly this.
+  Debugging a determinism regression: the failing check prints the first
+  divergent frame + field; `PROPWASH_DUMP_STATE` + `state_diff.py` bisect
+  any residue to exact symbols.
 - **Betaflight source uses `#pragma GCC poison sprintf snprintf`** unless
   `SIMULATOR_BUILD` is defined; keep that define on the BF lib.
 

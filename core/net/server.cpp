@@ -2,8 +2,26 @@
 #include <chrono>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
+
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <mach-o/ldsyms.h>
+#include <mach/vm_prot.h>
+#elif defined(__linux__)
+// linker section boundaries — file scope + C linkage, or the references
+// mangle to namespace-qualified symbols and fail to link (see
+// static_snapshot.cpp for the same trap)
+extern "C" {
+extern char __data_start[];
+extern char _edata[];
+extern char __bss_start[];
+extern char _end[];
+}
+#endif
 
 #if defined(_WIN32)
 #include <winsock2.h>
@@ -123,6 +141,92 @@ void Server::sendTo(const void* payload, uint16_t len, uint8_t type)
     sendto(mFd, (const char*)buf, sizeof(hdr) + len, 0, (sockaddr*)&dst, sizeof(dst));
 }
 
+/* Debug tooling for the reset-residue hunt (PROPWASH_DUMP_STATE=<path>):
+ * write every writable static section of the process to a file right after
+ * the first-contact reset. Firmware state in SITL is just process memory, so
+ * two runs that behave differently can be diffed byte-for-byte and the
+ * offsets resolved to symbols with `nm` — no theorizing.
+ *
+ * Format: per section, a text line "SECT <seg> <sect> <unslid-vmaddr> <size>"
+ * followed by <size> raw bytes. Unslid addresses are recorded so offsets map
+ * onto `nm` output regardless of ASLR (tools/tester/state_diff.py consumes
+ * this; pointer-valued bytes differ per process via ASLR and self-filter as
+ * within-class-unstable there). */
+static void dumpStaticState(const char* path)
+{
+#if defined(__APPLE__)
+    FILE* f = fopen(path, "wb");
+    if (!f) { perror("[pw][dump] fopen"); return; }
+
+    const struct mach_header_64* mh = &_mh_execute_header;
+    intptr_t slide = 0;
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        if (_dyld_get_image_header(i) == (const struct mach_header*)mh) {
+            slide = _dyld_get_image_vmaddr_slide(i);
+            break;
+        }
+    }
+
+    const struct load_command* lc = (const struct load_command*)(mh + 1);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64* seg =
+                (const struct segment_command_64*)lc;
+            if ((seg->initprot & VM_PROT_WRITE)
+                && strncmp(seg->segname, "__DATA", 6) == 0) {
+                const struct section_64* sec = (const struct section_64*)(seg + 1);
+                for (uint32_t s = 0; s < seg->nsects; s++, sec++) {
+                    // pure pointer-fixup sections are ASLR noise by definition
+                    if (strncmp(sec->sectname, "__got", 5) == 0
+                        || strncmp(sec->sectname, "__la_symbol", 11) == 0
+                        || strncmp(sec->sectname, "__thread", 8) == 0) {
+                        continue;
+                    }
+                    fprintf(f, "SECT %.16s %.16s 0x%llx %llu\n",
+                            seg->segname, sec->sectname,
+                            (unsigned long long)sec->addr,
+                            (unsigned long long)sec->size);
+                    fwrite((const void*)((uintptr_t)sec->addr + slide), 1,
+                           (size_t)sec->size, f);
+                }
+            }
+        }
+        lc = (const struct load_command*)((const uint8_t*)lc + lc->cmdsize);
+    }
+    fclose(f);
+    printf("[pw][dump] static state -> %s\n", path);
+#elif defined(__linux__)
+    FILE* f = fopen(path, "wb");
+    if (!f) { perror("[pw][dump] fopen"); return; }
+    // NOTE: addresses are the RUNTIME ones; with a PIE binary, symbolizing
+    // requires subtracting the load base by hand. The macOS path (primary
+    // dev machine) records unslid addresses.
+    fprintf(f, "SECT __DATA __data %p %zu\n", (void*)__data_start,
+            (size_t)(_edata - __data_start));
+    fwrite(__data_start, 1, (size_t)(_edata - __data_start), f);
+    fprintf(f, "SECT __DATA __bss %p %zu\n", (void*)__bss_start,
+            (size_t)(_end - __bss_start));
+    fwrite(__bss_start, 1, (size_t)(_end - __bss_start), f);
+    fclose(f);
+    printf("[pw][dump] static state -> %s\n", path);
+#else
+    (void)path;
+    printf("[pw][dump] not supported on this platform\n");
+#endif
+}
+
+/* First-contact diagnostics: idle-tick count (the boot-window variable that
+ * decides the calibration-progress "coin") and the optional state dump. */
+static void firstContactDiagnostics(uint64_t idleTicks)
+{
+    printf("[pw][net] first contact after %llu idle ticks\n",
+           (unsigned long long)idleTicks);
+    const char* dumpPath = getenv("PROPWASH_DUMP_STATE");
+    if (dumpPath && dumpPath[0]) {
+        dumpStaticState(dumpPath);
+    }
+}
+
 /* Wall-clock milliseconds. Used ONLY to decide whether a client is still
  * driving the sim — never to advance simulated time. */
 static uint64_t nowMillis()
@@ -183,6 +287,7 @@ void Server::run(SimITL::Sim& sim, const StateInit& defaultInit, Joystick* js)
     // advances only on PW_STATE_IN. PW_CMD_REALTIME switches to free-running.
     bool lockstep = true;
     uint64_t lastStateInMs = 0;
+    uint64_t idleTicks = 0;
     float rcOverride[8] = {0, 0, -1, 0, -1, -1, -1, -1};
     uint64_t stateInCount = 0;
 
@@ -234,6 +339,7 @@ void Server::run(SimITL::Sim& sim, const StateInit& defaultInit, Joystick* js)
                 input.contact = 0;
                 input.contactCount = 0;
                 sim.update(input);
+                idleTicks++;
             }
             continue;
         }
@@ -301,6 +407,7 @@ void Server::run(SimITL::Sim& sim, const StateInit& defaultInit, Joystick* js)
                 // them from the eeprom, so anything applied and saved over the
                 // CLI survives.
                 sim.reset(initState);
+                firstContactDiagnostics(idleTicks);
             }
 
             boot();
@@ -404,7 +511,10 @@ void Server::run(SimITL::Sim& sim, const StateInit& defaultInit, Joystick* js)
 
             lastStateInMs = nowMillis();
             stateInCount++;
-            if (stateInCount == 1) sim.reset(initState);
+            if (stateInCount == 1) {
+                sim.reset(initState);
+                firstContactDiagnostics(idleTicks);
+            }
             boot();
 
             input.delta = p.dt;
