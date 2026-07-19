@@ -51,6 +51,7 @@ typedef enum {
     PW_OSD           = 5, /* core -> client : PwOsd (throttled)            */
     PW_RC_OVERRIDE   = 6, /* any peer -> core : PwRcOverride               */
     PW_COMMAND       = 7, /* client -> core : PwCommand                    */
+    PW_MOTOR_IN      = 8, /* client -> core : PwMotorIn (physics-only)     */
 } PwPacketType;
 
 typedef enum {
@@ -198,6 +199,27 @@ typedef struct {
      *        unreachable on the SITL target today (needs DSHOT). */
     uint8_t  crash_flags;
 } PwStateOut;
+
+/* Physics-only motor replay (the "--physics-only" path for blackbox system ID).
+ * Instead of the firmware computing motor outputs from RC, the client supplies
+ * the recorded per-motor ESC commands directly; the core skips the Betaflight
+ * scheduler and drives the physics tick with these motors. Comparing the sim's
+ * gyro/accel to a real blackbox log then isolates *physics-model* error from
+ * PID/firmware error. Pose + contact manifold are supplied exactly as in
+ * PwStateIn (the client still owns world position and collision detection).
+ * This packet is additive to protocol v2: a client that never sends it is
+ * unaffected. */
+typedef struct {
+    uint32_t frame_id;                /* echoed in PwStateOut             */
+    float    dt;                      /* seconds to advance (clamped 0.1) */
+    float    motor[PW_MOTOR_COUNT];   /* per-motor ESC command, 0..1      */
+
+    PwVec3   position;                /* world, m                         */
+    PwQuat   rotation;
+
+    uint8_t  contact_count;           /* 0..PW_MAX_CONTACTS               */
+    PwContact contacts[PW_MAX_CONTACTS];
+} PwMotorIn;
 
 typedef struct {
     uint8_t chars[PW_OSD_ROWS * PW_OSD_COLS];

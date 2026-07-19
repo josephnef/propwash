@@ -54,7 +54,7 @@ normal sim can't do:
 └─────────┼  state + damage out ─────────────── ┼────────────┘
           │                                     │
    Godot 4 client / Quest 3 (planned) /   Betaflight Configurator
-   Python gym / bbreplay (planned)             (MSP / CLI)
+   Python gym / blackbox replay + sysid        (MSP / CLI)
 ```
 
 - **In-process, not networked SITL.** The core links Betaflight's C internals
@@ -91,6 +91,7 @@ two lockstep scheduler patches and the OSD/CLI plumbing.
 | `client-godot/` | MIT | Godot 4 frontend: FPV cinewhoop, OSD overlay, joystick/keyboard |
 | `python/propwash_gym/` | MIT | Gymnasium env (RL): `uv`-managed, subprocess-per-env, `frame_id` lockstep |
 | `tools/tester/` | GPL-3.0 | Headless tests: boot/MSP identity, hover, determinism, OSD, real-tune |
+| `tools/sysid/` | GPL-3.0 | Blackbox replay + system ID: fit the physics to a real log (RC & physics-only replay) |
 | `tools/bfcli/` | MIT-ish | CLI-over-TCP: apply the pilot's `diff all`, bake eeprom, calibrate joystick |
 | `config/` | — | The real `cinelog35v3.diff` + SITL overrides |
 | `docs/` | — | Architecture, licensing, screenshots |
@@ -241,6 +242,28 @@ The env task is a hover (arm → hold altitude, level and still). Action is
 [README](python/propwash_gym/README.md) for the spaces, reward and the
 determinism caveat.
 
+## Matching the real quad (blackbox system ID)
+
+[`tools/sysid/`](tools/sysid/) replays a Betaflight blackbox log through the sim
+and fits the physics model to it, so the sim flies like *your* CineLog35 — the
+step that certifies it for sim-vs-real work. Two replay modes:
+
+- **RC replay** drives the firmware with the log's stick inputs (firmware +
+  physics, end-to-end).
+- **Physics-only replay** (`PW_MOTOR_IN`) feeds the log's recorded motor outputs
+  straight into the physics, bypassing the firmware — isolating physics-model
+  error from PID error, and **bit-reproducible across cores** (the firmware
+  residual state that limits closed-loop determinism is out of the loop).
+
+A derivative-free fitter then adjusts `PW_INIT` physics parameters to minimise
+the gyro+accel error against the log. `PW_INIT` re-parameterises physics on a
+live core, so a fit evaluates hundreds of candidates against one process.
+
+Until the real quad has flown (it's pre-first-hover), the pipeline is validated
+on synthetic references: replay is bit-exact, and the fitter recovers a known
+parameter it was hidden from. A real log drops in through
+`bblog.import_betaflight_csv` with no code changes.
+
 ## Status
 
 Working: in-process Betaflight 4.5.2, deterministic lockstep, physics + stable
@@ -248,17 +271,19 @@ hover, real collision physics (solid world, contact forces the firmware feels,
 per-motor crash damage, repair/reset flow, wind + gusts, ground effect), UDP
 protocol, Godot FPV client with the real OSD and a cinewhoop model,
 CLI/Configurator data path, real-tune loading, joystick calibration, autonomous
-gate fly-through, and a **[Gymnasium environment](python/propwash_gym/)** (RL,
-`uv`-managed, subprocess-per-env, `frame_id` lockstep). **15 headless self-tests**
+gate fly-through, a **[Gymnasium environment](python/propwash_gym/)** (RL,
+`uv`-managed, subprocess-per-env, `frame_id` lockstep), and a
+**[blackbox replay + system-ID pipeline](tools/sysid/)** (RC & physics-only
+replay, physics-parameter fitting over `PW_INIT`). **16 headless self-tests**
 cover boot/MSP identity, hover, contact settling (level *and* inverted), the
 crash→repair lifecycle, damage over the wire, OSD render, real-tune hover, the
 Godot client's detection, repair flow and gate fly-through (now with clearance
-asserts against solid gates), and the gym env-checker + hover with the real core
-in the loop.
+asserts against solid gates), the gym env-checker + hover, and physics-only
+replay reproducibility + parameter recovery — all with the real core in the loop.
 
-Planned: blackbox replay (sim-vs-real system ID), Quest 3 / OpenXR build.
-Bit-reproducibility across resets (the last gap for a fully deterministic gym)
-lands with the M5 system-ID work.
+Planned: Quest 3 / OpenXR build. Physics-only replay is already bit-reproducible
+across cores; extending that to the closed loop (the last gap for a fully
+deterministic gym across resets) tracks the firmware residual-state work.
 
 ## Prior art & credits
 

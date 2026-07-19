@@ -43,6 +43,7 @@ if the firmware version changes.
 | `fpv_cull` | FPV cull mask + prop→motor index map — invariants a rewrite has already silently dropped once |
 | `client_collision` | client detection: hull vs analytic ground + engine-query gate tubes, slop depenetration, Godot→sim manifold conversion |
 | `gym_hover` | the Python Gymnasium env spawns a real core, arms + hovers, and passes the env-checker (step-determinism sub-check xfail'd — see below) |
+| `sysid_selfcheck` | physics-only motor replay (`PW_MOTOR_IN`) is bit-reproducible across cores; the fitter recovers a hidden physics parameter from a synthetic reference |
 
 `godot_client`/`flythrough` only run if a `godot` binary is found (see
 `find_program(GODOT_BIN ...)` in `CMakeLists.txt`). `gym_hover` only runs if a
@@ -80,8 +81,17 @@ cause spurious failures; kill strays before running
   MIT copy of the wire codec (`protocol.py`) rather than importing the GPL
   `tools/tester/pw_udp.py`. `reset()` drives arming (gyro-cal warm-up → ARM);
   defaults `gyro_noise=0`. **Known gap:** the sim is not bit-reproducible across
-  `reset()`s (same reason `determinism_check` is unwired), so Gymnasium's
-  step-determinism check is an xfail — the M5 system-ID work closes it.
+  `reset()`s in the closed loop (same reason `determinism_check` is unwired), so
+  Gymnasium's step-determinism check is an xfail.
+- **`tools/sysid/`** — blackbox replay + system ID (stdlib Python). Reuses
+  `tools/tester/pw_udp.py` and adds `PW_INIT` + `PW_MOTOR_IN` codecs (`wire.py`).
+  Two replay modes: RC (`PW_STATE_IN`, firmware in the loop) and physics-only
+  (`PW_MOTOR_IN`, firmware bypassed — the core sets `motorsState[i].pwm`
+  directly and skips `BF::update`). The fitter (`sysid.hooke_jeeves`) injects
+  candidate physics via `PW_INIT` (→ `reinitPhysics` on a live core, no
+  respawn) and minimises gyro+accel RMSE. Physics-only replay is bit-exact
+  across cores — the firmware residual state that limits closed-loop determinism
+  is out of the loop, which is why the gym's is xfail'd but this is gated tight.
 
 ## Non-obvious things that will bite you (learned the hard way)
 

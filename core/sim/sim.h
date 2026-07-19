@@ -41,6 +41,14 @@ namespace SimITL{
        */
       void update(const StateInput& stateInput);
 
+      /**
+       * Physics-only advance: drive the physics tick with externally supplied
+       * per-motor commands (0..1) instead of the firmware's motor outputs. The
+       * Betaflight scheduler is NOT run — this replays recorded motor outputs
+       * through the physics model alone (blackbox system ID, PW_MOTOR_IN).
+       */
+      void updateMotors(const StateInput& stateInput, const float motor[4]);
+
       const StateOutput& getStateUpdate() const;
       const SimState& getSimState() const { return mSimState; }
 

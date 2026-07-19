@@ -397,6 +397,78 @@ void Server::run(SimITL::Sim& sim, const StateInit& defaultInit, Joystick* js)
             break;
         }
 
+        case PW_MOTOR_IN: {
+            if (hdr.payload_len < sizeof(PwMotorIn)) break;
+            PwMotorIn p;
+            memcpy(&p, payload, sizeof(p));
+
+            lastStateInMs = nowMillis();
+            stateInCount++;
+            if (stateInCount == 1) sim.reset(initState);
+            boot();
+
+            input.delta = p.dt;
+            // No RC: the firmware is bypassed. Sticks stay safe/neutral so that
+            // if anything does read rcData it sees a disarmed idle.
+            static const float safeRc[8] = {0, 0, -1, 0, -1, -1, -1, -1};
+            memcpy(input.rcData, safeRc, sizeof(input.rcData));
+
+            input.position = { p.position.x, p.position.y, p.position.z };
+            quat q { p.rotation.x, p.rotation.y, p.rotation.z, p.rotation.w };
+            mat3 basis = quat_to_mat3(q);
+            copy(input.rotation, basis);
+            input.angularVelocity = { 0, 0, 0 };
+            input.linearVelocity  = { 0, 0, 0 };
+            input.gyroBaseNoiseAmp = 0.0f;   // deterministic replay by default
+            for (int i = 0; i < 4; i++) {
+                input.propDamage[i]   = 0.0f;
+                input.groundEffect[i] = 0.0f;
+            }
+            input.vbat = 16.8f;              // full 4S; physics models the sag
+            input.contact = p.contact_count ? 1 : 0;
+            input.contactCount = p.contact_count > PW_MAX_CONTACTS
+                ? PW_MAX_CONTACTS : p.contact_count;
+            for (int i = 0; i < input.contactCount; i++) {
+                input.contacts[i].pointBody   = { p.contacts[i].point_body.x,
+                                                  p.contacts[i].point_body.y,
+                                                  p.contacts[i].point_body.z };
+                input.contacts[i].normalWorld = { p.contacts[i].normal_world.x,
+                                                  p.contacts[i].normal_world.y,
+                                                  p.contacts[i].normal_world.z };
+                input.contacts[i].depth   = p.contacts[i].depth;
+                input.contacts[i].surface = p.contacts[i].surface;
+            }
+
+            float motor[4] = { p.motor[0], p.motor[1], p.motor[2], p.motor[3] };
+            sim.updateMotors(input, motor);
+
+            const SimState& st = sim.getSimState();
+            const StateOutput& out = sim.getStateUpdate();
+
+            PwStateOut o {};
+            o.frame_id = p.frame_id;
+            o.sim_time_us = st.microsPassed;
+            o.orientation = { out.orientation.w, out.orientation.x, out.orientation.y, out.orientation.z };
+            o.angular_velocity = { out.angularVelocity.x, out.angularVelocity.y, out.angularVelocity.z };
+            o.linear_velocity  = { out.linearVelocity.x, out.linearVelocity.y, out.linearVelocity.z };
+            o.position = p.position; // client-owned; echoed
+            o.acceleration = { st.acceleration[0], st.acceleration[1], st.acceleration[2] };
+            for (int i = 0; i < 4; i++) {
+                o.motor_rpm[i] = out.motorRpm[i];
+                o.motor_status[i] = (uint8_t)out.motorStatus[i];
+            }
+            o.armed = 0;                 // firmware bypassed
+            o.arming_disable_flags = 0;
+            o.flight_mode_flags = 0;
+            o.beeper = 0;
+            o.vbat = st.batteryState.batVoltageSag;
+            o.amperage = (float)st.batteryState.amperage;
+            for (int i = 0; i < 4; i++) o.prop_damage[i] = out.propDamage[i];
+            o.crash_flags = out.crashFlags;
+            sendTo(&o, sizeof(o), PW_STATE_OUT);
+            break;
+        }
+
         case PW_RC_OVERRIDE: {
             if (hdr.payload_len < sizeof(PwRcOverride)) break;
             PwRcOverride p;
