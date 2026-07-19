@@ -58,6 +58,12 @@ add_test(NAME udp_e2e
   COMMAND bash ${CMAKE_SOURCE_DIR}/tools/tester/run_e2e.sh $<TARGET_FILE:propwash-core>)
 set_tests_properties(udp_e2e PROPERTIES TIMEOUT 120)
 
+# Codec parity (issue #22): the gym's standalone MIT wire codec and the GPL
+# tools/tester codec must agree on the v2 format. Pure comparison, no core.
+add_test(NAME codec_parity
+  COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/tester/codec_parity_check.py)
+set_tests_properties(codec_parity PROPERTIES TIMEOUT 30)
+
 # NOTE: neither determinism check is wired as a ctest yet — both are red for
 # the same underlying reason (Betaflight statics that BF::init() does not
 # clear on an in-process re-init) and wiring in a red test trains people to
