@@ -40,6 +40,17 @@ add_test(NAME udp_e2e
   COMMAND bash ${CMAKE_SOURCE_DIR}/tools/tester/run_e2e.sh $<TARGET_FILE:propwash-core>)
 set_tests_properties(udp_e2e PROPERTIES TIMEOUT 120)
 
+# NOTE: tools/tester/determinism_check.py is deliberately NOT wired in as a
+# ctest yet. It measures the real property — two fresh cores, identical inputs,
+# byte-identical output — and the sim does not yet satisfy it: suppressing the
+# idle tick removed the dominant source, but residual firmware state that
+# BF::init() does not clear still varies between sessions. Run it by hand:
+#
+#   python3 tools/tester/determinism_check.py ./build/propwash-core
+#
+# It will be made a gating test once it passes reliably. Wiring it in while it
+# is red would either block every unrelated change or train people to ignore it.
+
 # CLI/Configurator data path: apply the pilot's diff over TCP 5761, save,
 # reboot in-process, verify the tune survives (the M3 core deliverable).
 add_test(NAME diff_roundtrip

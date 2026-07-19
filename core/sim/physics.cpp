@@ -12,9 +12,21 @@ namespace SimITL{
 
   const auto AIR_RHO = 1.225f;
 
+  /* xorshift32 over sim-owned state. Replaces libc rand(), which was never
+   * seeded (so it happened to repeat across processes) but is process-global
+   * and un-resettable — RESET could not restore it, and any unrelated rand()
+   * caller would shift every subsequent draw. Determinism is the project's
+   * headline claim, so the noise source has to belong to the sim. */
+  inline uint32_t nextRand(uint32_t& s){
+    s ^= s << 13;
+    s ^= s >> 17;
+    s ^= s << 5;
+    return s;
+  }
+
   // -1.0 , 1.0
-  inline float randf(){
-    return (static_cast<float>(rand()) / static_cast <float> (RAND_MAX)) * 2.0f - 1.0f;
+  inline float randf(uint32_t& s){
+    return (static_cast<float>(nextRand(s)) / static_cast<float>(0xFFFFFFFFu)) * 2.0f - 1.0f;
   }
 
   inline float rpmToHz(float rpm){
@@ -41,6 +53,11 @@ namespace SimITL{
   void Physics::initState(const StateInit& state){
     //copy data
     memcpy( (void *)&(mSimState->stateInit), (const void *)(&state), sizeof(StateInit) );
+
+    // Reseed the noise RNG. Without this a reset restored the physics but not
+    // the noise stream, so a "reset" run diverged from a fresh one.
+    mSimState->rngState = mSimState->stateInit.seed ? mSimState->stateInit.seed
+                                                    : 0x9E3779B9u;
 
     // is calculated now
     mSimState->batteryState.batVoltage = 0.1f;
@@ -238,7 +255,7 @@ namespace SimITL{
                  (mSimState->stateInit.maxVoltageSag * chargeFactorInv * chargeFactorInv * powerFactor2); // charge state dependency
 
     // actual vbat - sag - fuluctuations
-    mSimState->batteryState.batVoltageSag = mSimState->batteryState.batVoltage - vSag - std::abs(randf() * 0.01f);
+    mSimState->batteryState.batVoltageSag = mSimState->batteryState.batVoltage - vSag - std::abs(randf(mSimState->rngState) * 0.01f);
     mSimState->batteryState.batVoltageSag = clamp(mSimState->batteryState.batVoltageSag, 0.0f, 100.0f);
     
     float currentSum = 0.0f;
@@ -249,7 +266,7 @@ namespace SimITL{
     double currentmAs = currentSum / 3.6f;
 
     // minimum consumption + random fluctuation clamped to max 1mA/s to account for running electronics
-    const double mAMin = std::min(0.2, (0.5 + randf() * 0.25) / std::max(mSimState->batteryState.batVoltageSag, 0.01f));
+    const double mAMin = std::min(0.2, (0.5 + randf(mSimState->rngState) * 0.25) / std::max(mSimState->batteryState.batVoltageSag, 0.01f));
     currentmAs = std::max(currentmAs, mAMin );
 
 
@@ -299,9 +316,9 @@ namespace SimITL{
 
   void Physics::updateGyroNoise(const StateInput& state, vec3& angularNoise){
     // white noise
-    float whiteNoiseX = randf() * state.gyroBaseNoiseAmp;
-    float whiteNoiseY = randf() * state.gyroBaseNoiseAmp;
-    float whiteNoiseZ = randf() * state.gyroBaseNoiseAmp;
+    float whiteNoiseX = randf(mSimState->rngState) * state.gyroBaseNoiseAmp;
+    float whiteNoiseY = randf(mSimState->rngState) * state.gyroBaseNoiseAmp;
+    float whiteNoiseZ = randf(mSimState->rngState) * state.gyroBaseNoiseAmp;
 
     angularNoise[0] = whiteNoiseX;
     angularNoise[1] = whiteNoiseY;
@@ -363,8 +380,8 @@ namespace SimITL{
     }
 
     // frame noise 
-    mSimState->frameHarmonicPhase1 = shiftedPhase(dt, state.frameHarmonic1Freq + randf() * 70.0f, mSimState->frameHarmonicPhase1);
-    mSimState->frameHarmonicPhase2 = shiftedPhase(dt, state.frameHarmonic2Freq + randf() * 60.0f, mSimState->frameHarmonicPhase2);
+    mSimState->frameHarmonicPhase1 = shiftedPhase(dt, state.frameHarmonic1Freq + randf(mSimState->rngState) * 70.0f, mSimState->frameHarmonicPhase1);
+    mSimState->frameHarmonicPhase2 = shiftedPhase(dt, state.frameHarmonic2Freq + randf(mSimState->rngState) * 60.0f, mSimState->frameHarmonicPhase2);
 
     vec4 rpmFactorHDec  = minimum(maximum(motorRpm, 0.0f) / (maxRpm * 0.15f), 1.0f);
     float rpmFactorH = sum(rpmFactorHDec) * 0.25f;
@@ -665,9 +682,38 @@ namespace SimITL{
     }
   }
 
+  /* Clears the integrator state that initState() does not touch. Without this,
+   * a "reset" run kept motor phases, filter histories and harmonic phases from
+   * the previous flight and so diverged from a freshly started process — which
+   * is the whole point of a reset. */
   void Physics::reset(){
     mSimState->acceleration = {0.0f, 0.0f, 0.0f};
     mSimState->stateInput.linearVelocity = {0.0f, 0.0f, 0.0f};
     mSimState->stateInput.angularVelocity = {0.0f, 0.0f, 0.0f};
+
+    mSimState->gyro = {0.0f, 0.0f, 0.0f};
+    mSimState->acc = {0.0f, 0.0f, 0.0f};
+    mSimState->gyroNoise = {0.0f, 0.0f, 0.0f};
+    mSimState->motorNoise = {0.0f, 0.0f, 0.0f};
+    mSimState->combinedNoise = {0.0f, 0.0f, 0.0f};
+    mSimState->frameHarmonicPhase1 = 0.0f;
+    mSimState->frameHarmonicPhase2 = 0.0f;
+
+    for (auto i = 0u; i < 3; i++) {
+      mSimState->gyroLowPassFilter[i] = LowPassFilter{};
+    }
+    for (auto i = 0u; i < 4; i++) {
+      auto& m = mSimState->motorsState[i];
+      m.pwm = 0.0f;
+      m.rpm = 0.0f;
+      m.current = 0.0f;
+      m.thrust = 0.0f;
+      m.phase = 0.0f;
+      m.phaseHarmonic1 = 0.0f;
+      m.phaseHarmonic2 = 0.0f;
+      m.phaseSlow = 0.0f;
+      m.pwmLowPassFilter = LowPassFilter{};
+      m.propWashLowPassFilter = LowPassFilter{};
+    }
   }
 }

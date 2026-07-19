@@ -22,7 +22,17 @@ per tick:  physics.updateGyro(dt)        # gyro/accel + noise -> BF virtual sens
 
 No wall clock reaches the firmware (`extern/betaflightext/.../pw_sitl.c`
 routes `micros()/millis()/delay()` to the counter). Identical inputs =>
-identical trajectories: `pw-tester` asserts equal state hashes across runs.
+identical trajectories, verified through the UDP protocol by the
+`determinism_udp` test: two fresh cores fed the same input sequence produce
+byte-identical output, including when one has sends delayed past the core's
+recv timeout. `pw-tester` additionally prints a `STATE_HASH` for the in-process
+path.
+
+This holds only in lockstep mode (the default), where simulated time advances
+solely on `PW_STATE_IN`. `PW_CMD_REALTIME` lets the core self-tick on the wall
+clock and forfeits reproducibility. Note also that traffic on TCP 5761
+(Configurator/MSP) is delivered by a wall-clock-driven thread, so a determinism
+run must have nothing attached to it.
 
 ### Two subtle scheduler facts (hard-won, do not regress)
 

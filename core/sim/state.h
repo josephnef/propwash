@@ -131,6 +131,12 @@ namespace SimITL{
 
     // time passed in micro seconds
     uint64_t microsPassed = 0;
+
+    /* Noise RNG state. Deliberately owned by the sim rather than libc: rand()
+     * is process-global, cannot be reset, and is shared with any other caller,
+     * so a single extra draw anywhere shifts the whole stream and every
+     * subsequent trajectory with it. Seeded from PwInit.seed. */
+    uint32_t rngState = 0x9E3779B9u;
   };
 
 } // SIMITL_STATE_H

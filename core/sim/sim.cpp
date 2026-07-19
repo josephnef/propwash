@@ -41,6 +41,26 @@ namespace SimITL{
     mPhysics.initState(stateInit);
   }
 
+  /* Everything a fresh process would have. BF::init() is the same entry point
+   * pw_sitl.c's systemReset() calls, and systemInit() guards the dyad thread
+   * spawn and zeroes pw_micros_passed, so re-running it in-process is safe —
+   * this is the path the CLI `save` reboot already exercises. */
+  void Sim::resetPhysicsOnly(const StateInit& stateInit){
+    total_delta = 0;
+    mPhysics.initState(stateInit);
+    mPhysics.reset();
+  }
+
+  void Sim::reset(const StateInit& stateInit){
+    total_delta = 0;              // drop any sub-tick residue
+    mPhysics.initState(stateInit);  // also reseeds the noise RNG
+    mPhysics.reset();             // integrator/filter/phase state
+    BF::resetRcData();
+    BF::init();
+    BF::configureDefaultModes();
+    BF::disableRunawayTakeoff();
+  }
+
   void Sim::update(const StateInput& stateInput){
     if(!mPhysics.checkSimState()){
       return; // no SimState, no sim!

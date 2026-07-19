@@ -29,6 +29,10 @@ namespace SimITL{
        */
       void initState(const StateInit& state);
 
+      /* Clears integrator/filter/phase state that initState leaves alone.
+       * Public so Sim::reset can compose a genuine full reset. */
+      void reset();
+
       /**
        * \brief executes commands.
        * \param[in] commands The commands to execute.
@@ -80,7 +84,6 @@ namespace SimITL{
                             float motorsTorque);
 
       void repair();
-      void reset();
 
       SimState* mSimState = nullptr;
 
