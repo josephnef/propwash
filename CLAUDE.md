@@ -17,7 +17,7 @@ No external dependencies (kernel `js` API, not SDL2). One pinned submodule.
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo && cmake --build build -j
-ctest --test-dir build            # 18 headless tests (+ gym_hover if uv-synced); ~2.5 min
+ctest --test-dir build            # 19 headless tests (+ gym_hover if uv-synced); ~2.5 min
 ```
 
 The Betaflight submodule builds as a static lib (`extern/`). Source list is
@@ -44,6 +44,7 @@ if the firmware version changes.
 | `client_collision` | client detection: hull vs analytic ground + engine-query gate tubes, slop depenetration, Godot→sim manifold conversion |
 | `gym_hover` | the Python Gymnasium env spawns a real core, arms + hovers, and passes the env-checker (step-determinism sub-check xfail'd — see below) |
 | `sysid_selfcheck` | physics-only motor replay (`PW_MOTOR_IN`) is bit-reproducible across cores; the fitter recovers a hidden physics parameter from a synthetic reference |
+| `dshot_device` | virtual DSHOT ESC (`PROPWASH_DSHOT=1`): boot grace clears, arms + hovers on dshot600, SPIN_DIRECTION commands through the stock command queue land in `pw_motor_dir` |
 | `reset_determinism` | one core, the identical input tape twice around `PW_CMD_RESET` → byte-identical streams (fails on any stray rand()/clock in the sim path, or anything leaking through the snapshot reset) |
 | `cross_process_determinism` | two fresh cores, identical inputs (one send-jittered) → byte-identical output — the headline claim, gated |
 
@@ -100,9 +101,18 @@ cause spurious failures; kill strays before running
 - **Tick rate must exceed the PID rate.** At exactly 8 kHz, RX/MSP never run
   (scheduler only services them between gyro boundaries) → `rcData` frozen, no
   arming. 20 kHz fixes it.
-- **DSHOT blocks arming in SITL.** `ARMING_DISABLED_BOOT_GRACE_TIME` never
-  clears because DSHOT streaming commands aren't available on the fake motor
-  device. `targetPreInit()` forces `motor_pwm_protocol = PWM` every boot.
+- **DSHOT needed a virtual ESC AND a virtual-time fix.** Stock SITL never
+  compiles the dshot stack (`common_pre.h` gates `USE_DSHOT` on `!SITL`); the
+  ext `target.h` wrapper re-enables it and `pw_sitl.c` provides the virtual
+  ESC (`dshotPwmDevInit`: throttle 48–2047 → the same `pw_motors_pwm` sink,
+  SPIN_DIRECTION commands → `pw_motor_dir[]`; hardware `dshot_dpwm.c`
+  excluded, ARM-only headers shadowed in `simstubs/`). Separately,
+  `motorEnable()` runs during `init()` at virtual `millis()==0` and
+  `dshotStreamingCommandsAreEnabled()` reads a zero enable-stamp as "never" —
+  so `ARMING_DISABLED_BOOT_GRACE_TIME` would never clear; `BF::update`
+  re-stamps it on the first tick. `targetPreInit()` still forces
+  `motor_pwm_protocol = PWM` by default; `PROPWASH_DSHOT=1` keeps the dump's
+  protocol (dshot600) instead.
 - **`cli.c` `pgFind()` null-guard is `#ifdef DEBUG`.** SITL undefs features
   (OSD/VTX) whose settings stay in the value table → `diff`/`dump`/`save`
   segfault. The vendored `cli.c` makes the guard unconditional.

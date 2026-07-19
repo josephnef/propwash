@@ -71,6 +71,18 @@ namespace SimITL{
      * \return False when no snapshot exists (unsupported platform).
      */
     bool restoreStateSnapshot();
+
+    /**
+     * \brief Queue a spin-direction command for all motors through the
+     * stock dshot command queue (streaming type) — the crashflip path.
+     */
+    void sendSpinDirectionCommand(bool reversed);
+
+    /**
+     * \brief Per-motor spin direction as last commanded over the virtual
+     * DSHOT ESC: +1 normal, -1 reversed (0 = bad index).
+     */
+    int motorSpinDirection(int index);
   }
 }
 

@@ -1,5 +1,5 @@
 --- extern/betaflight/src/main/target/SITL/sitl.c	2026-07-17 21:28:36
-+++ extern/betaflightext/src/main/target/SITL/pw_sitl.c	2026-07-19 20:41:22
++++ extern/betaflightext/src/main/target/SITL/pw_sitl.c	2026-07-19 21:38:27
 @@ -1,21 +1,20 @@
  /*
 - * This file is part of Cleanflight and Betaflight.
@@ -226,7 +226,11 @@
 -    t2 = t2 > 1.0 ? 1.0 : t2;
 -    t2 = t2 < -1.0 ? -1.0 : t2;
 -    yf = asin(t2) * RAD2DEG; // from wiki
--
++int32_t clockCyclesTo100thMicros(int32_t clockCycles)
++{
++    return clockCycles;
++}
+ 
 -    // yaw (z-axis rotation)
 -    double t3 = +2.0 * (qw * qz + qx * qy);
 -    double t4 = +1.0 - 2.0 * (ysqr + qz * qz);
@@ -236,13 +240,23 @@
 -    imuSetAttitudeQuat(pkt->imu_orientation_quat[0], pkt->imu_orientation_quat[1], pkt->imu_orientation_quat[2], pkt->imu_orientation_quat[3]);
 -#endif
 -#endif
--
++uint32_t clockMicrosToCycles(uint32_t micros)
++{
++    return micros;
++}
+ 
 -#if defined(SIMULATOR_IMU_SYNC)
 -    imuSetHasNewData(deltaSim*1e6);
 -    imuUpdateAttitude(micros());
 -#endif
--
--
++/* ------------------------------------------------------------------ */
++/* system                                                               */
++/* ------------------------------------------------------------------ */
+ 
++static pthread_t tcpWorker;
++static bool workerRunning = true;
++static bool tcpThreadStarted = false;
+ 
 -    if (deltaSim < 0.02 && deltaSim > 0) { // simulator should run faster than 50Hz
 -//        simRate = simRate * 0.5 + (1e6 * deltaSim / (realtime_now - last_realtime)) * 0.5;
 -        struct timespec out_ts;
@@ -262,19 +276,19 @@
 -#if defined(SIMULATOR_GYROPID_SYNC)
 -    pthread_mutex_unlock(&mainLoopLock); // can run main loop
 -#endif
-+int32_t clockCyclesTo100thMicros(int32_t clockCycles)
++int targetParseArgs(int argc, char *argv[])
 +{
-+    return clockCycles;
++    (void)argc;
++    (void)argv;
++    return 0;
  }
  
 -static void* udpThread(void* data)
-+uint32_t clockMicrosToCycles(uint32_t micros)
++int lockMainPID(void)
  {
 -    UNUSED(data);
 -    int n = 0;
-+    return micros;
-+}
- 
+-
 -    while (workerRunning) {
 -        n = udpRecv(&stateLink, &fdmPkt, sizeof(fdm_packet), 100);
 -        if (n == sizeof(fdm_packet)) {
@@ -285,39 +299,17 @@
 -            updateState(&fdmPkt);
 -        }
 -    }
-+/* ------------------------------------------------------------------ */
-+/* system                                                               */
-+/* ------------------------------------------------------------------ */
- 
+-
 -    printf("udpThread end!!\n");
 -    return NULL;
--}
-+static pthread_t tcpWorker;
-+static bool workerRunning = true;
-+static bool tcpThreadStarted = false;
++    return 0;
+ }
  
 -static float readRCSITL(const rxRuntimeState_t *rxRuntimeState, uint8_t channel)
-+int targetParseArgs(int argc, char *argv[])
- {
+-{
 -    UNUSED(rxRuntimeState);
 -    return rcPkt.channels[channel];
-+    (void)argc;
-+    (void)argv;
-+    return 0;
- }
- 
--static uint8_t rxRCFrameStatus(rxRuntimeState_t *rxRuntimeState)
-+int lockMainPID(void)
- {
--    UNUSED(rxRuntimeState);
--    return RX_FRAME_COMPLETE;
-+    return 0;
- }
- 
--static void *udpRCThread(void *data)
--{
--    UNUSED(data);
--    int n = 0;
+-}
 +// propwash: dyad is single-threaded by design, but this worker owns the dyad
 +// event pump while the Betaflight scheduler (the sim thread) also calls dyad
 +// from serial_tcp.c — dyad_listen() at serial init and dyad_write() on every
@@ -328,6 +320,23 @@
 +// takes it via pw_dyad_lock/unlock below.
 +static pthread_mutex_t pwDyadMutex = PTHREAD_MUTEX_INITIALIZER;
  
+-static uint8_t rxRCFrameStatus(rxRuntimeState_t *rxRuntimeState)
+-{
+-    UNUSED(rxRuntimeState);
+-    return RX_FRAME_COMPLETE;
+-}
++void pw_dyad_lock(void)   { pthread_mutex_lock(&pwDyadMutex); }
++void pw_dyad_unlock(void) { pthread_mutex_unlock(&pwDyadMutex); }
+ 
+-static void *udpRCThread(void *data)
++/* propwash: the deterministic-reset snapshot must not restore this mutex —
++ * the restore runs while HOLDING it, and rewinding a held mutex to its
++ * boot (unlocked) bytes corrupts it for the unlock that follows. */
++void pw_dyad_mutex_range(void **addr, unsigned long *size)
+ {
+-    UNUSED(data);
+-    int n = 0;
+-
 -    while (workerRunning) {
 -        n = udpRecv(&rcLink, &rcPkt, sizeof(rc_packet), 100);
 -        if (n == sizeof(rc_packet)) {
@@ -335,9 +344,7 @@
 -                printf("[SITL] new rc %d: t:%f AETR: %d %d %d %d AUX1-4: %d %d %d %d\n", n, rcPkt.timestamp,
 -                    rcPkt.channels[0], rcPkt.channels[1],rcPkt.channels[2],rcPkt.channels[3],
 -                    rcPkt.channels[4], rcPkt.channels[5],rcPkt.channels[6],rcPkt.channels[7]);
-+void pw_dyad_lock(void)   { pthread_mutex_lock(&pwDyadMutex); }
-+void pw_dyad_unlock(void) { pthread_mutex_unlock(&pwDyadMutex); }
- 
+-
 -                rxRuntimeState.channelCount = SIMULATOR_MAX_RC_CHANNELS;
 -                rxRuntimeState.rcReadRawFn = readRCSITL;
 -                rxRuntimeState.rcFrameStatusFn = rxRCFrameStatus;
@@ -350,11 +357,6 @@
 -
 -    printf("udpRCThread end!!\n");
 -    return NULL;
-+/* propwash: the deterministic-reset snapshot must not restore this mutex —
-+ * the restore runs while HOLDING it, and rewinding a held mutex to its
-+ * boot (unlocked) bytes corrupts it for the unlock that follows. */
-+void pw_dyad_mutex_range(void **addr, unsigned long *size)
-+{
 +    *addr = &pwDyadMutex;
 +    *size = sizeof(pwDyadMutex);
  }
@@ -398,23 +400,12 @@
 -    printf("[system]Init...\n");
  
 -    SystemCoreClock = 500 * 1e6; // virtual 500MHz
--
--    if (pthread_mutex_init(&updateLock, NULL) != 0) {
--        printf("Create updateLock error!\n");
--        exit(1);
--    }
--
--    if (pthread_mutex_init(&mainLoopLock, NULL) != 0) {
--        printf("Create mainLoopLock error!\n");
--        exit(1);
--    }
 +    SystemCoreClock = 500 * 1000000; /* virtual 500 MHz */
 +    pw_micros_passed = 0;
 +    pw_sleep_timer = 0;
  
--    ret = pthread_create(&tcpWorker, NULL, tcpThread, NULL);
--    if (ret != 0) {
--        printf("Create tcpWorker error!\n");
+-    if (pthread_mutex_init(&updateLock, NULL) != 0) {
+-        printf("Create updateLock error!\n");
 -        exit(1);
 +    if (!tcpThreadStarted) {
 +        int ret = pthread_create(&tcpWorker, NULL, tcpThread, NULL);
@@ -424,6 +415,17 @@
 +        }
 +        tcpThreadStarted = true;
      }
+-
+-    if (pthread_mutex_init(&mainLoopLock, NULL) != 0) {
+-        printf("Create mainLoopLock error!\n");
+-        exit(1);
+-    }
+-
+-    ret = pthread_create(&tcpWorker, NULL, tcpThread, NULL);
+-    if (ret != 0) {
+-        printf("Create tcpWorker error!\n");
+-        exit(1);
+-    }
 -
 -    ret = udpInit(&pwmLink, simulator_ip, PORT_PWM, false);
 -    printf("[SITL] init PwmOut UDP link to gazebo %s:%d...%d\n", simulator_ip, PORT_PWM, ret);
@@ -512,14 +514,18 @@
 -    struct timespec ts;
 -    clock_gettime(CLOCK_MONOTONIC, &ts);
 -    return 1.0e3*((ts.tv_sec + (ts.tv_nsec*1.0e-9)) - (start_time.tv_sec + (start_time.tv_nsec*1.0e-9)));
--}
--
++    fprintf(stderr, "[pw][failure LED] %d\n", mode);
+ }
+ 
 -uint64_t micros64(void)
 -{
 -    static uint64_t last = 0;
 -    static uint64_t out = 0;
 -    uint64_t now = nanos64_real();
--
++/* ------------------------------------------------------------------ */
++/* PWM / motors                                                         */
++/* ------------------------------------------------------------------ */
+ 
 -    out += (now - last) * simRate;
 -    last = now;
 -
@@ -599,9 +605,8 @@
 -    while ((millis64() - start) < ms) {
 -        microsleep(1000);
 -    }
-+    fprintf(stderr, "[pw][failure LED] %d\n", mode);
- }
- 
+-}
+-
 -// Subtract the ‘struct timespec’ values X and Y,  storing the result in RESULT.
 -// Return 1 if the difference is negative, otherwise 0.
 -// result = x - y
@@ -616,10 +621,7 @@
 -        ns_carry += 1000000000 * nsec;
 -        s_carry += nsec;
 -    }
-+/* ------------------------------------------------------------------ */
-+/* PWM / motors                                                         */
-+/* ------------------------------------------------------------------ */
- 
+-
 -    // Compute the time remaining to wait. tv_usec is certainly positive.
 -    result->tv_sec = x->tv_sec - y->tv_sec - s_carry;
 -    result->tv_nsec = x->tv_nsec - y->tv_nsec + ns_carry;
@@ -648,7 +650,16 @@
      for (uint8_t servoIndex = 0; servoIndex < MAX_SUPPORTED_SERVOS; servoIndex++) {
          servos[servoIndex].enabled = true;
      }
-@@ -545,23 +318,14 @@
+@@ -527,6 +300,8 @@
+     return motors;
+ }
+ 
++bool pwmIsMotorEnabled(uint8_t index);
++
+ static float pwmConvertFromExternal(uint16_t externalValue)
+ {
+     return (float)externalValue;
+@@ -545,23 +320,14 @@
  static bool pwmEnableMotors(void)
  {
      motorPwmDevice.enabled = true;
@@ -673,7 +684,7 @@
  }
  
  static void pwmWriteMotorInt(uint8_t index, uint16_t value)
-@@ -581,32 +345,13 @@
+@@ -581,32 +347,13 @@
  
  static void pwmCompleteMotorUpdate(void)
  {
@@ -709,7 +720,7 @@
      }
  }
  
-@@ -631,65 +376,81 @@
+@@ -631,65 +378,218 @@
      UNUSED(motorConfig);
      UNUSED(useUnsyncedPwm);
  
@@ -731,6 +742,143 @@
  }
  
 -// ADC part
++#ifdef USE_DSHOT
++/* ------------------------------------------------------------------ */
++/* virtual DSHOT ESC                                                    */
++/*                                                                      */
++/* Replaces drivers/dshot_dpwm.c (hardware DMA device, excluded from    */
++/* bf_sources.txt): with a DSHOT protocol selected, motorDevInit routes */
++/* here. Throttle (48..2047) maps onto the same pw_motors_pwm sink the  */
++/* PWM device fills; DSHOT commands arrive through the stock            */
++/* dshot_command.c queue exactly as on hardware, and the only ones a    */
++/* virtual ESC acts on are the spin-direction pair (crashflip).         */
++/* ------------------------------------------------------------------ */
++
++#include "drivers/dshot.h"
++#include "drivers/dshot_command.h"
++#include "drivers/dshot_dpwm.h"
++#include "drivers/pwm_output_dshot_shared.h"
++
++/* per-motor spin direction as commanded over virtual DSHOT: +1 normal,
++ * -1 reversed. Read by the physics glue (reversed-thrust model). */
++int8_t pw_motor_dir[MAX_SUPPORTED_MOTORS] = {1, 1, 1, 1, 1, 1, 1, 1};
++
++/* dshot_command.c's allMotorsAreIdle() inspects the last written packet
++ * through this hardware-shaped struct; only protocolControl.value matters
++ * on a virtual ESC. */
++static motorDmaOutput_t pwDshotDma[MAX_SUPPORTED_MOTORS];
++
++/* referenced by the vendored cli.c (`dshot telemetry_info`); no DMA IRQs
++ * exist on a virtual ESC, so the counters stay zero */
++dshotDMAHandlerCycleCounters_t dshotDMAHandlerCycleCounters;
++
++motorDmaOutput_t *getMotorDmaOutput(uint8_t index)
++{
++    return &pwDshotDma[index];
++}
++
++static motorDevice_t dshotDevice; // forward
++
++static bool pwDshotEnable(void)
++{
++    dshotDevice.enabled = true;
++    return true;
++}
++
++static void pwDshotDisable(void)
++{
++    dshotDevice.enabled = false;
++}
++
++static void pwDshotWriteInt(uint8_t index, uint16_t value)
++{
++    if (index >= MAX_SUPPORTED_MOTORS) {
++        return;
++    }
++    /* the same substitution the hardware write path performs: while the
++     * command queue is ACTIVE, the throttle slot carries the command */
++    if (dshotCommandIsProcessing()) {
++        value = dshotCommandGetCurrent(index);
++        switch (value) {
++        case DSHOT_CMD_SPIN_DIRECTION_1:
++        case DSHOT_CMD_SPIN_DIRECTION_NORMAL:
++            pw_motor_dir[index] = 1;
++            break;
++        case DSHOT_CMD_SPIN_DIRECTION_2:
++        case DSHOT_CMD_SPIN_DIRECTION_REVERSED:
++            pw_motor_dir[index] = -1;
++            break;
++        default:
++            break; /* beeper/led/save: nothing to do on a virtual ESC */
++        }
++    }
++    pwDshotDma[index].protocolControl.value = value;
++
++    /* throttle band 48..2047 -> the same 0..1000 sink the PWM device
++     * fills; command/stop values (< 48) mean "no thrust" */
++    pw_motors_pwm[index] = value >= DSHOT_MIN_THROTTLE
++        ? (int16_t)(((int32_t)(value - DSHOT_MIN_THROTTLE) * 1000) / DSHOT_RANGE)
++        : 0;
++}
++
++static void pwDshotWrite(uint8_t index, float value)
++{
++    pwDshotWriteInt(index, (uint16_t)value);
++}
++
++static void pwDshotUpdateComplete(void)
++{
++    /* the hardware pattern (pwmCompleteDshotMotorUpdate): advance the
++     * command queue's delay/repeat state machine once per output cycle */
++    if (!dshotCommandQueueEmpty()) {
++        if (!dshotCommandOutputIsEnabled(dshotDevice.count)) {
++            return;
++        }
++    }
++}
++
++static void pwDshotShutdown(void)
++{
++    dshotDevice.enabled = false;
++}
++
++static motorDevice_t dshotDevice = {
++    .vTable = {
++        .postInit = motorPostInitNull,
++        .convertExternalToMotor = dshotConvertFromExternal,
++        .convertMotorToExternal = dshotConvertToExternal,
++        .enable = pwDshotEnable,
++        .disable = pwDshotDisable,
++        .isMotorEnabled = pwmIsMotorEnabled,
++        .decodeTelemetry = motorDecodeTelemetryNull,
++        .write = pwDshotWrite,
++        .writeInt = pwDshotWriteInt,
++        .updateComplete = pwDshotUpdateComplete,
++        .shutdown = pwDshotShutdown,
++    }
++};
++
++motorDevice_t *dshotPwmDevInit(const motorDevConfig_t *motorConfig, uint16_t _idlePulse, uint8_t motorCount, bool useUnsyncedPwm)
++{
++    UNUSED(motorConfig);
++    UNUSED(_idlePulse);
++    UNUSED(useUnsyncedPwm);
++
++    printf("[pw] virtual DSHOT ESC: %d motors\n", motorCount);
++
++    for (int i = 0; i < MAX_SUPPORTED_MOTORS && i < motorCount; i++) {
++        motors[i].enabled = true;
++        pw_motor_dir[i] = 1;
++        pwDshotDma[i].protocolControl.value = 0;
++    }
++    dshotDevice.count = motorCount;
++    dshotDevice.initialized = true;
++    dshotDevice.enabled = false;
++
++    return &dshotDevice;
++}
++#endif /* USE_DSHOT */
++
 +/* ------------------------------------------------------------------ */
 +/* ADC                                                                  */
 +/* ------------------------------------------------------------------ */
@@ -808,7 +956,7 @@
          }
      }
  }
-@@ -702,16 +463,15 @@
+@@ -702,16 +602,15 @@
          fwrite(eepromData, 1, sizeof(eepromData), eepromFd);
          fclose(eepromFd);
          eepromFd = NULL;
@@ -827,7 +975,7 @@
      return FLASH_COMPLETE;
  }
  
-@@ -719,34 +479,31 @@
+@@ -719,34 +618,31 @@
  {
      if ((addr >= (uintptr_t)eepromData) && (addr < (uintptr_t)ARRAYEND(eepromData))) {
          *((uint32_t*)addr) = value;
@@ -866,7 +1014,7 @@
  }
  
  void IOHi(IO_t io)
-@@ -758,3 +515,20 @@
+@@ -758,3 +654,31 @@
  {
      UNUSED(io);
  }
@@ -883,6 +1031,17 @@
 + */
 +void targetPreInit(void)
 +{
++    const char *dshotEnv = getenv("PROPWASH_DSHOT");
++    if (dshotEnv && dshotEnv[0] == '1') {
++        /* virtual DSHOT ESC: keep the configured protocol (the real quad's
++         * dump says dshot600). The boot-grace clearing needs a nonzero
++         * motor-enable timestamp; motorEnable() runs during init() at
++         * virtual millis()==0 and dshotStreamingCommandsAreEnabled() reads
++         * a zero stamp as "never enabled" — the glue re-stamps it on the
++         * first simulated tick (see BF::update). */
++        printf("[pw] targetPreInit: virtual DSHOT enabled (PROPWASH_DSHOT=1)\n");
++        return;
++    }
 +    motorConfigMutable()->dev.motorPwmProtocol = PWM_TYPE_STANDARD;
 +    motorConfigMutable()->dev.useUnsyncedPwm = true;
 +    printf("[pw] targetPreInit: forced motor protocol PWM (SITL override)\n");
