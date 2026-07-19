@@ -64,7 +64,8 @@ set_tests_properties(real_tune_hover PROPERTIES TIMEOUT 90)
 
 # Godot client autotest (runs only if a godot 4 binary is available).
 # PROPWASH_AUTOTEST=1 arms + hovers via the real GDScript client, headless.
-find_program(GODOT_BIN NAMES godot godot4 Godot_v4.3-stable_linux.x86_64
+find_program(GODOT_BIN NAMES godot godot4
+  Godot_v4.7.1-stable_linux.x86_64 Godot_v4.3-stable_linux.x86_64
   PATHS /tmp)
 if(GODOT_BIN)
   add_test(NAME godot_client
@@ -72,6 +73,13 @@ if(GODOT_BIN)
   set_tests_properties(godot_client PROPERTIES
     TIMEOUT 120
     ENVIRONMENT "PROPWASH_AUTOTEST=1;PROPWASH_CORE=$<TARGET_FILE:propwash-core>")
+
+  # Quality-tier selection rule. Pure function, no rendering, no sim — the
+  # cases that matter (240 Hz -> low) cannot be produced on a 60 Hz dev machine.
+  add_test(NAME quality_tiers
+    COMMAND ${GODOT_BIN} --headless --path ${CMAKE_SOURCE_DIR}/client-godot
+            --script res://tests/quality_test.gd)
+  set_tests_properties(quality_tiers PROPERTIES TIMEOUT 60)
 
   # Autonomous gate fly-through (angle mode): arms, cruises forward through
   # all three gates holding altitude, asserts it flew past the last gate.

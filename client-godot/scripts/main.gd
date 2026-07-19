@@ -105,6 +105,76 @@ const TICK_ENV := "PROPWASH_TICK"
 const TICK_MIN := 100   # the long-tested baseline; never go below it
 const TICK_MAX := 240   # don't melt a CPU on an exotic 360/500 Hz panel
 
+# Quality tiers. Auto-selected from the monitor's frame budget so a high-refresh
+# setup keeps its framerate and a 60 Hz one gets the pretty version.
+#   PROPWASH_QUALITY=low|medium|high|auto   (default auto)
+const PwQuality = preload("res://scripts/quality.gd")
+const QUALITY_ENV := "PROPWASH_QUALITY"
+# opt-in only; the default is always native resolution
+const SCALE_ENV := "PROPWASH_SCALE"
+var _tier := "medium"
+var _q := {}
+# A real RenderingDevice is the only reliable signal that Forward+ effects will
+# actually run: ProjectSettings still reports "forward_plus" even after
+# fallback_to_opengl3 has quietly dropped us onto the Compatibility renderer.
+var _has_rd := true
+
+# Lockstep watchdog. Heavy art threatening framerate is not just a smoothness
+# problem here: _physics_process blocks waiting on the core, and Godot will run
+# up to max_physics_steps_per_frame of those per rendered frame, so a GPU-bound
+# scene can starve the lockstep and change flight behaviour. If render rate
+# falls far below the tick rate for a sustained period, give the tick rate back.
+const WATCHDOG_RATIO := 0.6
+const WATCHDOG_GRACE := 3.0    # seconds below threshold before acting
+var _wd_low_for := 0.0
+var _wd_fps := 60.0
+
+# DJI O3 goggle-feed treatment (shaders/goggle.gdshader). Set PROPWASH_GOGGLE=off
+# to see the raw render. Effects that are basically free run at every tier — the
+# feed treatment IS the look, so it must not silently disappear on a fast panel.
+const GOGGLE_ENV := "PROPWASH_GOGGLE"
+var _goggle: TextureRect
+var _goggle_mat: ShaderMaterial
+var _block_env := 0.0        # codec stress envelope: fast attack, slow decay
+var _feed_time := 0.0
+
+# Auto-exposure, done analytically rather than with CameraAttributesPractical.
+# That is Forward+-only (so it vanishes under the fallback) and, more to the
+# point, WELL damped — whereas DJI's AE is characteristically under-damped: it
+# overshoots and settles, and that hunt is the recognisable behaviour. Measuring
+# real luminance would mean get_image() every frame, a GPU->CPU stall that would
+# wreck the high-refresh path, so this is computed from sky fraction and sun
+# alignment, both of which are known exactly.
+# Range is deliberately narrow. DJI's AE is good: it keeps the image properly
+# exposed and only hunts a little when the framing swings between ground and
+# sky. A wide range reads as a broken camera, which is what a first attempt at
+# 1.1*sky_frac produced -- it stopped down hard every time the horizon dropped
+# and turned the whole scene navy.
+const AE_OMEGA := 5.0
+const AE_ZETA := 0.55        # under 1.0 -> slight overshoot, then settles
+const AE_BASE := 1.35        # matches the static tonemap_exposure from Stage 1
+const AE_SKY := 0.22         # how much a sky-filled frame stops down
+const AE_SUN := 0.55         # extra stop-down looking near the sun
+var _ae := AE_BASE
+var _ae_vel := 0.0
+var _env: Environment
+var _sun: DirectionalLight3D
+var _cam: Camera3D
+
+# The screen we actually ended up on. Re-reading Window.current_screen after the
+# fullscreen transition reports the primary again on macOS, so both the tick
+# rate and the quality tier read this instead of asking twice.
+var _active_screen := 0
+
+# The 3D world renders into this SubViewport rather than straight to the screen,
+# and the goggle pass samples its texture directly. The reason is measured: a
+# canvas shader using hint_screen_texture forces a full-screen backbuffer copy
+# every frame, and at 4.1 MP that copy cost ~41 fps of a 212 fps frame -- a
+# one-tap passthrough shader measured identically to the full goggle shader,
+# which is what proved the cost was the copy and not the maths.
+var _subvp: SubViewport
+var _world: Node3D          # everything 3D parents here, not to self
+
 
 func _ready() -> void:
 	_autotest = OS.get_environment("PROPWASH_AUTOTEST") == "1"
@@ -115,6 +185,7 @@ func _ready() -> void:
 		_shot_times = [4.0, 7.0, 9.0, 11.0, 13.0, 15.0, 17.0, 19.0]
 	_parse_js_env()
 	_setup_display()
+	_resolve_quality()   # before _build_world: tree count is baked at build time
 	_build_world()
 	_spawn_core()
 	_udp.connect_to_host("127.0.0.1", CORE_PORT)
@@ -123,6 +194,109 @@ func _ready() -> void:
 func _exit_tree() -> void:
 	if _core_pid > 0:
 		OS.kill(_core_pid)
+
+
+func _resolve_quality() -> void:
+	var headless := DisplayServer.get_name() == "headless" or _autotest
+	_has_rd = RenderingServer.get_rendering_device() != null
+	var refresh := 0.0
+	var pixels := 0.0
+	if not headless:
+		refresh = DisplayServer.screen_get_refresh_rate(_active_screen)
+		var sz := DisplayServer.screen_get_size(_active_screen)
+		pixels = float(sz.x) * float(sz.y)
+	_tier = PwQuality.resolve(OS.get_environment(QUALITY_ENV), refresh, pixels, headless)
+	# Compatibility renderer is the floor, not a separate tier: the Forward+-only
+	# effects above medium would silently do nothing there.
+	if not _has_rd and _tier == "high":
+		_tier = "medium"
+	_q = PwQuality.TIERS[_tier]
+	if headless:
+		return   # nothing to configure; the dummy driver renders nothing
+	_apply_quality()
+	print("[pw][gfx] tier=%s renderer=%s %.0fHz %.1fMP=%.0fMP/s scale3d=%.2f msaa=%d" % [
+			_tier, "forward+" if _has_rd else "compatibility", refresh,
+			pixels / 1_000_000.0, pixels * refresh / 1_000_000.0,
+			get_viewport().scaling_3d_scale, _q.msaa])
+
+
+func _apply_quality() -> void:
+	var vp := get_viewport()
+	# Live per-Viewport properties.
+	vp.msaa_3d = _q.msaa
+	vp.screen_space_aa = Viewport.SCREEN_SPACE_AA_DISABLED
+	vp.use_debanding = true
+	# Native resolution. Rendering the 3D below panel resolution and upscaling is
+	# not an acceptable default here: the OSD and HUD stay native on their own
+	# layer, so the world looks soft next to crisp text, and on a display someone
+	# chose deliberately that is the wrong trade to make silently. Frames get
+	# found by cutting scene cost, not by cutting pixels.
+	# PROPWASH_SCALE is an explicit escape hatch for a GPU that cannot cope.
+	var scale: float = _q.scale_3d
+	var pin := OS.get_environment(SCALE_ENV)
+	if pin.is_valid_float():
+		scale = clampf(pin.to_float(), 0.5, 1.0)
+	vp.scaling_3d_mode = Viewport.SCALING_3D_MODE_FSR   # only used if scale < 1
+	vp.scaling_3d_scale = scale
+
+	# These are read once at boot, so ProjectSettings.set_setting() at runtime is
+	# a no-op -- they have to go through RenderingServer. This is the trap that
+	# makes naive preset systems appear to work while doing nothing.
+	RenderingServer.directional_shadow_atlas_set_size(_q.shadow_atlas, true)
+	RenderingServer.directional_soft_shadow_filter_set_quality(_q.shadow_filter)
+
+
+# Applied after the sun/environment exist, from _build_sky_and_sun.
+func _apply_quality_to_env(e: Environment, sun: DirectionalLight3D) -> void:
+	sun.light_angular_distance = _q.sun_angular
+	sun.directional_shadow_mode = _q.shadow_splits
+	sun.directional_shadow_blend_splits = _q.shadow_blend
+	sun.directional_shadow_max_distance = _q.shadow_max_dist
+
+	e.glow_enabled = _q.glow
+	if _q.glow:
+		e.glow_intensity = 0.5
+		e.glow_strength = 1.0
+		e.glow_bloom = 0.05
+		e.glow_blend_mode = Environment.GLOW_BLEND_MODE_SOFTLIGHT
+		e.glow_hdr_threshold = 1.0
+
+	# Forward+ only -- gated on a real RenderingDevice, not on the project
+	# setting, which still claims forward_plus after the OpenGL3 fallback.
+	e.ssao_enabled = _q.ssao and _has_rd
+	if e.ssao_enabled:
+		e.ssao_radius = 0.6        # small: this geometry is cm-scale
+		e.ssao_intensity = 1.5
+		e.ssao_power = 1.5
+	e.ssil_enabled = _q.ssil and _has_rd
+	e.volumetric_fog_enabled = _q.volfog and _has_rd
+	if e.volumetric_fog_enabled:
+		e.volumetric_fog_density = 0.008
+		e.volumetric_fog_albedo = Color(0.80, 0.85, 0.90)
+		e.volumetric_fog_anisotropy = 0.4   # forward scatter -> sun shafts
+		e.volumetric_fog_length = 128.0
+		# default temporal reprojection is tuned for slow cameras; on a quad at
+		# 30 m/s and 800 deg/s it smears trails behind the fog volume
+		e.volumetric_fog_temporal_reprojection_enabled = false
+
+
+# Give the tick rate back if the GPU can't keep up -- see WATCHDOG_RATIO.
+func _watchdog(delta: float) -> void:
+	if _autotest or DisplayServer.get_name() == "headless":
+		return
+	_wd_fps = lerpf(_wd_fps, 1.0 / maxf(delta, 0.0001), 0.05)
+	var tick := Engine.physics_ticks_per_second
+	if tick <= TICK_MIN or _wd_fps >= float(tick) * WATCHDOG_RATIO:
+		_wd_low_for = 0.0
+		return
+	_wd_low_for += delta
+	if _wd_low_for < WATCHDOG_GRACE:
+		return
+	_wd_low_for = 0.0
+	var next: int = maxi(TICK_MIN, int(tick * 0.75))
+	Engine.physics_ticks_per_second = next
+	print("[pw][gfx] %.0f fps under a %d Hz lockstep — dropping to %d Hz to keep"
+			% [_wd_fps, tick, next] + " the sim in step")
 
 
 func _setup_display() -> void:
@@ -143,7 +317,8 @@ func _setup_display() -> void:
 				screen, DisplayServer.get_screen_count(),
 				DisplayServer.screen_get_size(screen)])
 	# whichever screen we ended up on, windowed or not
-	_match_tick_rate(win.current_screen)
+	_active_screen = screen if screen >= 0 else win.current_screen
+	_match_tick_rate(_active_screen)
 
 
 # Screen to go fullscreen on, or -1 to stay windowed where we are.
@@ -208,6 +383,11 @@ func _spawn_core() -> void:
 		args += ["--no-js"]
 	_core_pid = OS.create_process(path, args)
 	print("propwash-core pid ", _core_pid)
+
+
+func _process(delta: float) -> void:
+	_watchdog(delta)
+	_update_goggle(delta)
 
 
 func _physics_process(delta: float) -> void:
@@ -661,59 +841,527 @@ func _build_drone_model(root: Node3D) -> void:
 
 
 # ------------------------------------------------------------------ world
+const GATE_COLOR := Color(0.85, 0.30, 0.06)
+const GROUND_SIZE := 1000.0   # the flythrough asserts z < -30; the old 60x60
+                              # plane ended exactly there, so the test passed by
+                              # flying off the last polygon
+const WORLD_SEED := 0x9E3779B9   # fixed: the world must be identical every run
+
+# Materials are shared per colour. _add_box used to allocate a fresh BoxMesh AND
+# StandardMaterial3D on every call -- 71 unique pairs for what is really two
+# distinct looks.
+var _mat_cache := {}
+
+
+func _shared_material(color: Color, rough: float, metal: float) -> StandardMaterial3D:
+	var key := "%s|%.2f|%.2f" % [color.to_html(), rough, metal]
+	if _mat_cache.has(key):
+		return _mat_cache[key]
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = color
+	mat.roughness = rough
+	mat.metallic = metal
+	_mat_cache[key] = mat
+	return mat
+
+
 func _add_box(pos: Vector3, size: Vector3, color: Color) -> void:
 	var mi := MeshInstance3D.new()
 	var mesh := BoxMesh.new()
 	mesh.size = size
-	var mat := StandardMaterial3D.new()
-	mat.albedo_color = color
-	mesh.material = mat
+	mesh.material = _shared_material(color, 0.55, 0.0)
 	mi.mesh = mesh
 	mi.position = pos
-	add_child(mi)
+	_world.add_child(mi)
 
 
-func _build_world() -> void:
-	# light + sky
+func _build_sky_and_sun() -> void:
+	# Sun lower than the old -55 deg: longer shadows read as shape, and a low sun
+	# is what an evening flying session actually looks like.
 	var sun := DirectionalLight3D.new()
-	sun.rotation_degrees = Vector3(-55, -30, 0)
+	sun.rotation_degrees = Vector3(-42, -35, 0)
+	sun.light_energy = 1.5
+	sun.light_color = Color(1.0, 0.97, 0.92)
 	sun.shadow_enabled = true
-	add_child(sun)
+	# shadow_bias defaults to 0.1 -- comparable to the whole 0.11 m airframe, so
+	# the quad had effectively no self-shadowing and peter-panned off the ground
+	sun.shadow_bias = 0.035
+	sun.shadow_normal_bias = 2.4
+	# the quad flies low and close, so bias the cascades hard toward the near field
+	sun.directional_shadow_split_1 = 0.05
+	sun.directional_shadow_split_2 = 0.15
+	sun.directional_shadow_split_3 = 0.40
+	sun.directional_shadow_fade_start = 0.9
+	_world.add_child(sun)
 
 	var env := WorldEnvironment.new()
 	var e := Environment.new()
+
 	var sky := Sky.new()
-	sky.sky_material = ProceduralSkyMaterial.new()
+	var psm := PhysicalSkyMaterial.new()   # real Rayleigh/Mie, sun disk matches the light
+	psm.rayleigh_coefficient = 2.0
+	psm.mie_coefficient = 0.005
+	psm.mie_eccentricity = 0.8
+	psm.turbidity = 10.0
+	psm.sun_disk_scale = 1.0
+	psm.ground_color = Color(0.22, 0.25, 0.18)
+	# the sky is the brightest thing in a daylit outdoor scene; at 1.0 against a
+	# sunlit field it rendered as dusk-navy with the field over-exposed
+	psm.energy_multiplier = 2.2
+	# The sun never moves in this scene, so the radiance map is static. AUTOMATIC
+	# keeps reprocessing it; QUALITY bakes it once and caches. Measured at ~15 fps
+	# of a 199 fps frame before this change.
+	sky.process_mode = Sky.PROCESS_MODE_QUALITY
+	sky.radiance_size = Sky.RADIANCE_SIZE_128
+	sky.sky_material = psm
 	e.background_mode = Environment.BG_SKY
 	e.sky = sky
-	env.environment = e
-	add_child(env)
 
-	# ground: 60x60 checkered
+	# sky-sourced ambient AND reflection: nearly free, and it is what stops every
+	# material reading as flat gouraud plastic
+	e.ambient_light_source = Environment.AMBIENT_SOURCE_SKY
+	e.ambient_light_sky_contribution = 1.0
+	e.reflected_light_source = Environment.REFLECTION_SOURCE_SKY
+
+	# Tonemapping is the single biggest item here. The default is LINEAR at
+	# exposure 1.0, which is why everything looked washed out. AgX rolls off
+	# highlights and desaturates near white much closer to what a small-sensor
+	# camera ISP does; ACES tends to crush and over-saturate greens, and this
+	# scene is mostly green.
+	e.tonemap_mode = Environment.TONE_MAPPER_AGX
+	e.tonemap_exposure = 1.35
+	e.tonemap_white = 6.0
+	e.adjustment_enabled = true
+	e.adjustment_contrast = 1.05
+	e.adjustment_saturation = 1.08
+
+	# aerial perspective: the biggest single "outdoor" cue, and it works on every
+	# renderer including the Compatibility fallback
+	e.fog_enabled = true
+	e.fog_mode = Environment.FOG_MODE_DEPTH
+	e.fog_light_color = Color(0.62, 0.70, 0.80)
+	e.fog_light_energy = 1.0
+	e.fog_sun_scatter = 0.2
+	e.fog_depth_begin = 40.0
+	e.fog_depth_end = 900.0
+	e.fog_depth_curve = 1.1
+	e.fog_aerial_perspective = 0.45   # tint by the sky cubemap
+	e.fog_sky_affect = 0.0           # PhysicalSky already has its own haze
+
+	_apply_quality_to_env(e, sun)   # tier-dependent: shadows, glow, ssao, ssil, volfog
+	env.environment = e
+	_world.add_child(env)
+	_env = e      # the exposure hunt drives tonemap_exposure each frame
+	_sun = sun
+
+
+func _build_ground() -> void:
 	var ground := MeshInstance3D.new()
 	var plane := PlaneMesh.new()
-	plane.size = Vector2(60, 60)
-	var gmat := StandardMaterial3D.new()
-	gmat.albedo_color = Color(0.25, 0.45, 0.2)
-	plane.material = gmat
+	plane.size = Vector2(GROUND_SIZE, GROUND_SIZE)
+	# NOTE: deliberately flat and un-displaced. _physics_process owns collision as
+	# a hard `_pos.y <= REST_H` test against y=0, so any visual relief would
+	# desync -- the drone would sink into hills and hover over valleys.
+	var smat := ShaderMaterial.new()
+	smat.shader = load("res://shaders/ground.gdshader")
+	plane.material = smat
 	ground.mesh = plane
-	add_child(ground)
+	_world.add_child(ground)
 
-	# grid lines for motion perception
-	for i in range(-30, 31, 2):
-		_add_box(Vector3(i, 0.01, 0), Vector3(0.03, 0.02, 60), Color(0.35, 0.55, 0.3))
-		_add_box(Vector3(0, 0.01, i), Vector3(60, 0.02, 0.03), Color(0.35, 0.55, 0.3))
 
-	# a few gates
+# A ring of low-poly conifers at 80-300 m in ONE draw call. No assets, and it is
+# the largest single cue that this is a place rather than a plane -- parallax
+# against distant objects is most of what sells outdoor flight.
+# A single cone and a single sphere read as exactly what they are. Real trees at
+# distance are irregular clustered foliage masses sitting on a visible trunk, and
+# the giveaway is silhouette variety, not polygon count. So: several distinct
+# meshes, each assembled from overlapping jittered blobs, scattered by its own
+# MultiMesh. Still only TREE_VARIANTS draw calls for the whole treeline.
+const TREE_VARIANTS := 6
+var _leaf_tex: ImageTexture
+const TRUNK_COLOR := Color(0.085, 0.062, 0.045)
+
+
+func _build_treeline() -> void:
+	_leaf_tex = _make_leaf_texture()   # one mask shared by every variant
+	var rng := RandomNumberGenerator.new()
+	rng.seed = WORLD_SEED
+	var per := int(_q.trees / float(TREE_VARIANTS))
+	for v in TREE_VARIANTS:
+		var conifer := v < 3
+		var mesh := _make_tree_mesh(rng, conifer)
+		var tint := Color(0.115, 0.165, 0.085) if conifer else Color(0.150, 0.195, 0.100)
+		_scatter_trees(mesh, per, 0.30 if conifer else 0.62, tint)
+
+
+# Procedural leaf mask, shared by every tree. Alpha is 0 wherever there is no
+# leaf, so the quad that carries it disappears and only leaf shapes render.
+# Generated rather than shipped: no binary asset, no licence question, no repo
+# weight — the whole reason this approach was chosen over sourcing models.
+const LEAF_TEX_SIZE := 192
+
+
+func _make_leaf_texture() -> ImageTexture:
+	var img := Image.create(LEAF_TEX_SIZE, LEAF_TEX_SIZE, true, Image.FORMAT_RGBA8)
+	var clump := FastNoiseLite.new()
+	clump.seed = WORLD_SEED
+	clump.noise_type = FastNoiseLite.TYPE_SIMPLEX
+	clump.frequency = 0.018
+	clump.fractal_octaves = 3
+	var detail := FastNoiseLite.new()
+	detail.seed = WORLD_SEED + 17
+	detail.noise_type = FastNoiseLite.TYPE_SIMPLEX
+	detail.frequency = 0.075
+
+	var half := LEAF_TEX_SIZE * 0.5
+	for y in LEAF_TEX_SIZE:
+		for x in LEAF_TEX_SIZE:
+			var u := (x - half) / half
+			var v := (y - half) / half
+			var r: float = sqrt(u * u + v * v)
+			var n := clump.get_noise_2d(x, y) * 0.5 + 0.5
+			var d := detail.get_noise_2d(x, y) * 0.5 + 0.5
+			# radial falloff keeps foliage off the card's rectangular edges, so
+			# the quad boundary never becomes visible
+			var mask := n * 0.72 + d * 0.28 - r * 0.62
+			if mask > 0.20:
+				var shade := 0.62 + d * 0.38          # per-leaf tonal break-up
+				img.set_pixel(x, y, Color(shade, shade, shade, 1.0))
+			else:
+				img.set_pixel(x, y, Color(0, 0, 0, 0))
+	img.generate_mipmaps()
+	return ImageTexture.create_from_image(img)
+
+
+# One tree: a tapered trunk plus a stack of alpha-cut foliage cards. Each card is
+# a flat quad; the leaf mask discards everything that is not a leaf, so the
+# silhouette comes out ragged and porous with sky visible through the gaps. That
+# porous outline is what actually reads as foliage — a solid blob never will,
+# regardless of how many blobs you overlap.
+func _make_tree_mesh(rng: RandomNumberGenerator, conifer: bool) -> ArrayMesh:
+	var foliage := SurfaceTool.new()
+	foliage.begin(Mesh.PRIMITIVE_TRIANGLES)
+
+	var card := PlaneMesh.new()
+	card.orientation = PlaneMesh.FACE_Z   # vertical quad
+	card.size = Vector2(1.0, 1.0)
+
+	# Alpha-tested foliage is overdraw-heavy — each card shades every fragment it
+	# covers whether or not the leaf mask keeps it, and the cards are two-sided.
+	# Card count is therefore the main foliage cost knob, tiered.
+	var base: int = _q.leaf_cards
+	var cards := rng.randi_range(base, base + 4)
+	for i in cards:
+		var t := float(i) / float(maxi(cards - 1, 1))   # 0 at base, 1 at tip
+		# conifers: cards shrink toward a point and droop. broadleaf: cards fill
+		# a rough ellipsoid crown.
+		var w: float
+		var y: float
+		var tilt: float
+		if conifer:
+			w = lerpf(1.15, 0.34, t) * rng.randf_range(0.9, 1.1)
+			y = lerpf(0.32, 1.02, t) + rng.randf_range(-0.04, 0.04)
+			tilt = rng.randf_range(0.06, 0.20)          # gentle branch droop
+		else:
+			w = rng.randf_range(0.72, 1.05)
+			y = rng.randf_range(0.46, 1.00)
+			tilt = rng.randf_range(-0.18, 0.18)
+		# Golden-angle yaw rather than random. Random leaves whole directions
+		# bare, and a card seen edge-on is a thin line -- several of those
+		# aligning is what produced the diagonal streaks and the false "every
+		# tree leans the same way" read.
+		var yaw := float(i) * 2.39996 + rng.randf_range(-0.25, 0.25)
+		# push cards off-axis so the crown has volume rather than all planes
+		# crossing at the trunk
+		var off := Vector3(cos(yaw + 1.2), 0.0, sin(yaw + 1.2)) \
+				* rng.randf_range(0.0, 0.22) * w
+		var basis := Basis(Vector3.UP, yaw) * Basis(Vector3.RIGHT, tilt)
+		foliage.append_from(card, 0,
+				Transform3D(basis.scaled(Vector3(w, w * 0.78, w)), Vector3(0, y, 0) + off))
+
+	foliage.generate_normals()
+	var mesh: ArrayMesh = foliage.commit()
+	var fmat := StandardMaterial3D.new()
+	fmat.albedo_texture = _leaf_tex
+	fmat.albedo_color = Color(0.52, 0.56, 0.42)   # multiplies the instance tint
+	fmat.roughness = 0.95
+	# Alpha SCISSOR, not blend: blended foliage needs depth sorting, which at
+	# 105 deg FOV across ~900 instances is both wrong and expensive. Scissor just
+	# discards the fragment. Alpha-to-coverage keeps the cut edges from crawling
+	# once MSAA is on.
+	fmat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA_SCISSOR
+	fmat.alpha_scissor_threshold = 0.5
+	# alpha-to-coverage resolves per MSAA sample, so it only helps (and only
+	# costs) when MSAA is actually on -- pointless on the low tier
+	if _q.msaa != Viewport.MSAA_DISABLED:
+		fmat.alpha_antialiasing_mode = BaseMaterial3D.ALPHA_ANTIALIASING_ALPHA_TO_COVERAGE
+	fmat.cull_mode = BaseMaterial3D.CULL_DISABLED   # cards are visible both sides
+	fmat.vertex_color_use_as_albedo = true   # per-instance tint varies the band
+	mesh.surface_set_material(0, fmat)
+
+	# trunk: visible below the canopy, which is most of what says "tree" in a
+	# silhouette against the sky
+	var trunk := SurfaceTool.new()
+	trunk.begin(Mesh.PRIMITIVE_TRIANGLES)
+	var tm := CylinderMesh.new()
+	tm.top_radius = 0.035
+	tm.bottom_radius = 0.075
+	tm.height = 0.9
+	tm.radial_segments = 6
+	tm.rings = 1
+	# trunk spans local y 0..0.9, so local y=0 is the base of the tree and the
+	# instance can simply be planted at ground level
+	trunk.append_from(tm, 0, Transform3D(Basis.IDENTITY, Vector3(0, 0.45, 0)))
+	trunk.generate_normals()
+	var tmesh: ArrayMesh = trunk.commit()
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES,
+			tmesh.surface_get_arrays(0))
+	var tmat := StandardMaterial3D.new()
+	tmat.albedo_color = TRUNK_COLOR
+	tmat.roughness = 1.0
+	mesh.surface_set_material(1, tmat)
+	return mesh
+
+
+func _scatter_trees(mesh: Mesh, count: int, width: float, tint: Color) -> void:
+	var rng := RandomNumberGenerator.new()
+	# fixed and per-variant: the world must be identical every run, but each
+	# variant must land somewhere different
+	rng.seed = WORLD_SEED + count * 7919 + int(width * 1000.0)
+
+	var mm := MultiMesh.new()
+	mm.transform_format = MultiMesh.TRANSFORM_3D
+	mm.use_colors = true
+	mm.mesh = mesh
+	mm.instance_count = count
+	for i in count:
+		var ang := rng.randf() * TAU
+		# denser near the inner edge so it reads as a receding mass, not a ring
+		var rad: float = 95.0 + pow(rng.randf(), 1.7) * 380.0
+		var h := rng.randf_range(5.0, 13.0)
+		var w := h * width * rng.randf_range(0.85, 1.2)
+		# mesh base is at local y=0, so plant directly on the ground; the old
+		# h*0.5 offset was for a centred primitive and left these hovering
+		var t := Transform3D(Basis.IDENTITY.scaled(Vector3(w, h, w)),
+				Vector3(cos(ang) * rad, 0.0, sin(ang) * rad))
+		mm.set_instance_transform(i, t)
+		var v := rng.randf_range(0.72, 1.28)
+		mm.set_instance_color(i, Color(tint.r * v, tint.g * v, tint.b * v * 0.95))
+
+	var mmi := MultiMeshInstance3D.new()
+	mmi.multimesh = mm
+	# 95-475 m out: their shadows are invisible but would pollute every cascade
+	mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_world.add_child(mmi)
+
+
+# ------------------------------------------------------------------ gates
+# Geometry the flythrough depends on: uprights at x = +/-GATE_HALF, top bar at
+# GATE_H, and the demo cruises through at GATE_ALT (1.0 m). The opening must stay
+# clear -- decoration goes outside it, never across it.
+const GATE_HALF := 1.2
+const GATE_H := 2.05
+const TUBE_R := 0.055
+const GATE_STRIPE_PX := 64
+
+var _gate_tube_mat: StandardMaterial3D
+var _gate_foot_mat: StandardMaterial3D
+
+
+# Hazard banding, generated rather than shipped: alternating safety-orange and
+# off-white along the tube axis, the way real race-gate poles are taped.
+func _make_stripe_texture() -> ImageTexture:
+	var img := Image.create(8, GATE_STRIPE_PX, false, Image.FORMAT_RGBA8)
+	for y in GATE_STRIPE_PX:
+		# 4 bands over the tile; slight tonal noise so it is not perfectly flat
+		var band := int(floor(y / float(GATE_STRIPE_PX) * 2.0)) % 2
+		var c := Color(0.85, 0.30, 0.06) if band == 0 else Color(0.88, 0.87, 0.84)
+		for x in 8:
+			var j := 1.0 + (sin(float(y) * 2.3 + float(x)) * 0.02)
+			img.set_pixel(x, y, Color(c.r * j, c.g * j, c.b * j, 1.0))
+	img.generate_mipmaps()
+	return ImageTexture.create_from_image(img)
+
+
+func _gate_materials() -> void:
+	if _gate_tube_mat != null:
+		return
+	_gate_tube_mat = StandardMaterial3D.new()
+	_gate_tube_mat.albedo_texture = _make_stripe_texture()
+	# powder-coated tube: not a mirror, but it catches the sky, which is most of
+	# what separates "real object" from "flat orange box"
+	_gate_tube_mat.roughness = 0.38
+	_gate_tube_mat.metallic = 0.0
+	_gate_tube_mat.uv1_scale = Vector3(1.0, 1.0, 1.0)
+
+	_gate_foot_mat = StandardMaterial3D.new()
+	_gate_foot_mat.albedo_color = Color(0.07, 0.07, 0.08)
+	_gate_foot_mat.roughness = 0.75
+
+
+func _add_tube(parent: Node3D, from: Vector3, to: Vector3, radius: float) -> void:
+	var mesh := CylinderMesh.new()
+	mesh.top_radius = radius
+	mesh.bottom_radius = radius
+	mesh.height = from.distance_to(to)
+	mesh.radial_segments = 12      # round profile; a box silhouette reads as CG
+	mesh.rings = 1
+	# repeat the banding along the tube rather than stretching one tile over it
+	# tile the banding at a fixed world size (~22 cm per band) instead of
+	# stretching one tile over the whole tube, which read as half orange /
+	# half white rather than striped
+	var mat: StandardMaterial3D = _gate_tube_mat.duplicate()
+	mat.uv1_scale = Vector3(1.0, maxf(1.0, mesh.height / 0.44), 1.0)
+	mesh.material = mat
+	var mi := MeshInstance3D.new()
+	mi.mesh = mesh
+	mi.position = (from + to) * 0.5
+	# CylinderMesh runs along +Y; rotate that onto the segment direction
+	var dir := (to - from).normalized()
+	if absf(dir.dot(Vector3.UP)) < 0.999:
+		var axis := Vector3.UP.cross(dir).normalized()
+		mi.rotate(axis, Vector3.UP.angle_to(dir))
+	parent.add_child(mi)
+
+
+func _build_gate(z: float, idx: int) -> void:
+	_gate_materials()
+	var rng := RandomNumberGenerator.new()
+	rng.seed = WORLD_SEED + idx * 131   # deterministic per-gate variation
+
+	var gate := Node3D.new()
+	gate.position = Vector3(0, 0, z)
+	gate.rotate_y(rng.randf_range(-0.05, 0.05))   # nothing on a field is square
+	_world.add_child(gate)
+
+	# uprights and top bar -- the opening itself, unchanged from the box version
+	_add_tube(gate, Vector3(-GATE_HALF, 0.0, 0), Vector3(-GATE_HALF, GATE_H, 0), TUBE_R)
+	_add_tube(gate, Vector3(GATE_HALF, 0.0, 0), Vector3(GATE_HALF, GATE_H, 0), TUBE_R)
+	_add_tube(gate, Vector3(-GATE_HALF - TUBE_R, GATE_H, 0),
+			Vector3(GATE_HALF + TUBE_R, GATE_H, 0), TUBE_R)
+
+	# corner braces: short diagonals just under the top bar. Outside the flight
+	# line, and they stop the frame reading as three disconnected sticks.
+	var brace := 0.34
+	_add_tube(gate, Vector3(-GATE_HALF, GATE_H - brace, 0),
+			Vector3(-GATE_HALF + brace, GATE_H, 0), TUBE_R * 0.6)
+	_add_tube(gate, Vector3(GATE_HALF, GATE_H - brace, 0),
+			Vector3(GATE_HALF - brace, GATE_H, 0), TUBE_R * 0.6)
+
+	# feet: a gate standing on nothing is one of the strongest "floating CG"
+	# cues, and these also ground it against the shadow
+	for sx in [-1.0, 1.0]:
+		var foot := MeshInstance3D.new()
+		var fm := BoxMesh.new()
+		fm.size = Vector3(0.34, 0.045, 0.30)
+		fm.material = _gate_foot_mat
+		foot.mesh = fm
+		foot.position = Vector3(sx * GATE_HALF, 0.022, 0)
+		gate.add_child(foot)
+
+
+func _build_goggle_layer() -> void:
+	if DisplayServer.get_name() == "headless" or _autotest:
+		return   # nothing is rasterised; the tests read stdout
+	if OS.get_environment(GOGGLE_ENV) == "off":
+		return
+	var mat := ShaderMaterial.new()
+	mat.shader = load("res://shaders/goggle.gdshader")
+	mat.set_shader_parameter("block_enable", 1.0 if _q.goggle_block else 0.0)
+	mat.set_shader_parameter("rs_amt", _q.goggle_rs)
+	_goggle_mat = mat
+
+	var rect := TextureRect.new()
+	rect.texture = _subvp.get_texture()
+	rect.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	rect.stretch_mode = TextureRect.STRETCH_SCALE
+	rect.set_anchors_preset(Control.PRESET_FULL_RECT)
+	rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	rect.material = mat
+	var layer := CanvasLayer.new()
+	layer.layer = 0
+	add_child(layer)
+	layer.add_child(rect)
+	_goggle = rect
+
+
+# Feed the shader what only the sim knows, and run the exposure hunt.
+func _update_goggle(delta: float) -> void:
+	if _goggle_mat == null:
+		return
+	_feed_time += delta
+
+	# Codec stress from angular rate: fast attack, slow decay, so a whip-pan
+	# mushes the frame and it recovers over roughly ten frames — which is what
+	# a real H.264 link does when the bitrate budget blows out.
+	var rate := _angvel.length()
+	var target := clampf((rate - 1.2) / 6.0, 0.0, 1.0)
+	if target > _block_env:
+		_block_env = lerpf(_block_env, target, 0.5)
+	else:
+		_block_env = lerpf(_block_env, target, 0.06)
+
+	_goggle_mat.set_shader_parameter("angvel", _angvel)
+	_goggle_mat.set_shader_parameter("block_strength", _block_env)
+	_goggle_mat.set_shader_parameter("time_seed", _feed_time * 60.0)
+
+	_update_auto_exposure(delta)
+
+
+func _update_auto_exposure(delta: float) -> void:
+	if _env == null or _cam == null or _sun == null:
+		return
+	var fwd := -_cam.global_transform.basis.z
+	var sky_frac := clampf(0.5 + fwd.y * 1.2, 0.0, 1.0)
+	var sun_align := maxf(0.0, fwd.dot(-_sun.global_transform.basis.z))
+	var target := AE_BASE / (1.0 + AE_SKY * sky_frac + AE_SUN * pow(sun_align, 8.0))
+	# under-damped second-order follower -> overshoot then settle, like DJI's AE
+	_ae_vel += (target - _ae) * AE_OMEGA * AE_OMEGA * delta \
+			- 2.0 * AE_ZETA * AE_OMEGA * _ae_vel * delta
+	_ae += _ae_vel * delta
+	_env.tonemap_exposure = clampf(_ae, 0.85, 1.6)
+
+
+func _make_world_root() -> void:
+	# Headless, autotest and goggle-off all render straight to the root viewport:
+	# no goggle pass means no backbuffer copy to avoid, and keeping the tested
+	# headless path structurally identical is worth more than the symmetry.
+	if DisplayServer.get_name() == "headless" or _autotest \
+			or OS.get_environment(GOGGLE_ENV) == "off":
+		_world = self
+		return
+	_subvp = SubViewport.new()
+	_subvp.size = DisplayServer.window_get_size()
+	_subvp.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+	_subvp.handle_input_locally = false
+	# the quality settings belong on whichever viewport actually draws the 3D
+	_subvp.msaa_3d = _q.msaa
+	_subvp.use_debanding = true
+	_subvp.scaling_3d_mode = get_viewport().scaling_3d_mode
+	_subvp.scaling_3d_scale = get_viewport().scaling_3d_scale
+	add_child(_subvp)
+	_world = Node3D.new()
+	_subvp.add_child(_world)
+	get_window().size_changed.connect(_on_window_resized)
+
+
+func _on_window_resized() -> void:
+	if _subvp:
+		_subvp.size = DisplayServer.window_get_size()
+
+
+func _build_world() -> void:
+	_make_world_root()
+	_build_sky_and_sun()
+	_build_ground()
+	_build_treeline()
+
 	for i in range(3):
-		var z := -6.0 - i * 8.0
-		_add_box(Vector3(-1.2, 1.0, z), Vector3(0.15, 2.0, 0.15), Color(0.9, 0.4, 0.1))
-		_add_box(Vector3(1.2, 1.0, z), Vector3(0.15, 2.0, 0.15), Color(0.9, 0.4, 0.1))
-		_add_box(Vector3(0, 2.05, z), Vector3(2.55, 0.15, 0.15), Color(0.9, 0.4, 0.1))
+		_build_gate(-6.0 - i * 8.0, i)
 
 	# drone + FPV camera
 	_drone = Node3D.new()
-	add_child(_drone)
+	_world.add_child(_drone)
 	_build_drone_model(_drone)
 
 	# FPV camera where the DJI O3 sits on a CineLog35: front-top of the frame,
@@ -721,14 +1369,27 @@ func _build_world() -> void:
 	# just below the view, exactly like real cinewhoop footage.
 	var cam := Camera3D.new()
 	cam.fov = 105
-	cam.near = 0.005
+	# near 0.005 against the default far 4000 was an 800,000:1 depth ratio --
+	# harmless in a 60 m world, severe z-fighting once there is a treeline at
+	# 300 m. Nearest airframe geometry (duct lip / blade tips) is ~0.084 m, so
+	# 0.02 is still 4x clear of it.
+	cam.near = 0.02
+	cam.far = 1500.0
 	cam.position = Vector3(0, 0.045, -0.02)
 	cam.rotation_degrees = Vector3(25, 0, 0)
 	_drone.add_child(cam)
 	cam.current = true
+	_cam = cam
 
-	# HUD
+	# Layer 0: the goggle-feed pass over the 3D render.
+	_build_goggle_layer()
+
+	# Layer 1: OSD and HUD, ABOVE the feed pass and untouched by it. On a real
+	# DJI system the Betaflight OSD is drawn by the goggles from MSP-DisplayPort
+	# data, not encoded into the video, so it is never distorted, blocked,
+	# sharpened or noised — it is crisp at panel resolution.
 	var ui := CanvasLayer.new()
+	ui.layer = 1
 	add_child(ui)
 	_hud = Label.new()
 	_hud.position = Vector2(12, 8)
@@ -737,14 +1398,18 @@ func _build_world() -> void:
 	_hud.text = "connecting to propwash-core..."
 
 	# OSD overlay — the real Betaflight 16x30 character grid, centered like
-	# FPV goggles. Uses a monospace font so columns line up.
+	# FPV goggles.
 	_osd = Label.new()
 	_osd.set_anchors_preset(Control.PRESET_CENTER)
 	_osd.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_osd.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	_osd.add_theme_font_override("font", ThemeDB.fallback_font)
+	# ThemeDB.fallback_font is PROPORTIONAL despite the old comment here claiming
+	# monospace, so the fixed 16x30 grid never actually lined up into columns.
+	var mono := SystemFont.new()
+	mono.font_names = ["Menlo", "Consolas", "DejaVu Sans Mono", "Courier New", "monospace"]
+	_osd.add_theme_font_override("font", mono)
 	_osd.add_theme_font_size_override("font_size", 20)
 	_osd.add_theme_color_override("font_color", Color(1, 1, 1))
 	_osd.add_theme_color_override("font_outline_color", Color(0, 0, 0))
-	_osd.add_theme_constant_override("outline_size", 4)
+	_osd.add_theme_constant_override("outline_size", 2)   # DJI's is a tight shadow
 	ui.add_child(_osd)

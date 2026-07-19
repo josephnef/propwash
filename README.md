@@ -116,7 +116,14 @@ The Godot client spawns `build/propwash-core` itself. Controls:
   `E` arm, `Q` angle toggle, `R` reset.
 - **Betaflight Configurator** connects any time to TCP `127.0.0.1:5761` (MSP/CLI)
   and tunes it live.
-- The **real Betaflight OSD** is overlaid on the FPV view.
+- The **real Betaflight OSD** is overlaid on the FPV view — crisp, above the
+  camera-feed pass, because on a real DJI system the goggles draw it from
+  MSP-DisplayPort data rather than it being encoded into the video.
+- **DJI O3 feed treatment** — ISP sharpening halos, gentle digital contrast,
+  mild corner falloff, a daylight sensor floor, and codec softening driven from
+  real angular rate (a whip-pan blows the bitrate budget and recovers). Tuned to
+  be subtle: real O3 footage is clean, so if you can point at an individual
+  effect it is turned up too far. `PROPWASH_GOGGLE=off` shows the raw render.
 - **Second monitor** — if one is attached the sim opens fullscreen on it, leaving
   the primary free for the Configurator and logs. Override with
   `PROPWASH_SCREEN=off` (stay windowed) or `PROPWASH_SCREEN=<index>` (0-based).
@@ -125,6 +132,15 @@ The Godot client spawns `build/propwash-core` itself. Controls:
   the monitor: a 240 Hz screen runs a 240 Hz lockstep, while 60/100 Hz setups
   stay on the 100 Hz baseline and pay exactly what they always have (clamped to
   100–240). Pin it with `PROPWASH_TICK=<hz>` if you'd rather choose yourself.
+- **Quality tiers** — `low`/`medium`/`high`, auto-selected from what the GPU
+  actually has to sustain (width × height × refresh), so a 240 Hz panel keeps its
+  framerate and a 60 Hz one gets the prettier version. **Every tier renders at
+  native resolution**; tiers differ in scene and lighting cost, never in pixels.
+  Override with `PROPWASH_QUALITY=<tier>`. If render rate falls far below the
+  lockstep rate for a few seconds, the client gives the tick rate back rather
+  than let a heavy scene starve the sim. `PROPWASH_SCALE=<0.5-1.0>` exists as an
+  explicit opt-in for a GPU that genuinely can't drive the panel — it is never
+  applied by default.
 
 ### Loading the pilot's real tune
 
