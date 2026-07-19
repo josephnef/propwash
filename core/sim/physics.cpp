@@ -697,6 +697,14 @@ namespace SimITL{
       const auto Rth = mSimState->stateInit.motorRth;
       const auto Cth = mSimState->stateInit.motorCth;
 
+      // crashflip: reversed spin flips the thrust sign at reduced
+      // efficiency; axial-inflow correction only applies forward (reversed
+      // ops happen on the ground at ~zero inflow)
+      const float spinDir = (float)motors[i].spinDir;
+      const float inflow = spinDir > 0.0f ? vel : 0.0f;
+      const float reverseEff = spinDir < 0.0f
+          ? mSimState->stateInit.propReverseEfficiency : 1.0f;
+
       //prevent division by 0
       float vbat = std::max(1.0f, mSimState->batteryState.batVoltageSag);
 
@@ -705,7 +713,7 @@ namespace SimITL{
       const auto volts = motors[i].pwmLowPassFilter.update(motors[i].pwm, dt, 100.0f) * vbat;
       const auto mTorque = motorTorque(volts, rpm, kV, R, I0) * 0.833f * motorDamageEffect;
       auto current       = motorCurrent(mTorque, kV);
-      const auto pTorque = propTorque(rpm, vel) * propHealthTorqueFactor;
+      const auto pTorque = propTorque(rpm, inflow) * propHealthTorqueFactor;
       const auto netTorque = mTorque - pTorque;
 
       const auto domega = netTorque / std::max(mSimState->stateInit.propInertia, 0.00000001f);
@@ -720,12 +728,13 @@ namespace SimITL{
       }
 
       float currentAbs = std::abs(current);
-      float thrust = propThrust(rpm, vel) * propHealthFactor * groundEffect * propwashEffect * propDamageEffect;
+      float thrust = spinDir * reverseEff * propThrust(rpm, inflow)
+          * propHealthFactor * groundEffect * propwashEffect * propDamageEffect;
       float powerDraw = currentAbs * vbat;
 
       float cooling = (1.0f - std::exp(-speed * 0.2f)) * 100.0f; // 100 watts max cooling by airspeed
       constexpr float maxSpeedPropCooling = 20.0f; //72 km/h and cooling by rotation of props has no effect
-      cooling += (std::min(maxSpeedPropCooling, speed) / maxSpeedPropCooling) * thrust * 4.0f;
+      cooling += (std::min(maxSpeedPropCooling, speed) / maxSpeedPropCooling) * std::fabs(thrust) * 4.0f;
 
       // motor pwm is already read by BF::update call
       //motors[i].pwm = bf::motorsPwm[i] / 1000.0f;
@@ -738,7 +747,8 @@ namespace SimITL{
       motors[i].mTorque = mTorque;
       motors[i].thrust = thrust;
       motors[i].rpm = rpm;
-      resPropTorque += motor_dir[i] * mTorque;
+      // reaction torque flips with the commanded spin direction
+      resPropTorque += motor_dir[i] * spinDir * mTorque;
 
       if(motors[i].temp > mSimState->stateInit.motorMaxT){
         motors[i].status = motors[i].status | MotorStatus::MotorBurnedOut;

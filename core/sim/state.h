@@ -70,6 +70,10 @@ namespace SimITL{
     // motor status flags
     // \see MotorStatus
     int32_t status = 0;
+
+    // spin direction commanded over virtual DSHOT: +1 normal, -1 reversed
+    // (crashflip). Thrust flips sign and pays a reverse-efficiency penalty.
+    int8_t spinDir = 1;
   };
 
   struct BatteryState {

@@ -24,7 +24,9 @@ runs the genuine article, which makes it uniquely suited to three things a
 normal sim can't do:
 
 1. **Train on your exact tune** — same PIDs, rates, filters, arming/failsafe
-   behaviour as the real quad.
+   behaviour as the real quad — including DSHOT600, crashflip (turtle mode)
+   and the RPM filter running on bidirectional-DSHOT eRPM that the virtual
+   ESC derives from the physics' true motor speeds.
 2. **Deterministic lockstep** — identical inputs produce byte-identical
    trajectories, so it can back a reproducible RL gym and replay real blackbox
    logs for sim-vs-real validation.
@@ -133,7 +135,8 @@ The Godot client spawns `build/propwash-core` itself. Controls:
   by name, RC read directly by the core. Calibrate once:
   `./build/propwash-core --js-calibrate`.
 - **No radio** — keyboard: arrows = right stick, `W`/`S` throttle, `A`/`D` yaw,
-  `E` arm, `Q` angle toggle, `T` repair in place, `R` reset to pad.
+  `E` arm, `Q` angle toggle, `F` turtle switch, `T` repair in place, `R` reset
+  to pad.
 - **Crashes have consequences.** Gates, trees and the ground are solid; hitting
   them costs momentum and props. The HUD shows per-motor damage, a hard impact
   puts up a `CRASHED` banner, and a wrecked quad genuinely cannot hover (the
@@ -142,7 +145,10 @@ The Godot client spawns `build/propwash-core` itself. Controls:
   disables `T` for deliberate practice — a crash then always ends the flight.
   If your dump sets `crash_recovery = DISARM`, the firmware's own crash
   detection disarms you exactly as on hardware (`CRASH DETECTED` banner; cycle
-  the ARM switch to clear).
+  the ARM switch to clear). And when you end up upside-down: disarm, flip the
+  turtle switch (`F`), arm, and roll — the props reverse over real DSHOT
+  spin-direction commands and the quad pivots itself upright over a duct
+  edge, exactly the crashflip maneuver from the real quad.
 - **Wind** — `PROPWASH_WIND="3,0,0" PROPWASH_GUST=1.5 godot --path client-godot`
   gives a 3 m/s steady wind with 1.5 m/s gusts. Deterministic: the same flags
   reproduce the same run; calm runs are byte-identical to a build without wind.
@@ -198,6 +204,7 @@ discoverable by reading the source.
 | `PROPWASH_PORT=<port>` | core UDP port; lets tests and a live session coexist |
 | `PROPWASH_NO_JS=1` | spawn the core with `--no-js` (scripted harnesses) |
 | `PROPWASH_CONTACT_LOG=1` | print every new contact event (surface, depth) |
+| `PROPWASH_FORCE_PWM=1` | (core env) force the old PWM motor protocol instead of the dump's DSHOT |
 
 ### Loading the pilot's real tune
 

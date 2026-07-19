@@ -85,6 +85,10 @@ struct StateInit{
   float windGustAmp = 0.0f;   // m/s gust amplitude (0 = steady wind only)
   float windGustFreq = 0.5f;  // gust rate scale
 
+  // Thrust efficiency of a reversed prop (crashflip): blades are cambered
+  // and pitched for one direction, and ducts make reversed flow worse.
+  float propReverseEfficiency = 0.7f;
+
   // prop wash starts at this speed in m/s
   float minPropWashSpeed = 1.0f;
   // prop wash reacheas peak at this speed in m/s

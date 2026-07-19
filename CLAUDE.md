@@ -17,7 +17,7 @@ No external dependencies (kernel `js` API, not SDL2). One pinned submodule.
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo && cmake --build build -j
-ctest --test-dir build            # 19 headless tests (+ gym_hover if uv-synced); ~2.5 min
+ctest --test-dir build            # 21 headless tests (+ gym_hover if uv-synced); ~2.5 min
 ```
 
 The Betaflight submodule builds as a static lib (`extern/`). Source list is
@@ -44,7 +44,9 @@ if the firmware version changes.
 | `client_collision` | client detection: hull vs analytic ground + engine-query gate tubes, slop depenetration, Godot→sim manifold conversion |
 | `gym_hover` | the Python Gymnasium env spawns a real core, arms + hovers, and passes the env-checker (step-determinism sub-check xfail'd — see below) |
 | `sysid_selfcheck` | physics-only motor replay (`PW_MOTOR_IN`) is bit-reproducible across cores; the fitter recovers a hidden physics parameter from a synthetic reference |
-| `dshot_device` | virtual DSHOT ESC (`PROPWASH_DSHOT=1`): boot grace clears, arms + hovers on dshot600, SPIN_DIRECTION commands through the stock command queue land in `pw_motor_dir` |
+| `dshot_device` | virtual DSHOT ESC: boot grace clears, arms + hovers on dshot600 (the default protocol now), SPIN_DIRECTION commands through the stock command queue land in `pw_motor_dir` |
+| `turtle_flip` | crashflip end to end: settle inverted, arm with the turtle box, reversed props pivot the quad over its duct edge (emergent contact-solver maneuver), normal re-arm restores directions |
+| `rpm_filter` | bidir-DSHOT eRPM: the virtual ESC encodes physics-true rpm into real eRPM period frames; firmware-side telemetry rpm matches physics within quantization and the RPM filter runs during a stable hover |
 | `reset_determinism` | one core, the identical input tape twice around `PW_CMD_RESET` → byte-identical streams (fails on any stray rand()/clock in the sim path, or anything leaking through the snapshot reset) |
 | `cross_process_determinism` | two fresh cores, identical inputs (one send-jittered) → byte-identical output — the headline claim, gated |
 
@@ -110,9 +112,9 @@ cause spurious failures; kill strays before running
   `motorEnable()` runs during `init()` at virtual `millis()==0` and
   `dshotStreamingCommandsAreEnabled()` reads a zero enable-stamp as "never" —
   so `ARMING_DISABLED_BOOT_GRACE_TIME` would never clear; `BF::update`
-  re-stamps it on the first tick. `targetPreInit()` still forces
-  `motor_pwm_protocol = PWM` by default; `PROPWASH_DSHOT=1` keeps the dump's
-  protocol (dshot600) instead.
+  re-stamps it on the first tick. The configured protocol now applies
+  as-is (the dump's dshot600 by default); `PROPWASH_FORCE_PWM=1` restores
+  the old PWM override as an escape hatch.
 - **`cli.c` `pgFind()` null-guard is `#ifdef DEBUG`.** SITL undefs features
   (OSD/VTX) whose settings stay in the value table → `diff`/`dump`/`save`
   segfault. The vendored `cli.c` makes the guard unconditional.

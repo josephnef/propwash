@@ -413,6 +413,10 @@ motorDevice_t *motorPwmDevInit(const motorDevConfig_t *motorConfig, uint16_t _id
  * -1 reversed. Read by the physics glue (reversed-thrust model). */
 int8_t pw_motor_dir[MAX_SUPPORTED_MOTORS] = {1, 1, 1, 1, 1, 1, 1, 1};
 
+/* physics-true mechanical rpm, written by the glue each tick; source for
+ * the virtual ESC's bidirectional-DSHOT eRPM telemetry */
+float pw_motor_rpm[MAX_SUPPORTED_MOTORS];
+
 /* dshot_command.c's allMotorsAreIdle() inspects the last written packet
  * through this hardware-shaped struct; only protocolControl.value matters
  * on a virtual ESC. */
@@ -492,6 +496,44 @@ static void pwDshotShutdown(void)
     dshotDevice.enabled = false;
 }
 
+/* Encode a mechanical rpm into the bidir-DSHOT eRPM period frame
+ * (eeem mmmm mmmm) — the exact inverse of the stock decoder
+ * (dshot.c dshot_decode_eRPM_telemetry_value): the stock stack then
+ * decodes, converts and feeds the RPM filter as if a real ESC had
+ * answered. 0x0fff = stopped. */
+static uint16_t pwEncodeErpmPeriod(float mechRpm)
+{
+    const float polePairs = motorConfig()->motorPoleCount / 2.0f;
+    const float erpm = mechRpm * polePairs;
+    if (erpm < 100.0f) {
+        return 0x0fff;
+    }
+    uint32_t period = (uint32_t)((60000000.0f / erpm) + 0.5f);
+    uint32_t e = 0;
+    while (period > 0x1ff && e < 7) {
+        period = (period + 1) >> 1;
+        e++;
+    }
+    if (period > 0x1ff) {
+        return 0x0fff; /* too slow to represent — treat as stopped */
+    }
+    return (uint16_t)((e << 9) | period);
+}
+
+static bool pwDshotDecodeTelemetry(void)
+{
+    if (!useDshotTelemetry) {
+        return true;
+    }
+    for (int i = 0; i < dshotDevice.count; i++) {
+        dshotTelemetryState.motorState[i].rawValue = pwEncodeErpmPeriod(pw_motor_rpm[i]);
+        dshotTelemetryState.motorState[i].telemetryTypes = DSHOT_NORMAL_TELEMETRY_MASK;
+    }
+    dshotTelemetryState.rawValueState = DSHOT_RAW_VALUE_STATE_NOT_PROCESSED;
+    dshotTelemetryState.readCount += dshotDevice.count;
+    return true;
+}
+
 static motorDevice_t dshotDevice = {
     .vTable = {
         .postInit = motorPostInitNull,
@@ -500,7 +542,7 @@ static motorDevice_t dshotDevice = {
         .enable = pwDshotEnable,
         .disable = pwDshotDisable,
         .isMotorEnabled = pwmIsMotorEnabled,
-        .decodeTelemetry = motorDecodeTelemetryNull,
+        .decodeTelemetry = pwDshotDecodeTelemetry,
         .write = pwDshotWrite,
         .writeInt = pwDshotWriteInt,
         .updateComplete = pwDshotUpdateComplete,
@@ -510,11 +552,16 @@ static motorDevice_t dshotDevice = {
 
 motorDevice_t *dshotPwmDevInit(const motorDevConfig_t *motorConfig, uint16_t _idlePulse, uint8_t motorCount, bool useUnsyncedPwm)
 {
-    UNUSED(motorConfig);
     UNUSED(_idlePulse);
     UNUSED(useUnsyncedPwm);
 
-    printf("[pw] virtual DSHOT ESC: %d motors\n", motorCount);
+    /* the runtime telemetry flag normally set by the hardware device init
+     * (dshot_dpwm.c, excluded) — gates both our eRPM reporting and the
+     * firmware's RPM-filter/telemetry paths */
+    useDshotTelemetry = motorConfig->useDshotTelemetry;
+
+    printf("[pw] virtual DSHOT ESC: %d motors%s\n", motorCount,
+           useDshotTelemetry ? " (bidir eRPM telemetry)" : "");
 
     for (int i = 0; i < MAX_SUPPORTED_MOTORS && i < motorCount; i++) {
         motors[i].enabled = true;
@@ -667,18 +714,20 @@ bool useDshotTelemetry = false;
  */
 void targetPreInit(void)
 {
-    const char *dshotEnv = getenv("PROPWASH_DSHOT");
-    if (dshotEnv && dshotEnv[0] == '1') {
-        /* virtual DSHOT ESC: keep the configured protocol (the real quad's
-         * dump says dshot600). The boot-grace clearing needs a nonzero
-         * motor-enable timestamp; motorEnable() runs during init() at
-         * virtual millis()==0 and dshotStreamingCommandsAreEnabled() reads
-         * a zero stamp as "never enabled" — the glue re-stamps it on the
-         * first simulated tick (see BF::update). */
-        printf("[pw] targetPreInit: virtual DSHOT enabled (PROPWASH_DSHOT=1)\n");
+    /* The configured motor protocol applies as-is — the real dump's
+     * dshot600 runs on the virtual DSHOT ESC above (spin-direction
+     * commands, bidir eRPM telemetry). Historical note: PWM used to be
+     * forced here because boot grace never cleared under DSHOT; that was
+     * a virtual-time artifact (motorEnable() during init() stamps
+     * millis()==0, which dshotStreamingCommandsAreEnabled() reads as
+     * "never enabled") and the glue now re-stamps it on the first tick.
+     * PROPWASH_FORCE_PWM=1 keeps the old override as an escape hatch. */
+    const char *forcePwm = getenv("PROPWASH_FORCE_PWM");
+    if (forcePwm && forcePwm[0] == '1') {
+        motorConfigMutable()->dev.motorPwmProtocol = PWM_TYPE_STANDARD;
+        motorConfigMutable()->dev.useUnsyncedPwm = true;
+        printf("[pw] targetPreInit: forced motor protocol PWM (PROPWASH_FORCE_PWM=1)\n");
         return;
     }
-    motorConfigMutable()->dev.motorPwmProtocol = PWM_TYPE_STANDARD;
-    motorConfigMutable()->dev.useUnsyncedPwm = true;
-    printf("[pw] targetPreInit: forced motor protocol PWM (SITL override)\n");
+    printf("[pw] targetPreInit: motor protocol from config (virtual DSHOT ESC)\n");
 }

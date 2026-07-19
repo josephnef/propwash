@@ -51,6 +51,10 @@ namespace SimITL{
 
       #include "fc/rc_modes.h"
       #include "flight/pid.h"
+      #include "flight/rpm_filter.h"
+      #include "config/config.h"
+      #include "pg/motor.h"
+      #include "drivers/dshot.h"
       #include "io/beeper.h"
 
       #include "build/debug.h"
@@ -88,6 +92,8 @@ namespace SimITL{
       extern int16_t  pw_motors_pwm[];
       // per-motor spin direction from the virtual DSHOT ESC (+1 / -1)
       extern int8_t   pw_motor_dir[];
+      // physics-true mechanical rpm, fed to the virtual ESC's eRPM telemetry
+      extern float    pw_motor_rpm[];
       void pw_set_eeprom_path(const char *path);
 
       // dyad serialisation + the address ranges the deterministic-reset

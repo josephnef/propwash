@@ -57,6 +57,9 @@ inline void profileCineLog35(StateInit& s, const char* eepromPath)
   s.quadBatCapacityCharged = 660.0f;
   s.quadBatCapacity        = 660.0f;
 
+  // Reversed-spin (crashflip) thrust penalty — ducted props suffer more
+  s.propReverseEfficiency = 0.7f;
+
   // Prop wash — ducts wash earlier and harder when descending
   s.minPropWashSpeed      = 0.8f;
   s.maxPropWashSpeed      = 10.0f;
