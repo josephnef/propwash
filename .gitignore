@@ -9,3 +9,6 @@ __pycache__/
 *.egg-info/
 compile_commands.json
 client-godot/.godot/
+# OpenSCAD's intermediate per-material OBJ groups. The GLB they are packed into
+# (client-godot/assets/cinelog35_v3.glb) IS committed — see model/README.md.
+model/.build/

@@ -1,0 +1,24 @@
+# The OpenSCAD build client-godot/assets/cinelog35_v3.glb is generated with.
+#
+# Bumping this file is the whole ceremony for moving to a newer OpenSCAD:
+# change the three lines below, regenerate, commit the new GLB. The model-asset
+# CI job downloads exactly this AppImage, verifies the checksum, and diffs its
+# regenerated GLB against the committed one.
+#
+# WHY A SNAPSHOT AND NOT A STABLE RELEASE: 2021.01 is the newest stable release
+# (Feb 2021) and it cannot build this model -- it has no manifold backend and
+# no OBJ export (src/export_obj.cc does not exist at that tag), both of which
+# model/build_asset.py requires. OpenSCAD ships via dated snapshots, and
+# files.openscad.org keeps them indefinitely, so they pin cleanly.
+#
+# build_asset.py hard-codes the same version string in PINNED_OPENSCAD_VERSION;
+# keep the two in step.
+
+VERSION=2026.07.19
+LINUX_APPIMAGE=https://files.openscad.org/snapshots/OpenSCAD-2026.07.19-x86_64.AppImage
+LINUX_SHA256=9cf5e1c1a4a60117688415fefd024fc1666db6b14dd6910802b498fa21c35bc1
+
+# macOS has no .dmg snapshot for this date (the macOS snapshots lag Linux).
+# `brew install --cask openscad@snapshot` currently gives 2026.06.12, so a local
+# regen on a Mac prints a version warning and continues -- CI is the gate that
+# actually enforces the pin.
