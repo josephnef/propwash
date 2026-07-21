@@ -62,6 +62,12 @@ def main():
         ("PW_CMD_REPAIR", pw_udp.PW_CMD_REPAIR, gp.PW_CMD_REPAIR),
         # surface enum
         ("SURF_GROUND", pw_udp.SURF_GROUND, gp.PW_SURF_GROUND),
+        # Collision hull. Not a packet field, but both codecs derive their
+        # ground manifolds from it, so drift here desyncs contact geometry
+        # between the gym and the test harness while every struct still matches.
+        ("HULL", pw_udp.HULL, gp.HULL),
+        ("CONTACT_SLOP", pw_udp.CONTACT_SLOP, gp.CONTACT_SLOP),
+        ("CONTACT_MARGIN", pw_udp.CONTACT_MARGIN, gp.CONTACT_MARGIN),
     ]
 
     bad = [(name, a, b) for name, a, b in checks if a != b]

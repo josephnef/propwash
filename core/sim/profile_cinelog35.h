@@ -45,11 +45,13 @@ inline void profileCineLog35(StateInit& s, const char* eepromPath)
   s.quadMass          = 0.33f;   // AUW with 4S 660 mAh
   s.quadInvInertia    = { 900.0f, 1100.0f, 900.0f };
 
-  // Motor positions: 153 mm wheelbase -> ±54 mm x/z
-  s.quadMotorPos[0] = {  0.054f, 0.005f, -0.054f };
-  s.quadMotorPos[1] = {  0.054f, 0.005f,  0.054f };
-  s.quadMotorPos[2] = { -0.054f, 0.005f, -0.054f };
-  s.quadMotorPos[3] = { -0.054f, 0.005f,  0.054f };
+  // Motor positions: published 142 mm wheelbase -> ±50.205 mm x/z
+  // (142/sqrt(2)/2). Same figure model/cinelog35_v3.scad is generated from and
+  // PW_HULL_DUCT_XZ places the duct spheres at; keep the three in step.
+  s.quadMotorPos[0] = {  0.050205f, 0.005f, -0.050205f };
+  s.quadMotorPos[1] = {  0.050205f, 0.005f,  0.050205f };
+  s.quadMotorPos[2] = { -0.050205f, 0.005f, -0.050205f };
+  s.quadMotorPos[3] = { -0.050205f, 0.005f,  0.050205f };
 
   // Battery: 4S 660 mAh
   s.maxVoltageSag          = 1.6f;

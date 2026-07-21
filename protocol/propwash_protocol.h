@@ -36,7 +36,16 @@ extern "C" {
 #define PW_HULL_BELLY_Y 0.030f
 #define PW_HULL_BELLY_Z 0.0f
 #define PW_HULL_BELLY_R 0.045f
-#define PW_HULL_DUCT_XZ 0.054f  /* 4 duct spheres at (+-XZ, Y, +-XZ) */
+/* 4 duct spheres at (+-XZ, Y, +-XZ).
+ *
+ * NOT the wheelbase, despite being near it. These five spheres are a tuned
+ * approximation of a ducted cage's contact behaviour, not a transcription of
+ * its geometry: a 30 mm sphere already under-fits a duct ring of 51.55 mm outer
+ * radius, so XZ is a contact parameter rather than a dimension. Re-deriving it
+ * from the real airframe (0.0718, putting the spheres' outer edge on the true
+ * 203.5 mm guard span) widens the stance enough to break both the crash and
+ * crashflip dynamics. Retune the whole hull together or not at all. */
+#define PW_HULL_DUCT_XZ 0.054f
 #define PW_HULL_DUCT_Y  0.010f
 #define PW_HULL_DUCT_R  0.030f
 #define PW_HULL_REST_H  0.020f

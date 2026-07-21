@@ -139,6 +139,39 @@ add_test(NAME sysid_selfcheck
     $<TARGET_FILE:propwash-core>)
 set_tests_properties(sysid_selfcheck PROPERTIES TIMEOUT 180)
 
+# Airframe asset. model/cinelog35_v3.scad is the source of truth and
+# client-godot/assets/cinelog35_v3.glb is a committed build product — the same
+# arrangement as extern/bf_sources.txt. See model/README.md.
+#
+# Always-on half: the committed GLB still satisfies the dimensional contract
+# (wheelbase, duct bore, prop diameter, guard span, node/mesh/material names,
+# normals + UVs, triangle budget). Pure stdlib python, no OpenSCAD, no Godot,
+# so it runs on Windows/MSYS2 too.
+add_test(NAME model_asset
+  COMMAND python3 ${CMAKE_SOURCE_DIR}/model/validate_glb.py
+    ${CMAKE_SOURCE_DIR}/client-godot/assets/cinelog35_v3.glb)
+set_tests_properties(model_asset PROPERTIES TIMEOUT 30)
+
+# Drift half: regenerating from the .scad must reproduce the committed GLB.
+# Optional because it needs an OpenSCAD SNAPSHOT — the 2021.01 stable release
+# has neither the manifold backend nor OBJ export, so it cannot build this at
+# all (model/OPENSCAD_VERSION pins the exact build CI uses). Same
+# absent-tool-skips pattern as GODOT_BIN and PW_GYM_PYTHON.
+find_program(OPENSCAD_BIN NAMES openscad OpenSCAD
+  PATHS /Applications/OpenSCAD.app/Contents/MacOS)
+if(OPENSCAD_BIN)
+  add_test(NAME model_regen
+    COMMAND ${CMAKE_COMMAND}
+      -DOPENSCAD_BIN=${OPENSCAD_BIN}
+      -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
+      -DWORK_DIR=${CMAKE_BINARY_DIR}/model
+      -P ${CMAKE_SOURCE_DIR}/model/regen_check.cmake)
+  set_tests_properties(model_regen PROPERTIES TIMEOUT 300)
+  message(STATUS "model_regen test enabled (openscad: ${OPENSCAD_BIN})")
+else()
+  message(STATUS "model_regen test skipped (no openscad snapshot found)")
+endif()
+
 # Godot client autotest (runs only if a godot 4 binary is available).
 # PROPWASH_AUTOTEST=1 arms + hovers via the real GDScript client, headless.
 find_program(GODOT_BIN NAMES godot godot4

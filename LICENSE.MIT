@@ -3,7 +3,7 @@ MIT License
 Copyright (c) 2026 propwash contributors
 
 Applies to the following directories only (see LICENSE for the rest of the
-repository, which is GPL-3.0): protocol/, client-godot/, python/.
+repository, which is GPL-3.0): protocol/, client-godot/, python/, model/.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

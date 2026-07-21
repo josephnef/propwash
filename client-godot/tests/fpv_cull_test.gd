@@ -84,16 +84,110 @@ func _check() -> void:
 				% Main.FPV_HIDDEN_LAYER)
 
 	# --- and the ducts/props must NOT be hidden: a real cinewhoop feed shows
-	# them, and hiding them would be a silent authenticity regression
-	var visible_parts := _count_on_layer(main, 1)
-	if visible_parts < 4:
+	# them, and hiding them would be a silent authenticity regression.
+	#
+	# Counted over the DRONE subtree, not the whole scene: the world (ground,
+	# treeline, gates) puts dozens of instances on layer 1, so a scene-wide
+	# count passed even when nothing on the airframe was visible at all.
+	var drone: Node3D = main._drone
+	var visible_parts := 0
+	if drone == null:
 		fails += 1
-		print("FAIL expected ducts/motors/props visible to the FPV camera, "
-				+ "found %d instances on layer 1" % visible_parts)
+		print("FAIL the world has no drone node")
+	else:
+		visible_parts = _count_on_layer(drone, 1)
+		if visible_parts < 4:
+			fails += 1
+			print("FAIL expected ducts/motors/props visible to the FPV camera, "
+					+ "found %d airframe instances on layer 1" % visible_parts)
+
+	# --- the model is generated from model/cinelog35_v3.scad and bound BY NAME
+	# (main.gd MODEL_PROP_NODES / MODEL_FPV_HIDDEN). A regenerated GLB that
+	# renamed or dropped a node would otherwise fail silently: props would stop
+	# spinning, or interior parts would appear in the FPV feed.
+	if drone != null:
+		for name in Main.MODEL_PROP_NODES + Main.MODEL_FPV_HIDDEN:
+			if drone.find_child(name, true, false) == null:
+				fails += 1
+				print("FAIL the drone model has no %s node — did the GLB get "
+						% name + "regenerated with different node names?")
+
+	# --- props must be bound, in the right count, and spinnable
+	if main._props.size() != 4:
+		fails += 1
+		print("FAIL expected 4 bound props, got %d" % main._props.size())
+	else:
+		for i in 4:
+			if main._props[i].name != Main.MODEL_PROP_NODES[i]:
+				fails += 1
+				print("FAIL prop %d is %s, expected %s — the prop order must "
+						% [i, main._props[i].name, Main.MODEL_PROP_NODES[i]]
+						+ "match MOTOR_OFFSETS (FR, FL, RR, RL)")
+
+	# --- the airframe must actually BE in the FPV frame.
+	#
+	# Layer bits are not visibility. Every check above passes with the drone
+	# entirely off screen, because they only ask which layer a mesh is on, never
+	# whether the camera can see it — and a centimetre of camera height is all it
+	# takes to drop a 21 mm-tall airframe out of the view.
+	#
+	# So project the hull corners and require real presence in the lower band:
+	# some corners on screen, and the topmost no higher than mid frame (it must
+	# stay BELOW the horizon — this is a chin-mounted FPV cam, not a chase view).
+	# Anchored to PropGuards specifically, not to a count over every airframe
+	# mesh: the duct cage IS what a cinewhoop pilot sees, and a total across all
+	# meshes moves whenever the model gains or loses a part, which makes it fail
+	# for reasons that have nothing to do with visibility.
+	var guards := drone.find_child("PropGuards", true, false) as MeshInstance3D \
+			if drone != null else null
+	if cam != null and guards != null:
+		var vp := cam.get_viewport().get_visible_rect().size
+		_project_hull(guards, cam, vp)
+		if _proj_in < 8:
+			fails += 1
+			print("FAIL only %d of %d sampled duct-cage vertices land in the FPV "
+					% [_proj_in, _proj_total] + "frame — the drone is not on screen")
+		elif _proj_top < vp.y * 0.5:
+			fails += 1
+			print("FAIL duct cage reaches %.0f%% down the frame — it should stay "
+					% (100.0 * _proj_top / vp.y) + "in the lower band")
+		else:
+			print("[fpv_cull_test] duct cage: %d/%d sampled vertices on screen, "
+					% [_proj_in, _proj_total]
+					+ "topmost %.0f%% down" % (100.0 * _proj_top / vp.y))
+	elif guards == null:
+		fails += 1
+		print("FAIL the drone model has no PropGuards node")
 
 	print("[fpv_cull_test] %s (%d failure(s), %d hidden, %d visible)"
 			% ["PASS" if fails == 0 else "FAIL", fails, hidden, visible_parts])
 	quit(1 if fails > 0 else 0)
+
+
+var _proj_in := 0
+var _proj_total := 0
+var _proj_top := INF
+
+# Sample every Nth vertex of the cage. Deliberately real vertices rather than
+# the AABB: the bounding box's corners are its extreme diagonals, which sit out
+# past the guards entirely, so a corner test reports "off screen" while the
+# front rims are plainly in the feed.
+const GUARD_SAMPLE_STRIDE := 97   # coprime with the ring tessellation
+
+
+func _project_hull(mi: MeshInstance3D, cam: Camera3D, vp: Vector2) -> void:
+	var verts: PackedVector3Array = mi.mesh.surface_get_arrays(0)[Mesh.ARRAY_VERTEX]
+	var i := 0
+	while i < verts.size():
+		var world: Vector3 = mi.global_transform * verts[i]
+		_proj_total += 1
+		i += GUARD_SAMPLE_STRIDE
+		if cam.is_position_behind(world):
+			continue
+		var sp := cam.unproject_position(world)
+		if sp.x >= 0 and sp.x < vp.x and sp.y >= 0 and sp.y < vp.y:
+			_proj_in += 1
+			_proj_top = minf(_proj_top, sp.y)
 
 
 func _find_camera(n: Node) -> Camera3D:

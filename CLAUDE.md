@@ -17,7 +17,7 @@ No external dependencies (kernel `js` API, not SDL2). One pinned submodule.
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo && cmake --build build -j
-ctest --test-dir build            # 22 ctests: 15 always, +6 with a godot binary, +gym_hover if uv-synced; ~2.5 min
+ctest --test-dir build            # 24 ctests: 16 always, +6 with a godot binary, +model_regen with an OpenSCAD snapshot, +gym_hover if uv-synced; ~2.5 min
 ```
 
 The Betaflight submodule builds as a static lib (`extern/`). Source list is
@@ -51,11 +51,15 @@ if the firmware version changes.
 | `rpm_filter` | bidir-DSHOT eRPM: the virtual ESC encodes physics-true rpm into real eRPM period frames; firmware-side telemetry rpm matches physics within quantization and the RPM filter runs during a stable hover |
 | `reset_determinism` | one core, the identical input tape twice around `PW_CMD_RESET` → byte-identical streams (fails on any stray rand()/clock in the sim path, or anything leaking through the snapshot reset) |
 | `cross_process_determinism` | two fresh cores, identical inputs (one send-jittered) → byte-identical output — the headline claim, gated |
+| `model_asset` | the committed airframe GLB still meets its dimensional contract: wheelbase 142 mm, duct bore 95 mm, prop 90 mm, guard span 203.5 mm, node/mesh/material names, normals + UVs, 50k–100k triangles. Pure stdlib Python — no OpenSCAD, no Godot, so it runs on Windows too |
+| `model_regen` | regenerating from `model/cinelog35_v3.scad` reproduces the committed GLB — red if the source was edited without a regen (needs an OpenSCAD snapshot; skipped otherwise) |
 
 The six client tests (`godot_client`, `flythrough`, `quality_tiers`,
 `fpv_cull`, `client_collision`, `repair_flow`) only run if a `godot` binary is
-found (see `find_program(GODOT_BIN ...)` in `CMakeLists.txt`). `gym_hover` only
-runs if a Python with `numpy`+`gymnasium` is found — prefer
+found (see `find_program(GODOT_BIN ...)` in `CMakeLists.txt`). `model_regen`
+only runs if an OpenSCAD **snapshot** is found — the 2021.01 stable release
+cannot build the model at all (no manifold backend, no OBJ export).
+`gym_hover` only runs if a Python with `numpy`+`gymnasium` is found — prefer
 `python/propwash_gym/.venv` (run `uv sync` there first, then re-run
 `cmake -B build` so it's detected).
 Tests that bind ports must not overlap — leftover `propwash-core` processes
@@ -95,6 +99,13 @@ with `--no-js`.
   (the core's snapshot reset makes reset ≡ fresh process), so Gymnasium's
   step-determinism check is enforced — gated core-side by
   `reset_determinism`/`cross_process_determinism`.
+- **`model/`** — the airframe as *source*. `cinelog35_v3.scad` is a clean-room
+  parametric CineLog35 V3; `build_asset.py` (stdlib only — it hand-packs the
+  GLB, no Blender) renders 12 material groups through OpenSCAD and emits
+  `client-godot/assets/cinelog35_v3.glb`, a committed build product in the same
+  sense as `extern/bf_sources.txt`. The client loads it at runtime through
+  `GLTFDocument`, not the Godot importer, so the project still has zero
+  imported resources and ctest needs no import pass.
 - **`tools/sysid/`** — blackbox replay + system ID (stdlib Python). Reuses
   `tools/tester/pw_udp.py` and adds `PW_INIT` + `PW_MOTOR_IN` codecs (`wire.py`).
   Two replay modes: RC (`PW_STATE_IN`, firmware in the loop) and physics-only
@@ -197,6 +208,54 @@ with `--no-js`.
   flies upside-down. That's what `config/sitl-overrides.txt` is for.
 - **Betaflight source uses `#pragma GCC poison sprintf snprintf`** unless
   `SIMULATOR_BUILD` is defined; keep that define on the BF lib.
+- **There is no usable *stable* OpenSCAD.** 2021.01 is the newest stable
+  release (Feb 2021) and `model/build_asset.py` cannot run on it: it needs
+  `--backend=manifold` and `--export-format=obj`, and `src/export_obj.cc` does
+  not exist at that tag. OpenSCAD ships via dated snapshots, which pin cleanly
+  because files.openscad.org keeps them forever —
+  `model/OPENSCAD_VERSION` holds the pinned URL + sha256 that CI downloads.
+- **The airframe's duct rings are supposed to overlap, so don't widen the
+  wheelbase.** Each duct's outer radius is 51.55 mm while adjacent duct centres
+  sit 100.41 mm apart — the 2.69 mm overlap is what fuses the four rings into
+  the two molded halves, and `prop_guards()` cuts its tooling-relief slots
+  through that tangency. Raising `wheelbase` past ~146 mm separates them and
+  the cage becomes four floating hoops. If the physics ever needs a wider quad,
+  scale the model uniformly at the Godot node instead — `main.gd` already
+  derives that scale and warns when it is not 1.0.
+- **The 142 mm wheelbase lives in three places and they must agree**:
+  `model/cinelog35_v3.scad` (`wheelbase = 142`), `quadMotorPos` in
+  `core/sim/profile_cinelog35.h`, and `MOTOR_OFFSETS` in `main.gd` — plus
+  `tools/sysid/profiles.py`. All are ±50.205 mm (142/√2/2). `main.gd` warns at
+  load if the model and the profile diverge.
+- **`PW_HULL_*` is NOT the wheelbase**, even though `PW_HULL_DUCT_XZ` (0.054)
+  sits near it. The five spheres are a tuned approximation of a ducted cage's
+  *contact behaviour*: a 30 mm sphere already under-fits a 51.55 mm duct ring,
+  so the offset is a contact parameter, not a dimension. Re-deriving it from the
+  real airframe (0.0718, which puts the spheres' outer edge on the true 203.5 mm
+  guard span) widens the stance enough to break `crash_scenario` and
+  `turtle_flip`. Retune the hull as a whole or leave it alone. `codec_parity`
+  now compares `HULL` between the two Python codecs so the copies can't drift.
+- **Collision never touches the drone mesh.** Contacts come from the analytic
+  `HULL_SPHERES` plus engine shape queries, so swapping the visual model is
+  physics- and determinism-neutral. Conversely, a prettier model buys you
+  nothing in collision fidelity.
+- **`CAM_POS` is coupled to the airframe geometry and is easy to knock out of
+  frame.** The quad is 22 mm tall seen through a 105 deg lens, so a few mm of
+  camera height decides whether the front ducts hold the bottom of the feed or
+  the airframe disappears entirely — seating the model on the pad and shrinking
+  the wheelbase each did it once. Pushing the camera forward toward the real O3
+  nacelle position is worse, not better: past ~-0.03 it clears the front duct
+  and the guards leave the frustum sideways. **Layer bits are not visibility** —
+  every cull-mask assertion passed with the drone completely off screen, which
+  is why `fpv_cull_test` now projects the hull into the FPV camera and requires
+  it in the lower band.
+- **Godot's headless viewport is 64 px tall**, so anything asserting on screen
+  *fractions* is coarse there; assert on projected corner COUNTS instead. And
+  because the client runs `physics_interpolation=true`, moving a camera from a
+  script and immediately calling `unproject_position` reads the stale
+  interpolated transform — the reason `_repair_in_place` calls
+  `reset_physics_interpolation()`. Probe camera poses by changing `CAM_POS` and
+  rebuilding the scene, not by nudging the node at runtime.
 
 ## Diagnostics
 

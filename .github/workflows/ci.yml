@@ -128,6 +128,63 @@ jobs:
       - name: Gym env-checker + hover (real core in the loop)
         run: ctest --test-dir build --output-on-failure -R gym_hover
 
+  # The airframe is generated: model/cinelog35_v3.scad is the source of truth
+  # and client-godot/assets/cinelog35_v3.glb is a committed build product. This
+  # job is the drift gate — it rebuilds from the .scad with the pinned OpenSCAD
+  # and diffs the result, so editing the .scad without regenerating goes red.
+  #
+  # Linux only: it is the same check on every platform, and this is the only
+  # runner with a snapshot AppImage. The dimensional half (model_asset) needs
+  # no OpenSCAD and already runs in build-and-test on all three platforms.
+  model-asset:
+    runs-on: ubuntu-latest
+    env:
+      # OpenSCAD is a Qt app even when only exporting from the CLI. Rather than
+      # bringing up an X server for it, tell Qt there is no display.
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned OpenSCAD snapshot
+        run: |
+          # The AppImage bundles Qt itself but still links the system GL/EGL and
+          # xcb stack, none of which the runner image ships — without these it
+          # dies at load with "libEGL.so.1: cannot open shared object file".
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1 libglu1-mesa libopengl0 libdbus-1-3 libfontconfig1 \
+            libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 \
+            libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 \
+            libxcb-xinerama0 libxcb-xkb1
+
+          # model/OPENSCAD_VERSION is the single pin — plain KEY=VALUE so both
+          # bash and build_asset.py's error messages can point at one file.
+          set -a; . ./model/OPENSCAD_VERSION; set +a
+          curl -sSLO "$LINUX_APPIMAGE"
+          appimage="$(basename "$LINUX_APPIMAGE")"
+          echo "$LINUX_SHA256  $appimage" | sha256sum -c -
+          chmod +x "$appimage"
+          # --appimage-extract instead of running the AppImage directly: the
+          # GitHub runners have no libfuse2, and extracting needs no FUSE.
+          "./$appimage" --appimage-extract >/dev/null
+          echo "OPENSCAD_BIN=$PWD/squashfs-root/AppRun" >> "$GITHUB_ENV"
+
+      - name: Verify the pin, then regenerate from the .scad
+        run: |
+          "$OPENSCAD_BIN" --version
+          python3 model/build_asset.py \
+            --require-pinned-version \
+            --output "$RUNNER_TEMP/cinelog35_v3.glb"
+
+      - name: Dimensional contract (wheelbase, bore, prop, guard span, budget)
+        run: python3 model/validate_glb.py "$RUNNER_TEMP/cinelog35_v3.glb"
+
+      - name: The committed GLB must match the .scad
+        run: |
+          python3 model/compare_glb.py \
+            "$RUNNER_TEMP/cinelog35_v3.glb" \
+            client-godot/assets/cinelog35_v3.glb
+
   godot-client:
     strategy:
       fail-fast: false
@@ -179,4 +236,10 @@ jobs:
 
       - name: Godot client + fly-through (headless autotest)
         run: |
-          ctest --test-dir build --output-on-failure -R 'godot_client|flythrough'
+          # fpv_cull/client_collision/repair_flow/quality_tiers only exist when
+          # a godot binary was found at configure time, so build-and-test (which
+          # installs no Godot) never registers them — this is the only job that
+          # can run them at all. fpv_cull in particular is what pins the drone
+          # model's node names, prop order and FPV layer split.
+          ctest --test-dir build --output-on-failure \
+            -R 'godot_client|flythrough|fpv_cull|client_collision|repair_flow|quality_tiers'
