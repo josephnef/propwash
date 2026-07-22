@@ -55,6 +55,22 @@ const LOS_FOV_MAX := 55.0
 
 const CUT_FADE := 0.18         # seconds to crossfade the goggle treatment
 
+# PROPWASH_CAM_ZOOM=<factor> tightens the EXTERNAL cameras so the airframe
+# fills more of the frame — for looking at the quad itself (does it tremble? do
+# the props spin the right way? does the model look right?) rather than for
+# filming the flight. 2.0 is a good inspection setting.
+#
+# Chase pulls in by the factor; LOS narrows the world width it holds, which is
+# a zoom rather than a move — the tripod stays put, as it should.
+#
+# The FPV camera is deliberately NOT affected. It is a 105 deg lens bolted to
+# the airframe; "zooming" it would be inventing hardware, and all it can see of
+# the quad is the front ducts anyway.
+const ZOOM_ENV := "PROPWASH_CAM_ZOOM"
+const ZOOM_MIN := 0.5
+const ZOOM_MAX := 6.0
+var _zoom := 1.0
+
 var _main: Node3D
 var _chase: Camera3D
 var _los: Camera3D
@@ -71,6 +87,10 @@ var _caption_text := ""
 
 func setup(main: Node3D, world: Node3D, fpv_hidden_layer: int) -> void:
 	_main = main
+	var z := OS.get_environment(ZOOM_ENV)
+	if z.is_valid_float():
+		_zoom = clampf(z.to_float(), ZOOM_MIN, ZOOM_MAX)
+		print("[pw][cam] external cameras zoomed x%.2f" % _zoom)
 
 	_chase = Camera3D.new()
 	_chase.name = "ChaseCamera"
@@ -93,6 +113,27 @@ func setup(main: Node3D, world: Node3D, fpv_hidden_layer: int) -> void:
 	# once already.
 	_chase.set_cull_mask_value(fpv_hidden_layer, true)
 	_los.set_cull_mask_value(fpv_hidden_layer, true)
+
+	# Physics interpolation OFF for both, and this is the fix for a real,
+	# visible bug rather than a micro-optimisation.
+	#
+	# These two are driven from _process, at render rate. Godot's physics
+	# interpolation assumes a node's transform is written on the PHYSICS frame
+	# and renders it between the last two physics snapshots — so a node written
+	# every render frame gets interpolated between values that are already
+	# render-rate, and its drawn transform wobbles against its set transform.
+	#
+	# On a camera that wobble is worse than it sounds. A camera TRANSLATION
+	# error moves near geometry across the frame far more than distant geometry
+	# (plain parallax), so the drone 3.2 m away visibly trembles while the
+	# treeline at 100-400 m does not move at all. That is exactly the "only the
+	# drone is jittery, the world is smooth" report this came from.
+	#
+	# The FPV camera is deliberately NOT touched: it is a child of the drone,
+	# is written on the physics frame with it, and must stay interpolated so it
+	# inherits the same smoothing.
+	_chase.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
+	_los.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
 
 
 func build_captions(ui: CanvasLayer) -> void:
@@ -166,7 +207,16 @@ func _apply() -> void:
 
 
 func _track(dt: float) -> void:
-	var p: Vector3 = _main._pos
+	# Aim at where the drone is DRAWN, not where physics says it is.
+	#
+	# The drone is physics-interpolated, so its rendered origin lags the raw
+	# _pos by a fraction of a physics step that changes every frame. Framing the
+	# shot on _pos therefore puts the quad a few mm off centre by a varying
+	# amount — measured at 0.8 +/- 1.3 mm, peaking at 4.5 mm under acceleration
+	# and exactly zero at constant velocity. Small, but it lands on the drone
+	# and on nothing else, because no other object has an interpolation gap.
+	var p: Vector3 = _main._drone.get_global_transform_interpolated().origin \
+			if _main._drone != null else _main._pos
 	var vel: Vector3 = _main._linvel
 	var basis := Basis(_main._rot)
 
@@ -185,13 +235,20 @@ func _track(dt: float) -> void:
 		heading = Vector3(0, 0, -1)
 	heading = heading.normalized()
 
-	var want := p - heading * CHASE_BACK + Vector3.UP * CHASE_UP
-	want.y = maxf(want.y, 0.45)        # never clip through the ground plane
+	var want := p - heading * (CHASE_BACK / _zoom) + Vector3.UP * (CHASE_UP / _zoom)
+	# never clip through the ground plane; the floor has to come down with the
+	# zoom or a tight chase just sits on the 0.45 m clamp and stops tracking
+	want.y = maxf(want.y, 0.45 / _zoom)
 	if not _chase_ready:
 		_chase_pos = want
 		_chase_ready = true
 	else:
-		_chase_pos = _chase_pos.lerp(want, 1.0 - exp(-CHASE_LAG * dt))
+		# Lag scales WITH the zoom. The follow time constant is what actually
+		# sets the on-screen distance while moving: at 7 m/s the default 3.5/s
+		# trails about 2 m, which swamps a 1.3 m zoomed stand-off and leaves the
+		# quad just as small as before. Tightening the shot has to tighten the
+		# tracking too.
+		_chase_pos = _chase_pos.lerp(want, 1.0 - exp(-CHASE_LAG * _zoom * dt))
 	_chase.position = _chase_pos
 	if _chase_pos.distance_to(p) > 0.05:
 		_chase.look_at(p, Vector3.UP)
@@ -204,7 +261,8 @@ func _track(dt: float) -> void:
 		var d := _los_anchor.distance_to(p)
 		if d > 0.2:
 			_los.look_at(p, Vector3.UP)
-			_los.fov = clampf(rad_to_deg(2.0 * atan(LOS_FRAME_M / (2.0 * d))),
+			_los.fov = clampf(
+					rad_to_deg(2.0 * atan((LOS_FRAME_M / _zoom) / (2.0 * d))),
 					LOS_FOV_MIN, LOS_FOV_MAX)
 
 

@@ -261,6 +261,9 @@ func _ready() -> void:
 	_shot_dir = OS.get_environment("PROPWASH_SHOTS")
 	_strict = OS.get_environment("PROPWASH_STRICT") == "1"
 	_contact_log = OS.get_environment("PROPWASH_CONTACT_LOG") == "1"
+	_jl = OS.get_environment("PROPWASH_JITTER_LOG") == "1"
+	if _jl:
+		Engine.max_fps = 60   # comparable A/B runs
 	var port_env := OS.get_environment("PROPWASH_PORT")
 	if port_env.is_valid_int():
 		_core_port = int(port_env)
@@ -419,7 +422,144 @@ func _spawn_core() -> void:
 	print("propwash-core pid ", _core_pid)
 
 
+# PROPWASH_JITTER_LOG=1 — measure the ACTUAL symptom: where things are DRAWN
+# on screen, frame to frame.
+#
+# Everything else here (tick spacing, steps per frame) measures a proxy. This
+# measures what the eye sees. get_global_transform_interpolated() returns the
+# transform Godot actually renders — the physics-interpolated one — rather than
+# the value last written from script, and unproject_position uses the camera's
+# own drawn transform. So this is the rendered pixel position of the drone.
+#
+# Two points are tracked through the SAME camera:
+#   - the drone
+#   - a fixed point in the world (gate 1's top bar)
+# because the reported symptom is "the world is smooth, only the drone
+# trembles". Measuring both turns that into two numbers instead of an opinion.
+#
+# The metric is the mean absolute SECOND difference of screen position, in
+# pixels. Under smooth motion — still, constant velocity, or a steady turn —
+# successive screen steps change slowly and this is near zero. Frame-to-frame
+# tremble alternates the step size and makes it large. It is scale-free: it
+# does not care how fast anything is moving, only whether the motion is smooth.
+const JITTER_REF := Vector3(0.0, 2.05, -6.0)   # gate 1 top bar: static world
+var _jl := false
+var _jl_n := 0
+var _jl_prev := [Vector2.ZERO, Vector2.ZERO, Vector2.ZERO]
+var _jl_d1 := [Vector2.ZERO, Vector2.ZERO, Vector2.ZERO]
+var _jl_jerk := [0.0, 0.0, 0.0]
+var _jl_ang := 0.0
+var _jl_rate: Array[float] = []
+var _jl_aim: Array[float] = []
+var _jl_samples := 0
+
+
+func _jitter_log(_delta: float) -> void:
+	if _drone == null:
+		return
+	var vp := _drone.get_viewport()
+	if vp == null:
+		return
+	var cam := vp.get_camera_3d()
+	if cam == null:
+		return
+	# DRAWN transform (physics-interpolated), not the value last written
+	var x: Transform3D = _drone.get_global_transform_interpolated()
+
+	# Blade probe: the rendered ANGULAR RATE of a prop, in the drone's own
+	# frame so the airframe's motion cancels out.
+	#
+	# NOT a point on the rim. A rim point orbits, so its screen
+	# second-difference is dominated by centripetal acceleration and a
+	# perfectly smooth spin scores enormous — the first version of this probe
+	# measured exactly that and said nothing useful. What matters is whether
+	# the angle advances at a constant rate per unit of DISPLAYED time.
+	if not _props.is_empty() and _delta > 0.0:
+		var pr := _props[0] as Node3D
+		var rel := x.affine_inverse() * pr.get_global_transform_interpolated()
+		var ang := atan2(rel.basis.x.z, rel.basis.x.x)
+		var step := wrapf(ang - _jl_ang, -PI, PI)
+		_jl_ang = ang
+		if _jl_n > 2:
+			_jl_rate.append(absf(step) / _delta)
+	# THE camera-aim error: the director aims the chase/LOS cameras at _pos,
+	# the raw physics position, but the drone is DRAWN at x.origin, the
+	# interpolated one. If that gap varies frame to frame, the drone wobbles
+	# against frame centre while the static world — which the gap does not
+	# touch — stays put.
+	_jl_aim.append((x.origin - _pos).length())
+	# Three screen-space probes through the SAME camera:
+	#   origin - the body; translation only
+	#   duct   - offset from centre, so it also picks up ROTATION. An airframe
+	#            that shimmers in place moves this and NOT the origin, which is
+	#            why a centre-only probe found nothing.
+	#   world  - static geometry: the "is everything else smooth" control that
+	#            turns "only the drone trembles" into two comparable numbers.
+	var pts := [x.origin, x * Vector3(0.0718, 0.0, -0.0718), JITTER_REF]
+	var out := []
+	for q in pts:
+		if cam.is_position_behind(q):
+			return
+		out.append(cam.unproject_position(q))
+	_jl_n += 1
+	if _jl_n > 2:
+		for k in range(3):
+			var d1: Vector2 = out[k] - _jl_prev[k]
+			_jl_jerk[k] += (d1 - _jl_d1[k]).length()
+			_jl_d1[k] = d1
+		_jl_samples += 1
+	_jl_prev = out.duplicate()
+	if _jl_samples < 120:
+		return
+	var n := float(_jl_samples)
+	var rm := 0.0
+	for v in _jl_rate:
+		rm += v
+	rm /= maxf(float(_jl_rate.size()), 1.0)
+	var rv := 0.0
+	for v in _jl_rate:
+		rv += (v - rm) * (v - rm)
+	var rsd := sqrt(rv / maxf(float(_jl_rate.size()), 1.0))
+	# median absolute deviation as well as SD: a single hitched frame blows up
+	# an SD and looks identical to a systematic wobble, and the two need
+	# telling apart.
+	var sorted := _jl_rate.duplicate()
+	sorted.sort()
+	var med: float = sorted[sorted.size() / 2] if sorted.size() > 0 else 0.0
+	var devs: Array[float] = []
+	for v in _jl_rate:
+		devs.append(absf(v - med))
+	devs.sort()
+	var mad: float = devs[devs.size() / 2] if devs.size() > 0 else 0.0
+	var worst: float = sorted[sorted.size() - 1] if sorted.size() > 0 else 0.0
+	print("[jitter] %d fr @ %.0f fps, cam %s | body %.2f | duct %.2f | world %.2f px/fr^2"
+			% [_jl_samples, Engine.get_frames_per_second(), cam.name,
+					_jl_jerk[0] / n, _jl_jerk[1] / n, _jl_jerk[2] / n]
+			+ " || BLADE med %.0f MAD %.0f (%.1f%%) sd %.0f worst %.0f deg/s"
+			% [rad_to_deg(med), rad_to_deg(mad), 100.0 * mad / maxf(med, 1e-6),
+					rad_to_deg(rsd), rad_to_deg(worst)])
+	var am := 0.0
+	for v in _jl_aim:
+		am += v
+	am /= maxf(float(_jl_aim.size()), 1.0)
+	var av := 0.0
+	var amax := 0.0
+	for v in _jl_aim:
+		av += (v - am) * (v - am)
+		amax = maxf(amax, v)
+	print("[aim]    drawn-vs-physics gap %.4f +/- %.4f m (max %.4f) -- the "
+			% [am, sqrt(av / maxf(float(_jl_aim.size()), 1.0)), amax]
+			+ "camera aims at physics, the drone is drawn interpolated")
+	_jl_aim.clear()
+	_jl_rate.clear()
+	_jl_jerk = [0.0, 0.0, 0.0]
+	_jl_samples = 0
+
+
 func _process(delta: float) -> void:
+	_spin_props(delta)
+	if _jl:
+		_jitter_log(delta)
 	_update_goggle(delta)
 	_update_toast()
 	# Camera work runs on the RENDER frame, not the physics frame: the chase
@@ -569,7 +709,6 @@ func _physics_process(delta: float) -> void:
 		_pos.y = HULL_REST_H + 0.03
 
 	_drone.transform = Transform3D(Basis(_rot), _pos)
-	_spin_props(delta)
 	_update_hud()
 	if _autotest:
 		_autotest_check(delta)
@@ -1238,6 +1377,22 @@ const PROP_BLUR_RPM := 12000.0
 const PROP_BLUR_ALPHA := 0.12
 
 
+# Driven on the RENDER frame, with the render delta — not on the physics tick.
+#
+# This is the fix for a measured, visible defect. At 250 Hz physics into 60 Hz
+# render, each rendered frame consumes 4 or 5 physics steps in a fixed 5:1
+# ratio, so anything advanced per-physics-tick moves 25% further every sixth
+# frame. On the airframe that is invisible (it is physics-interpolated, and its
+# screen jerk measures ~1 px/frame^2). On a blade turning at ~4200 deg/s it is
+# 56 deg versus 70 deg per frame on a THREE-blade prop, and it measured 14-46
+# px/frame^2 — up to 18x the body through the same camera. Zoomed in from a
+# chase view that reads as the whole drone vibrating, while the airframe and
+# the world around it are perfectly smooth. Which is exactly how it was
+# reported, and exactly why looking at the flight controller found nothing.
+#
+# Angle is a pure visual: nothing reads _prop_angles, so advancing it by render
+# delta is both correct and the only way to make the step size match the frame
+# actually being displayed.
 func _spin_props(delta: float) -> void:
 	if _props.is_empty():
 		return
@@ -1356,6 +1511,10 @@ func _build_drone_model(root: Node3D) -> void:
 		if prop == null:
 			push_error("[pw] %s has no %s node" % [MODEL_PATH, MODEL_PROP_NODES[i]])
 			continue
+		# written every RENDER frame by _spin_props, so Godot must not also
+		# interpolate them between physics snapshots — that is interpolating a
+		# value that is already render-rate, and it reintroduces the wobble
+		prop.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
 		_props.append(prop)
 		_prop_discs.append(_add_blur_disc(prop))
 
