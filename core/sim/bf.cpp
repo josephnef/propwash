@@ -179,7 +179,25 @@ namespace SimITL{
       flip->range.endStep   = CHANNEL_VALUE_TO_STEP(2100);
 
       BF::analyzeModeActivationConditions();
-      printf("[pw] aux modes configured: ARM=AUX1, ANGLE=AUX2, TURTLE=AUX3\n");
+
+      // Arming while inverted, which is the PREREQUISITE for crashflip. On
+      // real hardware small_angle (default 25 deg) is a safety interlock; in a
+      // simulator there is nothing to be unsafe about, and without it turtle
+      // mode — a headline feature — silently cannot work: the quad flips onto
+      // its back, refuses to arm, and the recovery just grinds at full
+      // throttle. The pilot's own dump already sets 180 for exactly this
+      // reason; forcing it here means a fresh checkout with no eeprom at all
+      // behaves the same as a baked one, instead of requiring
+      // tools/bfcli/load_config.sh before the demo works.
+      //
+      // Same footing as the aux modes above: propwash owns the switch layout
+      // and the arming interlocks because the sim needs them known-good, and
+      // leaves everything that actually flies the quad (PIDs, rates, filters)
+      // to the pilot's config.
+      setSmallAngle(180);
+
+      printf("[pw] aux modes configured: ARM=AUX1, ANGLE=AUX2, TURTLE=AUX3;"
+             " small_angle=180 (arm inverted for crashflip)\n");
     }
 
     // Bench/test relaxation: runaway-takeoff prevention misfires against an
@@ -208,6 +226,14 @@ namespace SimITL{
 
     void setSmallAngle(int degrees){
       BF::imuConfigMutable()->small_angle = (uint8_t)degrees;
+      // small_angle is not read per-arm: imu.c caches it as a COSINE
+      // (smallAngleCosZ) inside imuConfigure(), which normally only runs at
+      // config load. Poking the value alone therefore does nothing until the
+      // next save+reboot, which is why this used to need one. Re-running
+      // imuConfigure() recomputes the cache in place.
+      BF::imuConfigure(
+          BF::throttleCorrectionConfig()->throttle_correction_angle,
+          BF::throttleCorrectionConfig()->throttle_correction_value);
     }
 
     void setDshotBidir(bool on){

@@ -36,6 +36,7 @@
 extends RefCounted
 
 const PwWorld = preload("res://scripts/world.gd")
+const PwProtocol = preload("res://scripts/protocol.gd")
 
 # Chapters this pilot can fly (PROPWASH_DEMO=<name>). `acro`/`flythrough` are
 # NOT here — they stay on main.gd's original ANGLE-mode routine, because the
@@ -1638,10 +1639,57 @@ func _report_ghost() -> void:
 # of tilt otherwise, and the whole act starts from upside-down. It comes from
 # the pilot's own dump (config/cinelog35v3.diff), which is why this chapter
 # needs a baked eeprom and the others do not.
-const TU_CLIMB_TO := Vector3(0.0, 3.0, -4.0)
+# The drop zone, and it has to be genuinely clear for METRES, not just at the
+# point of impact. Turtling is not a pirouette: the quad claws itself along the
+# ground on two reversed props and travelled 1.6 m in testing. At the old
+# (0, 3, -4) that was enough to reach gate 1's FOOT — the feet sit at
+# x = +/-1.2, z = -6.0 and are SURF_OBJECT — which jams the flip against
+# scenery and looks like the turtle mode failing. Sitting it back toward the
+# pad puts 4.5 m between the drop and the nearest gate.
+const TU_CLIMB_TO := Vector3(0.0, 3.0, -1.5)
 const TU_BURST_ON := 125       # 0.5 s at 250 Hz
 const TU_BURST_OFF := 88       # 0.35 s
-const TU_UP_RIGHTED := 0.5     # body-up y that counts as back on its feet
+# Body-up y that counts as back on its feet. NOT 0.5: at 0.5 the quad is still
+# 60 deg off level and only just past the balance point, and releasing the
+# stick there let it flop straight back onto its back (measured: righted at
+# +0.51, on its back again at -0.82 two phases later). 0.85 is ~32 deg from
+# Same 0.5 the headless turtleTest uses: past the balance point, let it coast
+# over. Driving all the way to 0.75 makes the quad claw at the ground for far
+# longer, and it arrives upright having skidded 5 m with 100% prop damage —
+# which the physics then correctly refuses to fly.
+# Past the balance point, and NOT higher. Driving further has been measured
+# twice now to make things worse, not better: the extra clawing costs prop
+# damage faster than the extra margin buys reliability (0.65 took a clean 0.10
+# run to 1.00 and wrecked the quad). Reliability has to come from settling and
+# retrying, not from pushing harder.
+const TU_UP_RIGHTED := 0.5
+const TU_STILL_SPEED := 0.4
+# Bound each ATTEMPT, not just the act. A flip that is not working should hand
+# over to the settle-and-retry loop quickly rather than claw for 12 s.
+const TU_FLIP_BUDGET := 250 * 5
+# 5, not 3. The flip is a contact-dynamics problem and its success depends on
+# the exact resting attitude — observed needing 1 retry on a fresh config and
+# all 3 on another, which is too close to the ceiling for something that fails
+# the whole reel when it runs out.
+const TU_RETRIES := 5
+# A half roll at full stick takes ~0.2-0.4 s on any sane tune. 1.2 s is a
+# generous ceiling; past it, stop driving and drop from wherever we are rather
+# than fly the quad out of the demo.
+const TU_ROLL_BUDGET := 300
+# Prop damage ceiling, and deliberately loose. The act crashes the quad ON
+# PURPOSE and every retry of the flip legitimately claws more, so this cannot
+# be a tight "did the drop go well" gate without failing honest runs: observed
+# 0.10 with no retry, 0.53 with two. The assertions that actually mean
+# something are the scenery check, the flip retry, and the fly-away distance —
+# this only catches the quad being destroyed outright, which is worth naming
+# separately because at 1.00 the physics correctly refuses to fly it and every
+# downstream failure becomes a confusing consequence of that.
+const TU_DMG_LIMIT := 0.8
+# Where "and fly away" actually goes. Above gate 1's 2.05 m bar, and far enough
+# down the line that it reads as leaving rather than hovering.
+const TU_FLYAWAY_ALT := 4.0
+const TU_FLYAWAY_Z := -16.0
+const TU_FLYAWAY_MIN_DIST := 8.0
 
 enum {TU_CLIMB, TU_ROLL_OVER, TU_SETTLE, TU_DISARM, TU_BOX, TU_FLIP,
 		TU_RESTORE, TU_FLYAWAY, TU_DONE}
@@ -1652,15 +1700,46 @@ var _tu_turtle_seen := false
 var _tu_max_up := -1.0
 var _tu_rearmed := false
 var _tu_righted := false
+var _tu_tries := 0
+# The turtle act assumes clear ground: it drops the quad on its back and levers
+# it over its own duct edge. Landing against scenery makes that impossible, and
+# before this the run just timed out reporting "never came fully upright" —
+# technically true, and useless for working out why.
+var _tu_obstacle := ""
+var _tu_obstacle_at := Vector3.ZERO
+
+
+const TU_PHASE_NAMES := ["CLIMB", "ROLL_OVER", "SETTLE", "DISARM", "BOX",
+		"FLIP", "RESTORE", "FLYAWAY", "DONE"]
 
 
 func _tu_next(phase: int) -> void:
 	_tu_phase = phase
 	_tu_t = 0
 	_rot_acc = 0.0
+	var p: Vector3 = _main._pos
+	var v: Vector3 = _main._linvel
+	print("[demo] turtle -> %s at %s  vel %.1f m/s  up.y %+.2f"
+			% [TU_PHASE_NAMES[phase], _fmt(p), v.length(),
+					Basis(_main._rot).y.y])
+
+
+# Whole-act watchdog. Several phases wait on the FIRMWARE — an arming block
+# clearing, an attitude settling — and a wait with no ceiling is how the act
+# sat there forever instead of failing with a reason.
+const TU_WATCHDOG := 250 * 120        # 120 s of sim time; a good run takes ~45
+var _tu_frames := 0
+# fc/runtime_config.h armingDisableFlags_e
+const ARMING_DISABLED_ANGLE := 1 << 8
+var _tu_angle_blocked := false
 
 
 func _run_turtle(dt: float) -> void:
+	_tu_frames += 1
+	if _tu_frames > TU_WATCHDOG and _tu_phase != TU_DONE:
+		_fail_reasons.append("turtle act stalled in %s after %.0f s"
+				% [TU_PHASE_NAMES[_tu_phase], _tu_frames / 250.0])
+		_tu_next(TU_DONE)
 	var basis := Basis(_main._rot)
 	var up_y := basis.y.y
 	var out: Dictionary = _main._last_out
@@ -1668,11 +1747,52 @@ func _run_turtle(dt: float) -> void:
 	var flags: int = out.get("crash_flags", 0) if not out.is_empty() else 0
 	if flags & 4:
 		_tu_turtle_seen = true
-	_tu_max_up = maxf(_tu_max_up, up_y)
+	# Arming refused because the quad is tilted past small_angle. After the
+	# flip that is the signature of an eeprom that cannot arm inverted, which
+	# is the whole prerequisite for this act.
+	if _tu_phase >= TU_BOX and not _main._last_out.is_empty():
+		var dis: int = _main._last_out.get("arming_disable", 0)
+		if dis & ARMING_DISABLED_ANGLE:
+			_tu_angle_blocked = true
+	# Only from the FLIP onward. Tracking this from frame 1 meant it read 1.00
+	# off the CLIMB, while the quad was still happily upright and flying — so
+	# the "never came fully upright" assertion was satisfied before the act had
+	# even started, and a completely failed flip still passed it.
+	if _tu_phase >= TU_FLIP:
+		_tu_max_up = maxf(_tu_max_up, up_y)
 	_tu_t += 1
+	# anything that is not the ground has no business being in this act
+	if _tu_obstacle.is_empty():
+		for c in _main._pending_contacts:
+			if c.surface != PwProtocol.SURF_GROUND:
+				_tu_obstacle = ["ground", "a gate", "a tree", "an object"][
+						clampi(c.surface, 0, 3)]
+				_tu_obstacle_at = _main._pos
+				print("[demo] turtle: hit %s at %s — the drop zone is not clear"
+						% [_tu_obstacle, _fmt(_tu_obstacle_at)])
 
 	# defaults for the frame; each phase overrides what it needs
-	_rc[CH_ANGLE] = 1.0        # ANGLE on: turtle is a recovery, not freestyle
+	# ACRO, like every other chapter. Two reasons, both learned the hard way:
+	#
+	# 1. You cannot roll inverted in ANGLE mode. Full stick there commands a
+	#    bank ANGLE capped by angle_limit, not a continuous rotation, so the
+	#    half roll stalls at the limit — measured, it reached 48 deg in 1.2 s
+	#    against the 600-800 deg/s full stick gives in acro. The quad then flew
+	#    on under power instead of rolling, 17 m into a tree.
+	# 2. _fly_to is an ACRO controller end to end: its inner loop closes on a
+	#    RATE error, and in angle mode the stick means an angle, so the whole
+	#    cascade is driven through the wrong plant.
+	#
+	# ...but ONLY for the phases that FLY. The turtle phases themselves keep
+	# ANGLE on, which is what tools/tester/main.cpp's turtleTest does and what
+	# the flip was tuned against; switching those to acro as well made the quad
+	# claw itself 8 m across the field without ever staying upright.
+	#
+	# The chapter used to set ANGLE on throughout because "turtle is a
+	# recovery, not freestyle", which sounds reasonable and is wrong for every
+	# phase that uses _fly_to.
+	_rc[CH_ANGLE] = 1.0 if _tu_phase in [TU_DISARM, TU_BOX, TU_FLIP, TU_RESTORE] \
+			else -1.0
 	_rc[CH_TURTLE] = -1.0
 	_rc[CH_ARM] = 1.0
 
@@ -1681,22 +1801,51 @@ func _run_turtle(dt: float) -> void:
 			cam_hint = "chase"
 			caption = "Every crash is real"
 			subcaption = "contacts are forces inside the physics tick — the firmware feels them"
-			_rc[CH_ARM] = 1.0 if _frame >= ARM_FRAME else -1.0
-			if _wait_for_arm(armed):
+			if _frame < ARM_FRAME:
+				_rc[CH_ARM] = -1.0
+				_idle_sticks()
+				_set_thr(0.0)
+				return
+			if _arm_when_ready(armed):
 				return
 			_fly_to(dt, TU_CLIMB_TO, 0.0, V_MAX)
-			if _main._pos.distance_to(TU_CLIMB_TO) < 1.0 and _tu_t > 250:
+			# SETTLED, not merely arrived. Rolling inverted while still
+			# translating throws the quad sideways and lands it hard on a duct
+			# edge; entering at 2.0 m/s instead of 0.9 was the difference
+			# between 0.10 and 0.75 prop damage on the same code.
+			var v: Vector3 = _main._linvel
+			if _main._pos.distance_to(TU_CLIMB_TO) < 0.8 and v.length() < 0.6 \
+					and _tu_t > 250:
 				_tu_next(TU_ROLL_OVER)
+			if _tu_t > 250 * 20:
+				_fail_reasons.append("never settled over the drop zone")
+				_tu_next(TU_DONE)
 
 		TU_ROLL_OVER:
 			cam_hint = "los"
 			caption = "Rolled inverted, throttle chopped"
 			subcaption = "it falls and settles on its back — nothing is teleported"
-			# ballistic half roll, then hands off and let it drop
-			if _rot_acc < PI * 0.95:
+			# Ballistic half roll, then hands off and let it drop.
+			#
+			# BUDGETED, and that is not paranoia. This phase holds FULL roll
+			# stick until the accumulated rotation reaches pi. How long that
+			# takes depends entirely on the pilot's rate curve, because full
+			# stick means the tune decides the rate — and on a tune where the
+			# accumulator does not converge, the quad simply barrel-rolls away
+			# across the park under power. Measured on a real dump: it left the
+			# drop zone at (0, 2.7, -3.4) and next touched down 17 m away at
+			# (17.3, 0.1, -7.5), wrapped around a tree, 100% prop damage, and
+			# the whole act was unrecoverable from there. Every step in the
+			# maneuver library carries a `budget` for exactly this reason; this
+			# hand-written phase machine never got one.
+			if _rot_acc < PI * 0.95 and _tu_t < TU_ROLL_BUDGET:
 				_drive_axis(dt, CH_ROLL, 2, 1.0, basis)
 				_set_thr(_hover_f() * 0.25)
 			else:
+				if _rot_acc < PI * 0.95:
+					print("[demo] turtle: half roll only reached %.0f deg in "
+							% rad_to_deg(_rot_acc)
+							+ "%.1f s — dropping from here" % (_tu_t / 250.0))
 				_rate_loop_body(dt, Vector3.ZERO, basis)
 				_set_thr(0.0)
 				_tu_next(TU_SETTLE)
@@ -1706,8 +1855,13 @@ func _run_turtle(dt: float) -> void:
 			# rest, exactly as it does for a real crash
 			_idle_sticks()
 			_set_thr(0.0)
+			# Properly on its back, not merely past vertical. -0.4 is only 66
+			# deg over, and starting the flip from that attitude makes the quad
+			# claw sideways instead of levering over its duct edge — it arrived
+			# upright having skidded 3 m with 75% prop damage, which the
+			# physics then correctly refuses to fly.
 			var still: bool = _main._linvel.length() < 0.25
-			if _tu_t > 250 and still and up_y < -0.4:
+			if _tu_t > 250 and still and up_y < -0.85:
 				_tu_next(TU_DISARM)
 			elif _tu_t > 250 * 8:
 				_fail_reasons.append("never settled inverted (up.y %.2f)" % up_y)
@@ -1730,7 +1884,9 @@ func _run_turtle(dt: float) -> void:
 			_set_thr(0.0)
 			_rc[CH_ARM] = -1.0
 			_rc[CH_TURTLE] = 1.0
-			if _tu_t > 125:
+			# same: do not start a flip attempt from a quad that is still moving
+			var box_still: bool = _main._linvel.length() < TU_STILL_SPEED
+			if _tu_t > 125 and (box_still or _tu_t > 250 * 4):
 				_tu_next(TU_FLIP)
 
 		TU_FLIP:
@@ -1740,30 +1896,54 @@ func _run_turtle(dt: float) -> void:
 			_idle_sticks()
 			_set_thr(-1.0)          # throttle stays down; roll does the work
 			_rc[CH_TURTLE] = 1.0
+			# Drive until it is past the balance point, then STOP and disarm.
+			#
+			# The flop-back that made "...and fly away" grind into the grass is
+			# not a threshold problem — it is the reversed props still pushing
+			# while the quad teeters. Chasing it with a higher threshold and a
+			# hold timer just made the quad claw further: it reached 0.76, could
+			# not hold, kept bursting for 12 s and travelled 10 m with 100% prop
+			# damage. Cutting power at the balance point lets it fall onto its
+			# feet instead of being pushed past them, and TU_RESTORE then
+			# settles it with the motors off and retries if it did not take.
 			if up_y > TU_UP_RIGHTED:
-				_tu_righted = true
-			if not _tu_righted:
+				_rc[CH_ROLL] = 0.0
+				_tu_next(TU_RESTORE)
+			else:
 				# burst-and-coast, not a held stick (see the note above)
 				var cycle := _tu_t % (TU_BURST_ON + TU_BURST_OFF)
 				_rc[CH_ROLL] = 1.0 if cycle < TU_BURST_ON else 0.0
-			else:
+			if _tu_t > TU_FLIP_BUDGET:
 				_rc[CH_ROLL] = 0.0
-				if _tu_t > 250:
-					_tu_next(TU_RESTORE)
-			if _tu_t > 250 * 12:
-				_fail_reasons.append("turtle never righted it (max up.y %.2f)"
-						% _tu_max_up)
-				_tu_next(TU_DONE)
+				_tu_next(TU_RESTORE)   # let the retry loop judge it, settled
 
 		TU_RESTORE:
-			# disarm, box off, then arm normally — this is what restores the
-			# motor directions, and asserting it is what proves the reversal was
-			# a real firmware state and not a one-way sim hack
+			# Disarm, box off, and let it settle with the motors STOPPED — this
+			# is the only moment the quad is free of reversed-prop thrust, so
+			# it is the only honest place to ask "is it actually on its feet?".
+			# If it is not, go round again rather than handing an inverted quad
+			# to the fly-away.
 			_idle_sticks()
 			_set_thr(-1.0)
 			_rc[CH_ARM] = -1.0
-			if _tu_t > 250:
-				_tu_next(TU_FLYAWAY)
+			# STILL, not just "250 frames have passed". Judging attitude while
+			# the quad is sliding at 2.3 m/s reads whatever it happened to be
+			# rolling through — which is how CI saw it "settle back" four times
+			# at up.y +0.12, -0.06, +0.25, +0.28 without ever having stopped.
+			var settled: bool = _main._linvel.length() < TU_STILL_SPEED
+			if _tu_t > 250 and (settled or _tu_t > 250 * 5):
+				if up_y > TU_UP_RIGHTED:
+					_tu_righted = true
+					_tu_next(TU_FLYAWAY)
+				elif _tu_tries < TU_RETRIES:
+					_tu_tries += 1
+					print("[demo] turtle: settled back at up.y %+.2f — retry %d"
+							% [up_y, _tu_tries])
+					_tu_next(TU_BOX)
+				else:
+					_fail_reasons.append("the flip would not hold after %d "
+							% TU_RETRIES + "attempts (up.y %+.2f)" % up_y)
+					_tu_next(TU_DONE)
 
 		TU_FLYAWAY:
 			cam_hint = "chase"
@@ -1771,10 +1951,40 @@ func _run_turtle(dt: float) -> void:
 			subcaption = "normal re-arm restores the motor directions"
 			if not out.is_empty() and armed and not (flags & 4):
 				_tu_rearmed = true
-			if _wait_for_arm(armed):
+			if _arm_when_ready(armed):
 				return
-			_fly_to(dt, Vector3(0.0, 2.5, -6.0), 0.0, V_MAX)
-			if _tu_t > 250 * 8:
+			# Never fly an inverted quad. _fly_to happily commands full throttle
+			# regardless of attitude, so entering this phase upside-down means
+			# grinding the props into the ground at thr 1.0 — visible in the
+			# HUD as `alt 0.1 m  thr 1.0` and going nowhere. If the flip did not
+			# actually leave it on its feet, say so instead of destroying it.
+			if Basis(_main._rot).y.y < 0.5:
+				_idle_sticks()
+				_set_thr(0.0)
+				if _tu_t > 250 * 2:
+					_fail_reasons.append("still inverted at the fly-away "
+							+ "(up.y %.2f) — the flip did not hold"
+							% Basis(_main._rot).y.y)
+					_tu_next(TU_DONE)
+				return
+			# Actually leave.
+			#
+			# Two bugs lived here in turn. First the target was (0, 2.5, -6.0),
+			# which is gate 1 — top bar at 2.05 m — so the recovery flew into
+			# it on every run, unnoticed. Moving it back to (0, 2.5, -2.0) fixed
+			# that and created the second: once the drop zone also moved to
+			# z = -1.5, the target was 0.7 m away, so "...and fly away" hopped
+			# up and hovered on the spot.
+			#
+			# Climb out over the drop zone first, THEN run down the line. The
+			# climb matters: threading gate 1's opening from a standing start on
+			# damaged props is not a shot worth risking, whereas 4 m clears its
+			# bar by 2 m.
+			var tgt := Vector3(0.0, TU_FLYAWAY_ALT, TU_CLIMB_TO.z)
+			if _tu_t > 250 * 3:
+				tgt = Vector3(0.0, TU_FLYAWAY_ALT, TU_FLYAWAY_Z)
+			_fly_to(dt, tgt, 0.0, V_MAX)
+			if _tu_t > 250 * 14:
 				_tu_next(TU_DONE)
 
 		TU_DONE:
@@ -1793,6 +2003,24 @@ func _run_turtle(dt: float) -> void:
 # which blocks the arm, which means it never climbs. The shared update() path
 # has this guard built in; the turtle chapter bypasses update() to own ARM, so
 # it needs its own. Returns true if the caller should do nothing else.
+# Raise the ARM switch only once the firmware reports it is ready, and hold it
+# LOW until then. Holding it high through an arming block makes Betaflight latch
+# ARMING_DISABLED_ARM_SWITCH ("flip ARM switch OFF then ON") and the quad can
+# never arm again — which is how the turtle act's fly-away hung forever on a
+# tune where the quad was still tilted past small_angle after the flip.
+func _arm_when_ready(armed: bool) -> bool:
+	if armed:
+		_rc[CH_ARM] = 1.0
+		return false
+	var dis: int = _main._last_out.get("arming_disable", -1) \
+			if not _main._last_out.is_empty() else -1
+	_rc[CH_ARM] = 1.0 if dis == 0 else -1.0
+	_idle_sticks()
+	_set_thr(0.0)
+	_thr_i = 0.0
+	return true
+
+
 func _wait_for_arm(armed: bool) -> bool:
 	if armed:
 		return false
@@ -1816,14 +2044,40 @@ func _report_turtle() -> void:
 	if not _tu_turtle_seen:
 		_fail_reasons.append("turtle mode never activated (crash_flags bit2) — "
 				+ "is small_angle=180 in the eeprom, and is the protocol DSHOT?")
+	if _tu_angle_blocked:
+		# name the actual cause rather than leaving five downstream symptoms
+		_fail_reasons.append("the firmware refused to arm because the quad was "
+				+ "tilted (ARMING_DISABLED_ANGLE): this eeprom has a small "
+				+ "small_angle. Turtle needs `set small_angle = 180` — bake the "
+				+ "real dump with tools/bfcli/load_config.sh")
+	if not _tu_obstacle.is_empty():
+		# reported whether or not the flip then succeeded: turtling against
+		# scenery is luck, not a demonstration
+		_fail_reasons.append("the drop zone was not clear — hit %s at %s"
+				% [_tu_obstacle, _fmt(_tu_obstacle_at)])
 	if _tu_max_up < 0.9:
 		_fail_reasons.append("never came fully upright (max up.y %.2f)" % _tu_max_up)
 	if not _tu_rearmed:
 		_fail_reasons.append("never re-armed normally with turtle inactive")
 	if p.y < 1.0:
 		_fail_reasons.append("did not fly away (ended at %.2f m)" % p.y)
-	print("[demo] turtle: activated=%s max_up=%.2f rearmed=%s end=%s"
-			% [str(_tu_turtle_seen), _tu_max_up, str(_tu_rearmed), _fmt(p)])
+	# "flew away" has to mean it went somewhere. Altitude alone passed while
+	# the quad hovered 0.7 m from where it crashed, which is not the shot.
+	var travelled := Vector2(p.x - TU_CLIMB_TO.x, p.z - TU_CLIMB_TO.z).length()
+	if travelled < TU_FLYAWAY_MIN_DIST:
+		_fail_reasons.append("only got %.1f m from the drop zone — the "
+				% travelled + "recovery is supposed to fly OFF, not hover")
+	# The act crashes the quad on purpose, so some damage is expected — but a
+	# CLEAN run reads about 0.10. It read 0.46 for as long as the act flew in
+	# angle mode and tumbled instead of rolling, which is exactly why "damage
+	# looks high" was dismissed as normal for months. With the baseline honest,
+	# this is worth gating.
+	if _max_dmg > TU_DMG_LIMIT:
+		_fail_reasons.append("prop damage %.2f — the quad is destroyed, "
+				% _max_dmg + "so nothing after this means anything")
+	print("[demo] turtle: activated=%s max_up=%.2f rearmed=%s max_dmg=%.3f end=%s"
+			% [str(_tu_turtle_seen), _tu_max_up, str(_tu_rearmed), _max_dmg,
+					_fmt(p)])
 
 
 # --------------------------------------------------------------- diagnostic

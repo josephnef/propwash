@@ -437,16 +437,24 @@ func _scatter_trees(mesh: Mesh, count: int, width: float, tint: Color) -> void:
 		var v := rng.randf_range(0.72, 1.28)
 		mm.set_instance_color(i, Color(tint.r * v, tint.g * v, tint.b * v * 0.95))
 
-		# trunk collision: a vertical capsule per tree. Trunk only — the
+		# trunk collision: a vertical CYLINDER per tree. Trunk only — the
 		# crowns are visually porous alpha cards, and a canopy collider would
 		# block what clearly looks flyable-through.
+		#
+		# A cylinder and not a capsule, which is what this used to be. A
+		# capsule's bottom hemisphere tapers to a point at ground level, so the
+		# collider shrank to nothing exactly where a landed or crashed quad
+		# sits: measured, the hull could get 5 cm INSIDE the drawn trunk at
+		# y = 0.02 m while contact at y = 2 m was correct. A quad wedged into a
+		# tree it was never told it had hit is what sent us looking for this.
+		# A trunk is a cylinder; model it as one.
 		var body := StaticBody3D.new()
 		body.set_meta("pw_surface", PwProtocol.SURF_TREE)
 		var shape := CollisionShape3D.new()
-		var cap := CapsuleShape3D.new()
-		cap.radius = clampf(0.09 * w, 0.05, 0.5)
-		cap.height = 0.9 * h
-		shape.shape = cap
+		var cyl := CylinderShape3D.new()
+		cyl.radius = clampf(0.09 * w, 0.05, 0.5)
+		cyl.height = 0.9 * h
+		shape.shape = cyl
 		shape.position = Vector3(0, 0.45 * h, 0)
 		body.add_child(shape)
 		body.position = t.origin
@@ -841,10 +849,12 @@ func _build_near_trees() -> void:
 		var body := StaticBody3D.new()
 		body.set_meta("pw_surface", PwProtocol.SURF_TREE)
 		var shape := CollisionShape3D.new()
-		var cap := CapsuleShape3D.new()
-		cap.radius = clampf(0.09 * wide, 0.06, 0.5)
-		cap.height = 0.9 * h
-		shape.shape = cap
+		# cylinder, not a capsule — see the note in _scatter_trees: a capsule's
+		# bottom cap tapers away exactly where a crashed quad rests
+		var cyl := CylinderShape3D.new()
+		cyl.radius = clampf(0.09 * wide, 0.06, 0.5)
+		cyl.height = 0.9 * h
+		shape.shape = cyl
 		shape.position = Vector3(0, 0.45 * h, 0)
 		body.add_child(shape)
 		body.position = pos

@@ -295,6 +295,16 @@ if(GODOT_BIN)
     TIMEOUT 60
     FAIL_REGULAR_EXPRESSION "SHADER ERROR")
 
+  # Tree trunks must be solid where they are drawn, at every height including
+  # ground level. Builds the park and sweeps the hull into a known trunk; needs
+  # no core, like fpv_cull and client_collision.
+  add_test(NAME tree_collider
+    COMMAND ${GODOT_BIN} --headless --path ${CMAKE_SOURCE_DIR}/client-godot
+            --script res://tests/tree_collider_test.gd)
+  set_tests_properties(tree_collider PROPERTIES
+    TIMEOUT 60
+    ENVIRONMENT "PROPWASH_PORT=9156;PROPWASH_CORE=/nonexistent/propwash-core")
+
   # NB every Godot demo test below pins its own PROPWASH_EEPROM under the build
   # dir. Without that they boot from client-godot/eeprom.bin — a persistent,
   # mutable file that a `save` from the retune chapter (or a developer's own
