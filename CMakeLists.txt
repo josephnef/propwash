@@ -182,7 +182,7 @@ if(GODOT_BIN)
     COMMAND ${GODOT_BIN} --headless --path ${CMAKE_SOURCE_DIR}/client-godot)
   set_tests_properties(godot_client PROPERTIES
     TIMEOUT 120
-    ENVIRONMENT "PROPWASH_AUTOTEST=1;PROPWASH_PORT=9143;PROPWASH_CORE=$<TARGET_FILE:propwash-core>")
+    ENVIRONMENT "PROPWASH_AUTOTEST=1;PROPWASH_PORT=9143;PROPWASH_CORE=$<TARGET_FILE:propwash-core>;PROPWASH_EEPROM=${CMAKE_BINARY_DIR}/godot_client-eeprom.bin")
 
   # Quality-tier selection rule. Pure function, no rendering, no sim — the
   # cases that matter (240 Hz -> low) cannot be produced on a 60 Hz dev machine.
@@ -219,7 +219,7 @@ if(GODOT_BIN)
             --script res://tests/repair_flow_test.gd)
   set_tests_properties(repair_flow PROPERTIES
     TIMEOUT 90
-    ENVIRONMENT "PROPWASH_NO_JS=1;PROPWASH_PORT=9145;PROPWASH_CORE=$<TARGET_FILE:propwash-core>")
+    ENVIRONMENT "PROPWASH_NO_JS=1;PROPWASH_PORT=9145;PROPWASH_CORE=$<TARGET_FILE:propwash-core>;PROPWASH_EEPROM=${CMAKE_BINARY_DIR}/repair_flow-eeprom.bin")
 
   # Autonomous gate fly-through (angle mode): arms, cruises forward through
   # all three gates holding altitude, asserts it flew past the last gate.
@@ -227,7 +227,91 @@ if(GODOT_BIN)
     COMMAND ${GODOT_BIN} --headless --path ${CMAKE_SOURCE_DIR}/client-godot)
   set_tests_properties(flythrough PROPERTIES
     TIMEOUT 120
-    ENVIRONMENT "PROPWASH_DEMO=acro;PROPWASH_PORT=9144;PROPWASH_CORE=$<TARGET_FILE:propwash-core>")
+    ENVIRONMENT "PROPWASH_DEMO=acro;PROPWASH_PORT=9144;PROPWASH_CORE=$<TARGET_FILE:propwash-core>;PROPWASH_EEPROM=${CMAKE_BINARY_DIR}/flythrough-eeprom.bin")
+
+  # The same gate run in real ACRO (self-level OFF), flown by the demo pilot's
+  # cascaded controller instead of by the firmware's angle mode. Same clearance
+  # margins, so a regression in the controller cannot hide behind a wider gate.
+  add_test(NAME acro_gateline
+    COMMAND ${GODOT_BIN} --headless --path ${CMAKE_SOURCE_DIR}/client-godot)
+  set_tests_properties(acro_gateline PROPERTIES
+    TIMEOUT 120
+    ENVIRONMENT "PROPWASH_DEMO=gateline;PROPWASH_PORT=9148;PROPWASH_CORE=$<TARGET_FILE:propwash-core>;PROPWASH_EEPROM=${CMAKE_BINARY_DIR}/acro_gateline-eeprom.bin")
+
+  # Determinism, through the Godot client's own state. reset_determinism and
+  # cross_process_determinism gate the core; nothing gated the client, which
+  # carries its own position integration, contact detection and one-deep reply
+  # pipeline. This records a stick tape, resets, replays it open-loop and
+  # requires the trajectory to reproduce EXACTLY — then replays it again with a
+  # single stick sample changed by one microsecond (the finest step the wire can
+  # express) and requires it to diverge. Both halves matter: a run that ignored
+  # its inputs would pass the first check trivially.
+  add_test(NAME demo_ghost
+    COMMAND ${GODOT_BIN} --headless --path ${CMAKE_SOURCE_DIR}/client-godot)
+  set_tests_properties(demo_ghost PROPERTIES
+    TIMEOUT 240
+    ENVIRONMENT "PROPWASH_DEMO=ghost;PROPWASH_PORT=9154;PROPWASH_CORE=$<TARGET_FILE:propwash-core>;PROPWASH_EEPROM=${CMAKE_BINARY_DIR}/demo_ghost-eeprom.bin")
+
+  # Crash inverted -> turtle -> fly away, through the Godot client. The C++
+  # turtle_flip covers the core's side; nothing covered the client path, the
+  # switch sequencing, or that the quad actually flies afterwards. Needs the
+  # pilot's real tune baked in (small_angle = 180 is what lets it arm
+  # inverted), which is why it goes through the Python harness.
+  add_test(NAME demo_turtle_client
+    COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/tester/demo_chapter_check.py
+            $<TARGET_FILE:propwash-core> ${GODOT_BIN} turtle 9153)
+  set_tests_properties(demo_turtle_client PROPERTIES TIMEOUT 240)
+
+  # Live retune over the real Betaflight CLI: pin roll_srate, fly a full-stick
+  # roll, land, disarm, change it over TCP 5761, save, reboot, fly the IDENTICAL
+  # input again, and require the measured peak roll rate to change. Goes through
+  # the Python harness for a private eeprom — the chapter issues a real `save`,
+  # and it must not write into whatever eeprom the developer is flying.
+  add_test(NAME demo_retune
+    COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/tester/demo_chapter_check.py
+            $<TARGET_FILE:propwash-core> ${GODOT_BIN} retune 9155)
+  set_tests_properties(demo_retune PROPERTIES TIMEOUT 420)
+
+  # Hover QUALITY, as a number. The demo pilot's first cut held station
+  # perfectly while limit-cycling in pitch at 0.4 Hz — invisible to every
+  # position and damage assertion in the suite, and plainly visible on video as
+  # the airframe trembling. This asserts settled body-rate RMS, so that class of
+  # regression fails a test instead of being noticed by someone watching.
+  add_test(NAME demo_hover_quality
+    COMMAND ${GODOT_BIN} --headless --path ${CMAKE_SOURCE_DIR}/client-godot)
+  set_tests_properties(demo_hover_quality PROPERTIES
+    TIMEOUT 120
+    ENVIRONMENT "PROPWASH_DEMO=move:hover;PROPWASH_PORT=9152;PROPWASH_CORE=$<TARGET_FILE:propwash-core>;PROPWASH_EEPROM=${CMAKE_BINARY_DIR}/demo_hover_quality-eeprom.bin")
+
+  # Every shader must compile. Cheap, and it closes a real blind spot: the
+  # headless paths never build the goggle pass, so a broken goggle.gdshader
+  # shipped through the whole suite green while failing on any real renderer.
+  # Godot's parser runs headless and prints SHADER ERROR to stderr, which is
+  # what FAIL_REGULAR_EXPRESSION keys on — the script itself cannot see it.
+  add_test(NAME shader_compile
+    COMMAND ${GODOT_BIN} --headless --path ${CMAKE_SOURCE_DIR}/client-godot
+            --script res://tests/shader_compile_test.gd)
+  set_tests_properties(shader_compile PROPERTIES
+    TIMEOUT 60
+    FAIL_REGULAR_EXPRESSION "SHADER ERROR")
+
+  # NB every Godot demo test below pins its own PROPWASH_EEPROM under the build
+  # dir. Without that they boot from client-godot/eeprom.bin — a persistent,
+  # mutable file that a `save` from the retune chapter (or a developer's own
+  # baked tune) silently rewrites, which shows up as an unrelated demo failing
+  # its clearance or rate assertions.
+  #
+  # The freestyle reel: 22 maneuvers through the park — gates, backflip, loop
+  # gate, slalom, roll, a 15 m dive off the scaffold tower, an orbit, a split-S
+  # and a yaw spin — every one of them flown in ACRO by the cascaded controller.
+  # Asserts all 22 completed, no crash latch, and near-zero prop damage, so a
+  # physics or controller regression turns the showpiece red instead of just
+  # making it look bad.
+  add_test(NAME demo_freestyle
+    COMMAND ${GODOT_BIN} --headless --path ${CMAKE_SOURCE_DIR}/client-godot)
+  set_tests_properties(demo_freestyle PROPERTIES
+    TIMEOUT 300
+    ENVIRONMENT "PROPWASH_DEMO=freestyle;PROPWASH_SCENE=park;PROPWASH_PORT=9149;PROPWASH_CORE=$<TARGET_FILE:propwash-core>;PROPWASH_EEPROM=${CMAKE_BINARY_DIR}/demo_freestyle-eeprom.bin")
 endif()
 
 # Python gym (M4). Runs only if an interpreter with numpy + gymnasium is found.

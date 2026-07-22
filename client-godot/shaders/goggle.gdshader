@@ -44,14 +44,30 @@ uniform float contrast_amt = 0.055;     // gentle S-curve; digital "punch"
 uniform float rs_amt = 0.0;             // rolling shutter (0 disables)
 uniform float block_enable = 0.0;       // tier gate
 
+// How much of the goggle feed to apply. 1 = the O3 feed, 0 = the raw render.
+//
+// This exists for the demo director's external cameras. Everything above
+// models a camera bolted to the airframe sending video down a digital link;
+// applied to a chase or ground camera it would be claiming those views come
+// through the same link, which they obviously do not. The director crossfades
+// this on a cut rather than switching hard, so the transition does not pop.
+uniform float feed_mix = 1.0;
+
 float hash12(vec2 p) {
 	return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
 }
 
-void fragment() {
-	vec2 uv = UV;
-	vec2 px = TEXTURE_PIXEL_SIZE;
-
+// The feed treatment itself, as a plain function.
+//
+// It lives here rather than inline in fragment() for one hard reason: Godot
+// forbids `return` inside a processor function (vertex/fragment/light), and an
+// early-out is exactly what the feed_mix == 0 path wants. Writing it inline
+// with a `return` compiles fine as GLSL and is rejected by Godot's parser with
+// "Using 'return' in the 'fragment' processor function is incorrect" — which
+// fails the WHOLE shader, silently drops the goggle look, and then floods the
+// log with `version_get_shader: Parameter "version" is null` once per frame
+// forever. A normal function has no such restriction.
+vec3 goggle_feed(sampler2D tex, vec2 uv, vec2 px) {
 	// --- rolling shutter. Rows are scanned top to bottom, so a row read later is
 	// displaced by whatever the airframe did in between. For yaw this shear IS
 	// the correct artifact. Small: an O3 reads out fast, it is not a GoPro of a
@@ -74,11 +90,11 @@ void fragment() {
 	if (r2 > 0.10) {
 		vec2 off = c * r2 * r2 * ca_amt * 0.02;
 		col = vec3(
-			texture(TEXTURE, uv + off).r,
-			texture(TEXTURE, uv).g,
-			texture(TEXTURE, uv - off).b);
+			texture(tex, uv + off).r,
+			texture(tex, uv).g,
+			texture(tex, uv - off).b);
 	} else {
-		col = texture(TEXTURE, uv).rgb;
+		col = texture(tex, uv).rgb;
 	}
 
 	// --- H.264 stress. Not steady-state macroblocking: the convincing part is
@@ -87,7 +103,7 @@ void fragment() {
 	// hard-snapping to it -- modern encoders lose detail before they show edges.
 	if (block_enable > 0.5 && block_strength > 0.004) {
 		vec2 bs = px * 16.0;
-		vec3 bcol = texture(TEXTURE, (floor(uv / bs) + 0.5) * bs).rgb;
+		vec3 bcol = texture(tex, (floor(uv / bs) + 0.5) * bs).rgb;
 		col = mix(col, bcol, clamp(block_strength, 0.0, 0.45));
 	}
 
@@ -96,8 +112,8 @@ void fragment() {
 	// 2 diagonal taps rather than a 4-tap cross: at 4.1 MP those two extra
 	// fetches cost more than the halo quality they buy, and the halo is what
 	// reads as "DJI ISP" either way
-	vec3 blur = texture(TEXTURE, uv + px).rgb
-	          + texture(TEXTURE, uv - px).rgb;
+	vec3 blur = texture(tex, uv + px).rgb
+	          + texture(tex, uv - px).rgb;
 	col += (col - blur * 0.5) * sharpen_amt;
 
 	// --- digital contrast: a gentle S-curve with slightly crushed blacks and a
@@ -115,5 +131,20 @@ void fragment() {
 	// --- corner falloff
 	col *= 1.0 - vignette_amt * pow(length(c) * 1.414, 3.0);
 
-	COLOR = vec4(clamp(col, vec3(0.0), vec3(1.0)), 1.0);
+	return clamp(col, vec3(0.0), vec3(1.0));
+}
+
+
+void fragment() {
+	vec2 uv = UV;
+	vec2 px = TEXTURE_PIXEL_SIZE;
+	vec3 raw = texture(TEXTURE, uv).rgb;
+
+	// Fully off: one tap and out. An external camera should not be paying for
+	// the sharpen, CA and noise taps only to have them mixed back to zero.
+	if (feed_mix < 0.004) {
+		COLOR = vec4(raw, 1.0);
+	} else {
+		COLOR = vec4(mix(raw, goggle_feed(TEXTURE, uv, px), feed_mix), 1.0);
+	}
 }

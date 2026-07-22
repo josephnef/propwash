@@ -67,14 +67,32 @@ func _check() -> void:
 			print("FAIL PROP_SPIN %s disagrees with motor_dir permuted by "
 					% [Main.PROP_SPIN] + "RPM_FOR_PROP, which gives %s" % [derived])
 
-	# --- check the camera in the world built during _initialize
-	var cam: Camera3D = _find_camera(main)
+	# --- check the FPV camera in the world built during _initialize.
+	#
+	# BY NAME, not "the first Camera3D a depth-first walk finds". That was an
+	# identity only while there was exactly one camera; the demo director adds a
+	# chase and an LOS camera, and both deliberately DO render the hidden layer,
+	# so a traversal-order lookup could quietly start asserting against a camera
+	# that is supposed to fail this check.
+	var cam: Camera3D = main.find_child("FpvCamera", true, false) as Camera3D
 	if cam == null:
 		fails += 1
-		print("FAIL no Camera3D found in the built world")
+		print("FAIL no FpvCamera in the built world")
 	elif cam.get_cull_mask_value(Main.FPV_HIDDEN_LAYER):
 		fails += 1
 		print("FAIL FPV camera does not exclude layer %d" % Main.FPV_HIDDEN_LAYER)
+
+	# --- and the external cameras must exist and must NOT exclude it: seeing
+	# the battery and camera pod from outside is the whole point of them
+	for ext in ["ChaseCamera", "LosCamera"]:
+		var e: Camera3D = main.find_child(ext, true, false) as Camera3D
+		if e == null:
+			fails += 1
+			print("FAIL no %s in the built world" % ext)
+		elif not e.get_cull_mask_value(Main.FPV_HIDDEN_LAYER):
+			fails += 1
+			print("FAIL %s excludes layer %d — it should show the whole airframe"
+					% [ext, Main.FPV_HIDDEN_LAYER])
 
 	# --- something must actually be on the hidden layer, or the mask is a no-op
 	var hidden := _count_on_layer(main, Main.FPV_HIDDEN_LAYER)
@@ -188,16 +206,6 @@ func _project_hull(mi: MeshInstance3D, cam: Camera3D, vp: Vector2) -> void:
 		if sp.x >= 0 and sp.x < vp.x and sp.y >= 0 and sp.y < vp.y:
 			_proj_in += 1
 			_proj_top = minf(_proj_top, sp.y)
-
-
-func _find_camera(n: Node) -> Camera3D:
-	if n is Camera3D:
-		return n
-	for c in n.get_children():
-		var r := _find_camera(c)
-		if r != null:
-			return r
-	return null
 
 
 func _count_on_layer(n: Node, layer: int) -> int:

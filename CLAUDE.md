@@ -17,7 +17,7 @@ No external dependencies (kernel `js` API, not SDL2). One pinned submodule.
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo && cmake --build build -j
-ctest --test-dir build            # 24 ctests: 16 always, +6 with a godot binary, +model_regen with an OpenSCAD snapshot, +gym_hover if uv-synced; ~2.5 min
+ctest --test-dir build            # 31 ctests: 16 always, +13 with a godot binary, +model_regen with an OpenSCAD snapshot, +gym_hover if uv-synced; ~5 min
 ```
 
 The Betaflight submodule builds as a static lib (`extern/`). Source list is
@@ -53,10 +53,18 @@ if the firmware version changes.
 | `cross_process_determinism` | two fresh cores, identical inputs (one send-jittered) → byte-identical output — the headline claim, gated |
 | `model_asset` | the committed airframe GLB still meets its dimensional contract: wheelbase 142 mm, duct bore 95 mm, prop 90 mm, guard span 203.5 mm, node/mesh/material names, normals + UVs, 50k–100k triangles. Pure stdlib Python — no OpenSCAD, no Godot, so it runs on Windows too |
 | `model_regen` | regenerating from `model/cinelog35_v3.scad` reproduces the committed GLB — red if the source was edited without a regen (needs an OpenSCAD snapshot; skipped otherwise) |
+| `acro_gateline` | the same gate run in REAL acro (self-level off), flown by the demo pilot's cascaded controller — same clearance margins as `flythrough` |
+| `demo_hover_quality` | settled hover body-rate RMS is below 0.10 rad/s. Guards a class of regression no position/damage assert can see: a marginally stable cascade holds station while buzzing, which reads on video as the airframe trembling |
+| `demo_freestyle` | 22 acro maneuvers through the `park` scene (gates, backflip, loop gate, slalom, roll, 15 m tower dive, orbit, split-S, yaw spin) all complete, no crash latch, near-zero damage |
+| `demo_turtle_client` | crash inverted -> turtle -> fly away through the Godot client (the C++ `turtle_flip` covers only the core). Bakes the real tune first — `small_angle = 180` is what lets it arm inverted |
+| `shader_compile` | every .gdshader actually parses. Headless never builds the goggle pass, so a broken goggle.gdshader once shipped through the whole suite green while failing on any real renderer |
+| `demo_retune` | live retune over the real CLI: pin `roll_srate`, roll, land, disarm, change it over TCP 5761, `save`, reboot, fly the IDENTICAL stick input — peak roll rate must change (683 -> 1031 deg/s). Goes through the Python harness for a private eeprom, since the chapter issues a real `save` |
+| `demo_ghost` | determinism through the CLIENT's own state (position integration, contact detection, reply pipeline): record a stick tape, reset, replay it -> EXACTLY 0.0 m separation; then replay with one stick sample 1 us different -> must diverge |
 
-The six client tests (`godot_client`, `flythrough`, `quality_tiers`,
-`fpv_cull`, `client_collision`, `repair_flow`) only run if a `godot` binary is
-found (see `find_program(GODOT_BIN ...)` in `CMakeLists.txt`). `model_regen`
+The thirteen client tests (`godot_client`, `flythrough`, `quality_tiers`,
+`fpv_cull`, `client_collision`, `repair_flow`, `shader_compile`,
+`acro_gateline`, `demo_hover_quality`, `demo_freestyle`, `demo_ghost`,
+`demo_turtle_client`, `demo_retune`) only run if a `godot` binary is found (see `find_program(GODOT_BIN ...)` in `CMakeLists.txt`). `model_regen`
 only runs if an OpenSCAD **snapshot** is found — the 2021.01 stable release
 cannot build the model at all (no manifold backend, no OBJ export).
 `gym_hover` only runs if a Python with `numpy`+`gymnasium` is found — prefer
@@ -90,6 +98,21 @@ with `--no-js`.
   core resolves contacts as forces — the client never edits velocities),
   converts sim↔Godot handedness (mirror z; quat -x,-y; angular velocity is a
   pseudovector: -x,-y,+z).
+- **`client-godot/scripts/world.gd`** — the world: sky, ground, treeline,
+  gates, and the scene registry (`PROPWASH_SCENE`). `field` is the original
+  layout three ctests assert against; `park` is `field` plus freestyle
+  furniture (bando shell with threadable gaps, 14 m scaffold tower, tall loop
+  gate, slalom, hand-placed near trees) and is strictly additive.
+- **`client-godot/scripts/demo_pilot.gd`** — the demo pilot: a cascaded
+  controller that flies in REAL acro (position -> velocity -> accel ->
+  thrust-vector attitude -> body-rate PI+FF -> stick), a maneuver library, and
+  the chapter state machines (`freestyle`, `turtle`, `ghost`, `retune`,
+  `reel`). It deliberately does NOT model Betaflight's rate curve — reading it
+  needs MSP, which forfeits determinism — so the inner loop closes on rate
+  ERROR and works against any tune.
+- **`client-godot/scripts/demo_director.gd`** — camera rig (FPV / chase / LOS
+  tripod) with per-maneuver cuts and lower-third captions. The O3 goggle
+  treatment and the OSD are FPV-only, via the shader's `feed_mix` uniform.
 - **`python/propwash_gym/`** — MIT Gymnasium env (`uv`-managed). Same lockstep
   loop as the Godot client: subprocess-per-env, one PW_STATE_IN→PW_STATE_OUT per
   step, client-side position integration + `ground_manifold`. Carries its own
@@ -195,6 +218,35 @@ with `--no-js`.
   segfault. The vendored `cli.c` makes the guard unconditional.
 - **Opening the CLI sets `ARMING_DISABLED_CLI`** until a clean `exit`. Load the
   tune in one instance, fly a fresh one (never touches the CLI).
+- **Betaflight ignores the `#` CLI escape while the quad is ARMED.** Stock
+  upstream behaviour, not a propwash quirk: `fc/tasks.c:147` passes
+  `MSP_SKIP_NON_MSP_DATA` when `ARMING_FLAG(ARMED)`, so `mspEvaluateNonMspData`
+  never runs and the CLI banner never comes. Raw MSP keeps working the whole
+  time — the port answers, the connection is accepted, `#` simply does nothing
+  — which makes this maddening to diagnose from outside. Land and disarm first,
+  exactly like the real quad. (Cost a long detour: it presents as "the CLI is
+  dead while a client drives the sim", because a driven core is usually a
+  FLYING one.)
+- **`exit` in the CLI REBOOTS the FC and discards unsaved changes.** `cliExit`
+  prints "leaving CLI mode, unsaved changes lost" and calls `cliReboot()`, so a
+  RAM-only `set` is thrown away on the way out. Use `save` if the change is
+  meant to stick — it writes the eeprom and reboots.
+- **`ARMING_DISABLED_CLI` survives the in-process reboot.** On real hardware a
+  reboot clears RAM; here `BF::init()` does not clear the firmware's statics,
+  so a core that has ever opened the CLI can never arm again — which is why
+  CLAUDE.md's advice has been "load the tune in one instance, fly a fresh one".
+  Within one process the fix is `PW_CMD_RESET`: it rewinds the statics to the
+  pre-CLI snapshot, and the following `BF::init()` re-reads the eeprom, so a
+  saved retune survives while the arming block clears.
+- **After a reset, hold the ARM switch OFF until `arming_disable` reads 0.**
+  Raising it during the post-reset gyro calibration means the switch is already
+  ON when calibration completes, and Betaflight latches `flip ARM switch OFF
+  then ON` and refuses forever.
+- **Never block inside the client's `_physics_process`.** The core treats a
+  client quiet for longer than `CLIENT_IDLE_MS` as departed and resumes
+  idle-ticking (`server.cpp` `clientDriving`), injecting simulated time nobody
+  asked for — a blocking CLI call let the quad fly unattended and fall out of
+  the air. Client-side network work must be stepped across frames.
 - **`accept()` itself fails for aborted backlog connections on Windows**
   (`WSAECONNRESET`; Linux discards them silently). Stock dyad fell through
   that failure and fabricated a CONNECTED stream around `INVALID_SOCKET` —
@@ -249,6 +301,16 @@ with `--no-js`.
   every cull-mask assertion passed with the drone completely off screen, which
   is why `fpv_cull_test` now projects the hull into the FPV camera and requires
   it in the lower band.
+- **Nothing headless ever compiles a shader.** `_build_goggle_layer` returns
+  early under `--headless`/autotest, so the goggle pass — and therefore
+  `goggle.gdshader` — is never built or parsed by the normal test suite. A
+  broken shader is silent there and catastrophic on a real renderer: it fails
+  the whole shader, the effect vanishes, and Godot emits
+  `version_get_shader: Parameter "version" is null` once per frame forever.
+  The `shader_compile` ctest parses every shader explicitly for this reason.
+  Also note Godot FORBIDS `return` inside a processor function
+  (`vertex`/`fragment`/`light`), and processor built-ins like `TEXTURE` are not
+  visible inside plain functions — pass the sampler in as a parameter.
 - **Godot's headless viewport is 64 px tall**, so anything asserting on screen
   *fractions* is coarse there; assert on projected corner COUNTS instead. And
   because the client runs `physics_interpolation=true`, moving a camera from a
