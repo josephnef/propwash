@@ -311,6 +311,46 @@ with `--no-js`.
   Also note Godot FORBIDS `return` inside a processor function
   (`vertex`/`fragment`/`light`), and processor built-ins like `TEXTURE` are not
   visible inside plain functions — pass the sampler in as a parameter.
+- **The drone "trembling" in 3rd person was the PROPELLERS, not the airframe.**
+  Measured, after two wrong guesses. `_spin_props` advanced the blade angle
+  inside `_physics_process`, i.e. once per physics tick. At 250 Hz physics into
+  60 Hz render each frame consumes 4 or 5 steps in a fixed 5:1 ratio (measured
+  `4:100 5:20`), so the blades advanced 25% further every sixth frame. On a
+  steady hover with constant rpm that measured as **8.8% wobble in rendered
+  blade angular rate (4381 +/- 386 deg/s)**, against **0.00 px/frame^2 screen
+  jerk for the airframe body, the ducts AND the static world** — the body was
+  never trembling at all. Driving the spin on the RENDER frame with the render
+  delta takes it to **0.5% (4381 +/- 14)**. Prop angle is a pure visual;
+  nothing reads `_prop_angles`, so it belongs on the render clock.
+  Consequently the prop nodes are `PHYSICS_INTERPOLATION_MODE_OFF`: they are
+  now written every render frame, and interpolating a value that is already
+  render-rate reintroduces the wobble.
+  WHY IT MISLEADS: spinning blades are the most eye-catching part of the
+  airframe, so their stutter reads as "the whole drone is vibrating", and since
+  nothing else in the scene is driven by the physics tick, "only the drone"
+  looks like evidence about the flight controller. It is not. Two earlier
+  hypotheses (a controller limit cycle, then camera interpolation) were both
+  wrong; the measurement is what settled it.
+- **Never move a physics-interpolated node from `_process`.** Godot renders an
+  interpolated node between its last two PHYSICS-frame transforms, so a node
+  written every render frame is interpolated between values that are already
+  render-rate. The director's chase/LOS cameras and the prop nodes are
+  therefore `PHYSICS_INTERPOLATION_MODE_OFF`. The FPV camera is NOT — it is a
+  child of the drone, written on the physics frame with it.
+- **Aim a follow camera at the DRAWN position, not at `_pos`.** The drone is
+  physics-interpolated, so its rendered origin lags the raw physics position by
+  a varying fraction of a step — measured 0.8 +/- 1.3 mm, peaking at 4.5 mm
+  under acceleration and exactly zero at constant velocity. Use
+  `get_global_transform_interpolated()`. Small, but it lands on the drone and
+  on nothing else, because no other object has an interpolation gap.
+- **`PROPWASH_JITTER_LOG=1` is the tool for all of this.** It reports screen
+  jerk (px/frame^2) for the drone body, a point offset on a duct (so rotation
+  shows up, which a centre-only probe misses) and a STATIC WORLD point through
+  the same camera — plus the blade's rendered angular rate as median +/- MAD.
+  Two lessons in the metric itself: a point on a spinning rim is useless as a
+  jitter probe because its screen second-difference is dominated by centripetal
+  acceleration, and SD alone cannot tell one hitched frame from a systematic
+  wobble, which is why MAD is reported alongside it.
 - **Godot's headless viewport is 64 px tall**, so anything asserting on screen
   *fractions* is coarse there; assert on projected corner COUNTS instead. And
   because the client runs `physics_interpolation=true`, moving a camera from a

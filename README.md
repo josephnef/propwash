@@ -299,6 +299,8 @@ discoverable by reading the source.
 | `PROPWASH_PORT=<port>` | core UDP port; lets tests and a live session coexist |
 | `PROPWASH_NO_JS=1` | spawn the core with `--no-js` (scripted harnesses) |
 | `PROPWASH_CONTACT_LOG=1` | print every new contact event (surface, depth) |
+| `PROPWASH_CAM_ZOOM=<0.5-6>` | tighten the chase/LOS cameras to inspect the airframe; FPV unaffected |
+| `PROPWASH_JITTER_LOG=1` | report physics-tick wall spacing, steps per rendered frame and rendered-vs-physics speed — the tool for "why does it stutter" |
 | `PROPWASH_FORCE_PWM=1` | (core env) force the old PWM motor protocol instead of the dump's DSHOT |
 | `PROPWASH_DUMP_STATE=<path>` | (core env) dump the firmware's writable statics for determinism bisection (`tools/tester/state_diff.py`) |
 
