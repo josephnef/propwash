@@ -142,11 +142,16 @@ Install Godot 4.7+ (`pacman -S godot`, `apt install godot`, or grab the
 [official binary](https://godotengine.org/download)), then:
 
 ```bash
-# one-time: bake your tune into an eeprom the client will use
-tools/bfcli/load_config.sh                 # writes ./eeprom.bin
+godot --path client-godot                  # works with no setup at all
 
+# optional: bake YOUR tune (PIDs, rates, filters) into an eeprom and fly that
+tools/bfcli/load_config.sh                 # writes ./eeprom.bin
 PROPWASH_EEPROM=$PWD/eeprom.bin godot --path client-godot
 ```
+
+Baking is optional. The core pins the switch layout and `small_angle` itself,
+so everything — including the demo's turtle recovery — works out of the box;
+the eeprom is how you fly your *own* tune rather than Betaflight's defaults.
 
 The Godot client spawns `build/propwash-core` itself.
 

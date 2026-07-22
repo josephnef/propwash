@@ -255,6 +255,18 @@ with `--no-js`.
   the backlog (the old Windows-CI reconnect-after-`save` timeout). The
   vendored dyad.c skips the corpse and keeps draining; the reboot path also
   ends the old client deterministically (`tcpReconfigure`).
+- **The core forces `small_angle = 180` at boot** (`bf.cpp`
+  `configureDefaultModes`), on the same footing as the aux modes it already
+  pins. On hardware small_angle (default 25 deg) is a safety interlock against
+  arming while tilted; in a simulator there is nothing to be unsafe about, and
+  without it crashflip silently cannot work — the quad lands on its back,
+  refuses to arm, and the recovery grinds at full throttle. Forcing it means a
+  fresh checkout with NO eeprom behaves like a baked one, instead of requiring
+  `tools/bfcli/load_config.sh` before the demo works at all. NB poking
+  `imuConfig()->small_angle` alone does nothing: imu.c caches it as a cosine
+  (`smallAngleCosZ`) in `imuConfigure()`, so `BF::setSmallAngle` re-runs that
+  to recompute the cache in place — which is what removes the old
+  save-and-reboot requirement.
 - **`align_board_roll = 180`** in the real diff (FC mounted inverted) must be
   zeroed for the sim — the virtual gyro is already airframe-aligned, else it
   flies upside-down. That's what `config/sitl-overrides.txt` is for.
@@ -351,6 +363,24 @@ with `--no-js`.
   jitter probe because its screen second-difference is dominated by centripetal
   acceleration, and SD alone cannot tell one hitched frame from a systematic
   wobble, which is why MAD is reported alongside it.
+- **A trunk is a CYLINDER, not a capsule.** Tree colliders used
+  `CapsuleShape3D`, whose bottom hemisphere tapers to a point at ground level —
+  so the collider shrank to nothing exactly where a landed or crashed quad
+  sits. Measured: the hull reached 5 cm INSIDE the drawn trunk at y = 0.02 m
+  while contact at y = 2 m was correct. That is how a quad ends up visually
+  wedged into a tree the simulator never reported hitting. `tree_collider`
+  gates it by sweeping the hull into a known trunk at seven heights. NB gate
+  TUBES legitimately stay capsules — their rounded caps overreach along the
+  tube axis only, outside the flyable opening.
+- **A demo act that assumes clear space must CHECK for clear space.** The
+  turtle act drops the quad on its back and levers it over its own duct edge,
+  which is impossible against scenery — and its fly-away target was
+  (0, 2.5, -6.0), which is gate 1 with its top bar at 2.05 m. It had been
+  flying into that gate on every run. Nothing failed, because the act only
+  asserted "did it come upright / did it re-arm", and it did. Damage is no help
+  as a signal either: a clean turtle run reads max_dmg 0.46, because the act
+  crashes the quad ON PURPOSE. The act now flags any contact whose surface is
+  not SURF_GROUND and names it, which found the gate immediately.
 - **Godot's headless viewport is 64 px tall**, so anything asserting on screen
   *fractions* is coarse there; assert on projected corner COUNTS instead. And
   because the client runs `physics_interpolation=true`, moving a camera from a
