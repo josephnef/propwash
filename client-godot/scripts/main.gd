@@ -28,6 +28,26 @@ extends Node3D
 # headless run (no .godot import cache yet)
 const PwProtocol = preload("res://scripts/protocol.gd")
 
+# Sky, ground, treeline and gates live in scripts/world.gd — see the note there
+# on why the ground has to stay an analytic flat plane. PROPWASH_SCENE picks a
+# scene; the default is the original flying field, which three ctests assert
+# against, so a new scene must be opt-in rather than replace it.
+const PwWorld = preload("res://scripts/world.gd")
+const SCENE_ENV := "PROPWASH_SCENE"
+var _world_builder: PwWorld
+
+# The demo pilot (scripts/demo_pilot.gd) flies every PROPWASH_DEMO chapter
+# except the original `acro`/`flythrough` gate run, which stays exactly as it
+# was because the `flythrough` ctest asserts against it.
+const PwDemoPilot = preload("res://scripts/demo_pilot.gd")
+var _pilot: PwDemoPilot
+
+# Camera rig + captions (scripts/demo_director.gd). Built on every path, not
+# just in demo mode: a chase view is genuinely useful for hand flying too, and
+# `C` cycles it. Only the demo drives the cuts automatically.
+const PwDemoDirector = preload("res://scripts/demo_director.gd")
+var _director: PwDemoDirector
+
 # Default core port. PROPWASH_PORT overrides it — the ctest harnesses each
 # use their own port so tests never collide with (or hijack) a live flying
 # session on 9100, whose handset would win RC priority and "fly" the test.
@@ -247,6 +267,12 @@ func _ready() -> void:
 	if _demo == "acro":
 		# capture through the whole gate run
 		_shot_times = [4.0, 7.0, 9.0, 11.0, 13.0, 15.0, 17.0, 19.0]
+	elif not _demo.is_empty():
+		# the pilot's chapters run considerably longer; spread the stills over
+		# the whole reel rather than bunching them in the first 20 s
+		_shot_times = []
+		for i in range(24):
+			_shot_times.append(6.0 + i * 2.5)
 	_parse_js_env()
 	# before _setup_display: that returns early under headless/autotest, and the
 	# sim rate has to be identical on every path or the tests do not exercise
@@ -312,41 +338,6 @@ func _apply_quality() -> void:
 	# makes naive preset systems appear to work while doing nothing.
 	RenderingServer.directional_shadow_atlas_set_size(_q.shadow_atlas, true)
 	RenderingServer.directional_soft_shadow_filter_set_quality(_q.shadow_filter)
-
-
-# Applied after the sun/environment exist, from _build_sky_and_sun.
-func _apply_quality_to_env(e: Environment, sun: DirectionalLight3D) -> void:
-	sun.light_angular_distance = _q.sun_angular
-	sun.directional_shadow_mode = _q.shadow_splits
-	sun.directional_shadow_blend_splits = _q.shadow_blend
-	sun.directional_shadow_max_distance = _q.shadow_max_dist
-
-	e.glow_enabled = _q.glow
-	if _q.glow:
-		e.glow_intensity = 0.5
-		e.glow_strength = 1.0
-		e.glow_bloom = 0.05
-		e.glow_blend_mode = Environment.GLOW_BLEND_MODE_SOFTLIGHT
-		e.glow_hdr_threshold = 1.0
-
-	# Forward+ only -- gated on a real RenderingDevice, not on the project
-	# setting, which still claims forward_plus after the OpenGL3 fallback.
-	e.ssao_enabled = _q.ssao and _has_rd
-	if e.ssao_enabled:
-		e.ssao_radius = 0.6        # small: this geometry is cm-scale
-		e.ssao_intensity = 1.5
-		e.ssao_power = 1.5
-	e.ssil_enabled = _q.ssil and _has_rd
-	e.volumetric_fog_enabled = _q.volfog and _has_rd
-	if e.volumetric_fog_enabled:
-		e.volumetric_fog_density = 0.008
-		e.volumetric_fog_albedo = Color(0.80, 0.85, 0.90)
-		e.volumetric_fog_anisotropy = 0.4   # forward scatter -> sun shafts
-		e.volumetric_fog_length = 128.0
-		# default temporal reprojection is tuned for slow cameras; on a quad at
-		# 30 m/s and 800 deg/s it smears trails behind the fog volume
-		e.volumetric_fog_temporal_reprojection_enabled = false
-
 
 
 func _setup_display() -> void:
@@ -422,7 +413,7 @@ func _spawn_core() -> void:
 	# autotest / demo drive RC from the script — a physically-connected Pocket
 	# would otherwise override it (joystick has priority) and hijack the run.
 	# PROPWASH_NO_JS=1 forces the same for scripted harnesses (tests).
-	if _autotest or _demo == "acro" or OS.get_environment("PROPWASH_NO_JS") == "1":
+	if _autotest or not _demo.is_empty() or OS.get_environment("PROPWASH_NO_JS") == "1":
 		args += ["--no-js"]
 	_core_pid = OS.create_process(path, args)
 	print("propwash-core pid ", _core_pid)
@@ -431,6 +422,19 @@ func _spawn_core() -> void:
 func _process(delta: float) -> void:
 	_update_goggle(delta)
 	_update_toast()
+	# Camera work runs on the RENDER frame, not the physics frame: the chase
+	# follow and the LOS zoom are presentation, and smoothing them at 250 Hz
+	# while drawing at 60 would just be 190 wasted updates. Nothing here feeds
+	# the simulation, so it cannot affect reproducibility.
+	if _director != null:
+		var cam := ""
+		var cap := ""
+		var sub := ""
+		if _pilot != null:
+			cam = _pilot.cam_hint
+			cap = _pilot.caption
+			sub = _pilot.subcaption
+		_director.update(delta, cam, cap, sub)
 
 
 func _toast_msg(text: String) -> void:
@@ -455,8 +459,10 @@ func _update_toast() -> void:
 
 func _physics_process(delta: float) -> void:
 	_boot_elapsed += delta
-	if _demo == "acro":
+	if _demo == "acro" or _demo == "flythrough":
 		_update_acro_demo_rc(delta)
+	elif not _demo.is_empty():
+		_update_pilot_rc(delta)
 	elif _autotest:
 		_update_autotest_rc(delta)
 	else:
@@ -584,19 +590,26 @@ func _detect_contacts() -> void:
 		space = _drone.get_world_3d().direct_space_state
 
 	# anti-tunnel: at 30 m/s the quad moves 12 cm per frame — a thin gate tube
-	# fits between two poses. Sweep the belly sphere along the frame's motion
-	# and clip to the first obstacle hit. (The ground can't tunnel: its
-	# analytic depth below only grows with penetration.)
+	# fits between two poses. Sweep the hull along the frame's motion and clip
+	# to the first obstacle hit. (The ground can't tunnel: its analytic depth
+	# below only grows with penetration.)
+	#
+	# ALL FIVE spheres, not just the belly. The belly alone leaves the four duct
+	# spheres — which stick out 5.4 cm to each side and are the parts that
+	# actually clip a gate upright — free to pass straight through thin
+	# geometry between frames. Rotation is held at the frame's end pose for the
+	# sweep, the same approximation the single-sphere version made.
 	var motion := _pos - _prev_pos
 	if space != null and motion.length() > 0.05:
 		var sweep := PhysicsShapeQueryParameters3D.new()
-		sweep.shape = _sphere(HULL_SPHERES[0][1])
-		sweep.transform = Transform3D(Basis.IDENTITY,
-				_prev_pos + basis * HULL_SPHERES[0][0])
 		sweep.motion = motion
-		var frac := space.cast_motion(sweep)
-		if frac[0] < 1.0:
-			_pos = _prev_pos + motion * frac[0]
+		var first := 1.0
+		for s in HULL_SPHERES:
+			sweep.shape = _sphere(s[1])
+			sweep.transform = Transform3D(Basis.IDENTITY, _prev_pos + basis * s[0])
+			first = minf(first, space.cast_motion(sweep)[0])
+		if first < 1.0:
+			_pos = _prev_pos + motion * first
 
 	# candidate contacts: exact ground plane + engine queries for obstacles
 	var found: Array = []
@@ -759,21 +772,71 @@ func _unhandled_key_input(event: InputEvent) -> void:
 				_toast_msg("turtle switch ON — arm to flip" if _turtle_sw
 						else "turtle switch OFF")
 			KEY_R:
-				_udp.put_packet(PwProtocol.pack_command(PwProtocol.PW_CMD_RESET))
-				_pos = Vector3(0, HULL_REST_H, 0)
-				_prev_pos = _pos
-				_rot = Quaternion.IDENTITY
-				_linvel = Vector3.ZERO
-				_angvel = Vector3.ZERO
-				_throttle = -1.0
-				_armed_sw = false
-				_skip_stale_pose = 1
-				# a teleport, not motion — without this the interpolator
-				# smears the drone from where it was back to the pad
-				_drone.reset_physics_interpolation()
+				reset_sim()
 				_toast_msg("reset to pad")
+			KEY_C:
+				# FPV -> chase -> LOS. Handy when hand flying: a chase view is
+				# the fastest way to see what the quad is actually doing.
+				if _director != null:
+					_toast_msg("camera: %s" % _director.cycle())
 			KEY_T:
 				_repair_in_place()
+
+
+# Reset core AND client to the pad. Both halves matter: PW_CMD_RESET rewinds
+# the firmware's writable statics to the post-boot snapshot (so reset is
+# equivalent to a fresh process — see docs/ARCHITECTURE.md), and the client
+# owns world position, so it has to rewind its own integration to match. Miss
+# either half and a "reset" run starts somewhere the other side doesn't agree
+# with, which is exactly what the ghost chapter would surface as divergence.
+func reset_sim() -> void:
+	_udp.put_packet(PwProtocol.pack_command(PwProtocol.PW_CMD_RESET))
+	_pos = Vector3(0, HULL_REST_H, 0)
+	_prev_pos = _pos
+	_rot = Quaternion.IDENTITY
+	_linvel = Vector3.ZERO
+	_angvel = Vector3.ZERO
+	_throttle = -1.0
+	_armed_sw = false
+	_pending_contacts = []
+	_skip_stale_pose = 1
+	# a teleport, not motion — without this the interpolator smears the drone
+	# from where it was back to the pad
+	if _drone != null:
+		_drone.reset_physics_interpolation()
+
+
+# A translucent stand-in for a previously recorded run, used by the ghost
+# chapter. Same GLB as the real airframe so the two are directly comparable —
+# a simplified proxy would leave "are they really in the same place" open.
+func spawn_ghost() -> Node3D:
+	var g := _load_drone_glb()
+	if g == null:
+		return null
+	var holder := Node3D.new()
+	holder.name = "Ghost"
+	holder.add_child(g)
+	_world.add_child(holder)
+	_ghostify(g)
+	# never in the FPV feed: the pilot's camera is ON the live quad, and a
+	# ghost hanging in front of the lens would be nonsense
+	_hide_from_fpv(g)
+	for c in g.get_children():
+		_hide_from_fpv(c)
+	return holder
+
+
+func _ghostify(n: Node) -> void:
+	if n is MeshInstance3D:
+		var m := StandardMaterial3D.new()
+		m.albedo_color = Color(0.35, 0.85, 1.0, 0.30)
+		m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+		m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		m.cull_mode = BaseMaterial3D.CULL_DISABLED
+		(n as MeshInstance3D).material_override = m
+		(n as MeshInstance3D).cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	for c in n.get_children():
+		_ghostify(c)
 
 
 # T: repair + flip upright where it lies — like walking over and fixing the
@@ -819,7 +882,15 @@ func _update_hud() -> void:
 		return
 	var o := _last_out
 	var rc_line: String
-	if _js_dev >= 0:
+	if not _demo.is_empty():
+		# During a demo the keyboard help is noise — nobody is at the sticks.
+		# The flight mode is what matters, and it comes from the firmware's own
+		# flightModeFlags rather than from what we asked for on ch6: this line
+		# is the difference between "the demo claims ACRO" and "Betaflight
+		# reports ACRO".
+		rc_line = "mode %s   %s" % [_mode_name(o.get("mode_flags", 0)),
+				_demo.to_upper()]
+	elif _js_dev >= 0:
 		# live channels help confirm the AETR+switch mapping / spot inversions
 		rc_line = "RC '%s'  A%+.2f E%+.2f T%+.2f R%+.2f  5:%+.2f 6:%+.2f 7:%+.2f 8:%+.2f" % [
 			Input.get_joy_name(_js_dev),
@@ -840,6 +911,21 @@ func _update_hud() -> void:
 		"ARMED" if o.armed else "DISARMED", _pos.y, o.vbat, _throttle,
 		o.motor_rpm[0], o.motor_rpm[1], o.motor_rpm[2], o.motor_rpm[3],
 		o.arming_disable, dmg_line, rc_line]
+
+
+# Betaflight flightModeFlags, low bits (src/main/fc/runtime_config.h):
+# bit0 ANGLE_MODE, bit1 HORIZON_MODE. Neither set = acro, which is the state
+# the demo cares about and the one that has no flag of its own.
+const FLIGHT_MODE_ANGLE := 1 << 0
+const FLIGHT_MODE_HORIZON := 1 << 1
+
+
+func _mode_name(flags: int) -> String:
+	if flags & FLIGHT_MODE_ANGLE:
+		return "ANGLE"
+	if flags & FLIGHT_MODE_HORIZON:
+		return "HORIZON"
+	return "ACRO"
 
 
 # Center-screen crash state. Sim structural crash (bit0) is primary; the
@@ -902,6 +988,80 @@ func _maybe_shoot() -> void:
 			print("[shot] ", path)
 
 
+# --------------------------------------------------------- demo chapters
+# Everything except the original `acro` gate run is flown by demo_pilot.gd. The
+# pilot owns all eight channels (including ARM), prints its own report and says
+# when it is done; this is only the plumbing.
+# Booth mode: the demo runs on repeat, and anyone can pick up the sticks.
+#
+# The takeover is deliberately implicit — no button to find, no mode to
+# explain. Moving a stick past the deadband is how you take control, which is
+# the only instruction a stranger at a stand needs. Control goes back to the
+# demo after the sticks have been still for a while.
+const TAKEOVER_DEADBAND := 0.18
+const TAKEOVER_HOLD := 6.0        # seconds of stick silence before the demo resumes
+var _takeover := false
+var _takeover_idle := 0.0
+
+
+func _update_pilot_rc(delta: float) -> void:
+	if _pilot == null:
+		_pilot = PwDemoPilot.new()
+		_pilot.begin(self, "reel" if _demo == "loop" else _demo)
+	_at_time += delta
+	_maybe_shoot()          # PROPWASH_SHOTS: stills through the run
+
+	if _demo == "loop" and _check_takeover(delta):
+		_update_manual_rc(delta)
+		return
+
+	_rc = _pilot.update(delta)
+	_throttle = _rc[2]           # keeps the HUD's throttle readout honest
+	if _pilot.finished():
+		var fails: Array[String] = _pilot.failures()
+		for f in fails:
+			print("[demo] FAIL: %s" % f)
+		print("[demo] %s" % ("PASS" if fails.is_empty() else "FAIL"))
+		if _demo == "loop":
+			# never exits: start the reel again from the pad
+			print("[demo] loop: restarting")
+			reset_sim()
+			_pilot = null
+			return
+		get_tree().quit(0 if fails.is_empty() else 1)
+
+
+# True while a human is flying. Only ever consults a real handset — keyboard
+# input would make the demo hand control over to a stray arrow key.
+func _check_takeover(delta: float) -> bool:
+	var dev := _pick_joystick()
+	if dev < 0:
+		return false
+	var moved := false
+	for ch in range(4):
+		var ax: int = _js_axis_map[ch]
+		var v := Input.get_joy_axis(dev, ax)
+		# throttle rests at -1, the other three at centre
+		var rest := -1.0 if ch == 2 else 0.0
+		if absf(v - rest) > TAKEOVER_DEADBAND:
+			moved = true
+			break
+	if moved:
+		if not _takeover:
+			_takeover = true
+			_toast_msg("you have control")
+		_takeover_idle = 0.0
+		return true
+	if _takeover:
+		_takeover_idle += delta
+		if _takeover_idle >= TAKEOVER_HOLD:
+			_takeover = false
+			_toast_msg("demo resuming")
+			return false
+		return true
+	return false
+
+
 # Autonomous fly-through: ANGLE mode (self-level ON) so the firmware holds
 # attitude; the demo just commands a forward lean (pitch stick = target
 # angle) and an altitude-hold throttle to cruise the drone through the gates
@@ -952,7 +1112,7 @@ func _update_acro_demo_rc(delta: float) -> void:
 
 	# gates are solid now: record clearance while crossing each gate plane,
 	# and the worst damage — a silent scrape must fail the run
-	for gz in [-6.0, -14.0, -22.0]:
+	for gz in PwWorld.GATE_Z:
 		if absf(_pos.z - gz) < 0.5:
 			_gate_max_absx = maxf(_gate_max_absx, absf(_pos.x))
 			_gate_min_y = minf(_gate_min_y, _pos.y)
@@ -1302,466 +1462,6 @@ func _add_battery_and_pod(root: Node3D, model: Node3D) -> void:
 	_hide_from_fpv(pod)
 
 
-# ------------------------------------------------------------------ world
-const GATE_COLOR := Color(0.85, 0.30, 0.06)
-const GROUND_SIZE := 1000.0   # the flythrough asserts z < -30; the old 60x60
-                              # plane ended exactly there, so the test passed by
-                              # flying off the last polygon
-const WORLD_SEED := 0x9E3779B9   # fixed: the world must be identical every run
-
-# Materials are shared per colour. _add_box used to allocate a fresh BoxMesh AND
-# StandardMaterial3D on every call -- 71 unique pairs for what is really two
-# distinct looks.
-var _mat_cache := {}
-
-
-func _shared_material(color: Color, rough: float, metal: float) -> StandardMaterial3D:
-	var key := "%s|%.2f|%.2f" % [color.to_html(), rough, metal]
-	if _mat_cache.has(key):
-		return _mat_cache[key]
-	var mat := StandardMaterial3D.new()
-	mat.albedo_color = color
-	mat.roughness = rough
-	mat.metallic = metal
-	_mat_cache[key] = mat
-	return mat
-
-
-func _add_box(pos: Vector3, size: Vector3, color: Color) -> void:
-	var mi := MeshInstance3D.new()
-	var mesh := BoxMesh.new()
-	mesh.size = size
-	mesh.material = _shared_material(color, 0.55, 0.0)
-	mi.mesh = mesh
-	mi.position = pos
-	_world.add_child(mi)
-
-
-func _build_sky_and_sun() -> void:
-	# Sun lower than the old -55 deg: longer shadows read as shape, and a low sun
-	# is what an evening flying session actually looks like.
-	var sun := DirectionalLight3D.new()
-	sun.rotation_degrees = Vector3(-42, -35, 0)
-	sun.light_energy = 1.5
-	sun.light_color = Color(1.0, 0.97, 0.92)
-	sun.shadow_enabled = true
-	# shadow_bias defaults to 0.1 -- comparable to the whole 0.11 m airframe, so
-	# the quad had effectively no self-shadowing and peter-panned off the ground
-	sun.shadow_bias = 0.035
-	sun.shadow_normal_bias = 2.4
-	# the quad flies low and close, so bias the cascades hard toward the near field
-	sun.directional_shadow_split_1 = 0.05
-	sun.directional_shadow_split_2 = 0.15
-	sun.directional_shadow_split_3 = 0.40
-	sun.directional_shadow_fade_start = 0.9
-	_world.add_child(sun)
-
-	var env := WorldEnvironment.new()
-	var e := Environment.new()
-
-	var sky := Sky.new()
-	var psm := PhysicalSkyMaterial.new()   # real Rayleigh/Mie, sun disk matches the light
-	psm.rayleigh_coefficient = 2.0
-	psm.mie_coefficient = 0.005
-	psm.mie_eccentricity = 0.8
-	psm.turbidity = 10.0
-	psm.sun_disk_scale = 1.0
-	psm.ground_color = Color(0.22, 0.25, 0.18)
-	# the sky is the brightest thing in a daylit outdoor scene; at 1.0 against a
-	# sunlit field it rendered as dusk-navy with the field over-exposed
-	psm.energy_multiplier = 2.2
-	# The sun never moves in this scene, so the radiance map is static. AUTOMATIC
-	# keeps reprocessing it; QUALITY bakes it once and caches. Measured at ~15 fps
-	# of a 199 fps frame before this change.
-	sky.process_mode = Sky.PROCESS_MODE_QUALITY
-	sky.radiance_size = Sky.RADIANCE_SIZE_128
-	sky.sky_material = psm
-	e.background_mode = Environment.BG_SKY
-	e.sky = sky
-
-	# sky-sourced ambient AND reflection: nearly free, and it is what stops every
-	# material reading as flat gouraud plastic
-	e.ambient_light_source = Environment.AMBIENT_SOURCE_SKY
-	e.ambient_light_sky_contribution = 1.0
-	e.reflected_light_source = Environment.REFLECTION_SOURCE_SKY
-
-	# Tonemapping is the single biggest item here. The default is LINEAR at
-	# exposure 1.0, which is why everything looked washed out. AgX rolls off
-	# highlights and desaturates near white much closer to what a small-sensor
-	# camera ISP does; ACES tends to crush and over-saturate greens, and this
-	# scene is mostly green.
-	e.tonemap_mode = Environment.TONE_MAPPER_AGX
-	e.tonemap_exposure = 1.35
-	e.tonemap_white = 6.0
-	e.adjustment_enabled = true
-	e.adjustment_contrast = 1.05
-	e.adjustment_saturation = 1.08
-
-	# aerial perspective: the biggest single "outdoor" cue, and it works on every
-	# renderer including the Compatibility fallback
-	e.fog_enabled = true
-	e.fog_mode = Environment.FOG_MODE_DEPTH
-	e.fog_light_color = Color(0.62, 0.70, 0.80)
-	e.fog_light_energy = 1.0
-	e.fog_sun_scatter = 0.2
-	e.fog_depth_begin = 40.0
-	e.fog_depth_end = 900.0
-	e.fog_depth_curve = 1.1
-	e.fog_aerial_perspective = 0.45   # tint by the sky cubemap
-	e.fog_sky_affect = 0.0           # PhysicalSky already has its own haze
-
-	_apply_quality_to_env(e, sun)   # tier-dependent: shadows, glow, ssao, ssil, volfog
-	env.environment = e
-	_world.add_child(env)
-	_env = e      # the exposure hunt drives tonemap_exposure each frame
-	_sun = sun
-
-
-func _build_ground() -> void:
-	var ground := MeshInstance3D.new()
-	var plane := PlaneMesh.new()
-	plane.size = Vector2(GROUND_SIZE, GROUND_SIZE)
-	# NOTE: deliberately flat and un-displaced. _detect_contacts() tests the
-	# hull analytically against the y=0 plane (exact, engine-independent, and
-	# the same math as the C++/python harnesses), so any visual relief would
-	# desync -- the drone would sink into hills and hover over valleys.
-	var smat := ShaderMaterial.new()
-	smat.shader = load("res://shaders/ground.gdshader")
-	plane.material = smat
-	ground.mesh = plane
-	_world.add_child(ground)
-
-
-# A ring of low-poly conifers at 80-300 m in ONE draw call. No assets, and it is
-# the largest single cue that this is a place rather than a plane -- parallax
-# against distant objects is most of what sells outdoor flight.
-# A single cone and a single sphere read as exactly what they are. Real trees at
-# distance are irregular clustered foliage masses sitting on a visible trunk, and
-# the giveaway is silhouette variety, not polygon count. So: several distinct
-# meshes, each assembled from overlapping jittered blobs, scattered by its own
-# MultiMesh. Still only TREE_VARIANTS draw calls for the whole treeline.
-const TREE_VARIANTS := 6
-var _leaf_tex: ImageTexture
-const TRUNK_COLOR := Color(0.085, 0.062, 0.045)
-
-
-func _build_treeline() -> void:
-	_leaf_tex = _make_leaf_texture()   # one mask shared by every variant
-	var rng := RandomNumberGenerator.new()
-	rng.seed = WORLD_SEED
-	var per := int(_q.trees / float(TREE_VARIANTS))
-	for v in TREE_VARIANTS:
-		var conifer := v < 3
-		var mesh := _make_tree_mesh(rng, conifer)
-		var tint := Color(0.115, 0.165, 0.085) if conifer else Color(0.150, 0.195, 0.100)
-		_scatter_trees(mesh, per, 0.30 if conifer else 0.62, tint)
-
-
-# Procedural leaf mask, shared by every tree. Alpha is 0 wherever there is no
-# leaf, so the quad that carries it disappears and only leaf shapes render.
-# Generated rather than shipped: no binary asset, no licence question, no repo
-# weight — the whole reason this approach was chosen over sourcing models.
-const LEAF_TEX_SIZE := 192
-
-
-func _make_leaf_texture() -> ImageTexture:
-	var img := Image.create(LEAF_TEX_SIZE, LEAF_TEX_SIZE, true, Image.FORMAT_RGBA8)
-	var clump := FastNoiseLite.new()
-	clump.seed = WORLD_SEED
-	clump.noise_type = FastNoiseLite.TYPE_SIMPLEX
-	clump.frequency = 0.018
-	clump.fractal_octaves = 3
-	var detail := FastNoiseLite.new()
-	detail.seed = WORLD_SEED + 17
-	detail.noise_type = FastNoiseLite.TYPE_SIMPLEX
-	detail.frequency = 0.075
-
-	var half := LEAF_TEX_SIZE * 0.5
-	for y in LEAF_TEX_SIZE:
-		for x in LEAF_TEX_SIZE:
-			var u := (x - half) / half
-			var v := (y - half) / half
-			var r: float = sqrt(u * u + v * v)
-			var n := clump.get_noise_2d(x, y) * 0.5 + 0.5
-			var d := detail.get_noise_2d(x, y) * 0.5 + 0.5
-			# radial falloff keeps foliage off the card's rectangular edges, so
-			# the quad boundary never becomes visible
-			var mask := n * 0.72 + d * 0.28 - r * 0.62
-			if mask > 0.20:
-				var shade := 0.62 + d * 0.38          # per-leaf tonal break-up
-				img.set_pixel(x, y, Color(shade, shade, shade, 1.0))
-			else:
-				img.set_pixel(x, y, Color(0, 0, 0, 0))
-	img.generate_mipmaps()
-	return ImageTexture.create_from_image(img)
-
-
-# One tree: a tapered trunk plus a stack of alpha-cut foliage cards. Each card is
-# a flat quad; the leaf mask discards everything that is not a leaf, so the
-# silhouette comes out ragged and porous with sky visible through the gaps. That
-# porous outline is what actually reads as foliage — a solid blob never will,
-# regardless of how many blobs you overlap.
-func _make_tree_mesh(rng: RandomNumberGenerator, conifer: bool) -> ArrayMesh:
-	var foliage := SurfaceTool.new()
-	foliage.begin(Mesh.PRIMITIVE_TRIANGLES)
-
-	var card := PlaneMesh.new()
-	card.orientation = PlaneMesh.FACE_Z   # vertical quad
-	card.size = Vector2(1.0, 1.0)
-
-	# Alpha-tested foliage is overdraw-heavy — each card shades every fragment it
-	# covers whether or not the leaf mask keeps it, and the cards are two-sided.
-	# Card count is therefore the main foliage cost knob, tiered.
-	var base: int = _q.leaf_cards
-	var cards := rng.randi_range(base, base + 4)
-	for i in cards:
-		var t := float(i) / float(maxi(cards - 1, 1))   # 0 at base, 1 at tip
-		# conifers: cards shrink toward a point and droop. broadleaf: cards fill
-		# a rough ellipsoid crown.
-		var w: float
-		var y: float
-		var tilt: float
-		if conifer:
-			w = lerpf(1.15, 0.34, t) * rng.randf_range(0.9, 1.1)
-			y = lerpf(0.32, 1.02, t) + rng.randf_range(-0.04, 0.04)
-			tilt = rng.randf_range(0.06, 0.20)          # gentle branch droop
-		else:
-			w = rng.randf_range(0.72, 1.05)
-			y = rng.randf_range(0.46, 1.00)
-			tilt = rng.randf_range(-0.18, 0.18)
-		# Golden-angle yaw rather than random. Random leaves whole directions
-		# bare, and a card seen edge-on is a thin line -- several of those
-		# aligning is what produced the diagonal streaks and the false "every
-		# tree leans the same way" read.
-		var yaw := float(i) * 2.39996 + rng.randf_range(-0.25, 0.25)
-		# push cards off-axis so the crown has volume rather than all planes
-		# crossing at the trunk
-		var off := Vector3(cos(yaw + 1.2), 0.0, sin(yaw + 1.2)) \
-				* rng.randf_range(0.0, 0.22) * w
-		var basis := Basis(Vector3.UP, yaw) * Basis(Vector3.RIGHT, tilt)
-		foliage.append_from(card, 0,
-				Transform3D(basis.scaled(Vector3(w, w * 0.78, w)), Vector3(0, y, 0) + off))
-
-	foliage.generate_normals()
-	var mesh: ArrayMesh = foliage.commit()
-	var fmat := StandardMaterial3D.new()
-	fmat.albedo_texture = _leaf_tex
-	fmat.albedo_color = Color(0.52, 0.56, 0.42)   # multiplies the instance tint
-	fmat.roughness = 0.95
-	# Alpha SCISSOR, not blend: blended foliage needs depth sorting, which at
-	# 105 deg FOV across ~900 instances is both wrong and expensive. Scissor just
-	# discards the fragment. Alpha-to-coverage keeps the cut edges from crawling
-	# once MSAA is on.
-	fmat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA_SCISSOR
-	fmat.alpha_scissor_threshold = 0.5
-	# alpha-to-coverage resolves per MSAA sample, so it only helps (and only
-	# costs) when MSAA is actually on -- pointless on the low tier
-	if _q.msaa != Viewport.MSAA_DISABLED:
-		fmat.alpha_antialiasing_mode = BaseMaterial3D.ALPHA_ANTIALIASING_ALPHA_TO_COVERAGE
-	fmat.cull_mode = BaseMaterial3D.CULL_DISABLED   # cards are visible both sides
-	fmat.vertex_color_use_as_albedo = true   # per-instance tint varies the band
-	mesh.surface_set_material(0, fmat)
-
-	# trunk: visible below the canopy, which is most of what says "tree" in a
-	# silhouette against the sky
-	var trunk := SurfaceTool.new()
-	trunk.begin(Mesh.PRIMITIVE_TRIANGLES)
-	var tm := CylinderMesh.new()
-	tm.top_radius = 0.035
-	tm.bottom_radius = 0.075
-	tm.height = 0.9
-	tm.radial_segments = 6
-	tm.rings = 1
-	# trunk spans local y 0..0.9, so local y=0 is the base of the tree and the
-	# instance can simply be planted at ground level
-	trunk.append_from(tm, 0, Transform3D(Basis.IDENTITY, Vector3(0, 0.45, 0)))
-	trunk.generate_normals()
-	var tmesh: ArrayMesh = trunk.commit()
-	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES,
-			tmesh.surface_get_arrays(0))
-	var tmat := StandardMaterial3D.new()
-	tmat.albedo_color = TRUNK_COLOR
-	tmat.roughness = 1.0
-	mesh.surface_set_material(1, tmat)
-	return mesh
-
-
-func _scatter_trees(mesh: Mesh, count: int, width: float, tint: Color) -> void:
-	var rng := RandomNumberGenerator.new()
-	# fixed and per-variant: the world must be identical every run, but each
-	# variant must land somewhere different
-	rng.seed = WORLD_SEED + count * 7919 + int(width * 1000.0)
-
-	var mm := MultiMesh.new()
-	mm.transform_format = MultiMesh.TRANSFORM_3D
-	mm.use_colors = true
-	mm.mesh = mesh
-	mm.instance_count = count
-	for i in count:
-		var ang := rng.randf() * TAU
-		# denser near the inner edge so it reads as a receding mass, not a ring
-		var rad: float = 95.0 + pow(rng.randf(), 1.7) * 380.0
-		var h := rng.randf_range(5.0, 13.0)
-		var w := h * width * rng.randf_range(0.85, 1.2)
-		# mesh base is at local y=0, so plant directly on the ground; the old
-		# h*0.5 offset was for a centred primitive and left these hovering
-		var t := Transform3D(Basis.IDENTITY.scaled(Vector3(w, h, w)),
-				Vector3(cos(ang) * rad, 0.0, sin(ang) * rad))
-		mm.set_instance_transform(i, t)
-		var v := rng.randf_range(0.72, 1.28)
-		mm.set_instance_color(i, Color(tint.r * v, tint.g * v, tint.b * v * 0.95))
-
-		# trunk collision: a vertical capsule per tree. Trunk only — the
-		# crowns are visually porous alpha cards, and a canopy collider would
-		# block what clearly looks flyable-through.
-		var body := StaticBody3D.new()
-		body.set_meta("pw_surface", PwProtocol.SURF_TREE)
-		var shape := CollisionShape3D.new()
-		var cap := CapsuleShape3D.new()
-		cap.radius = clampf(0.09 * w, 0.05, 0.5)
-		cap.height = 0.9 * h
-		shape.shape = cap
-		shape.position = Vector3(0, 0.45 * h, 0)
-		body.add_child(shape)
-		body.position = t.origin
-		_world.add_child(body)
-
-	var mmi := MultiMeshInstance3D.new()
-	mmi.multimesh = mm
-	# 95-475 m out: their shadows are invisible but would pollute every cascade
-	mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-	_world.add_child(mmi)
-
-
-# ------------------------------------------------------------------ gates
-# Geometry the flythrough depends on: uprights at x = +/-GATE_HALF, top bar at
-# GATE_H, and the demo cruises through at GATE_ALT (1.0 m). The opening must stay
-# clear -- decoration goes outside it, never across it.
-const GATE_HALF := 1.2
-const GATE_H := 2.05
-const TUBE_R := 0.055
-const GATE_STRIPE_PX := 64
-
-var _gate_tube_mat: StandardMaterial3D
-var _gate_foot_mat: StandardMaterial3D
-
-
-# Hazard banding, generated rather than shipped: alternating safety-orange and
-# off-white along the tube axis, the way real race-gate poles are taped.
-func _make_stripe_texture() -> ImageTexture:
-	var img := Image.create(8, GATE_STRIPE_PX, false, Image.FORMAT_RGBA8)
-	for y in GATE_STRIPE_PX:
-		# 4 bands over the tile; slight tonal noise so it is not perfectly flat
-		var band := int(floor(y / float(GATE_STRIPE_PX) * 2.0)) % 2
-		var c := Color(0.85, 0.30, 0.06) if band == 0 else Color(0.88, 0.87, 0.84)
-		for x in 8:
-			var j := 1.0 + (sin(float(y) * 2.3 + float(x)) * 0.02)
-			img.set_pixel(x, y, Color(c.r * j, c.g * j, c.b * j, 1.0))
-	img.generate_mipmaps()
-	return ImageTexture.create_from_image(img)
-
-
-func _gate_materials() -> void:
-	if _gate_tube_mat != null:
-		return
-	_gate_tube_mat = StandardMaterial3D.new()
-	_gate_tube_mat.albedo_texture = _make_stripe_texture()
-	# powder-coated tube: not a mirror, but it catches the sky, which is most of
-	# what separates "real object" from "flat orange box"
-	_gate_tube_mat.roughness = 0.38
-	_gate_tube_mat.metallic = 0.0
-	_gate_tube_mat.uv1_scale = Vector3(1.0, 1.0, 1.0)
-
-	_gate_foot_mat = StandardMaterial3D.new()
-	_gate_foot_mat.albedo_color = Color(0.07, 0.07, 0.08)
-	_gate_foot_mat.roughness = 0.75
-
-
-func _add_tube(parent: Node3D, from: Vector3, to: Vector3, radius: float) -> void:
-	var mesh := CylinderMesh.new()
-	mesh.top_radius = radius
-	mesh.bottom_radius = radius
-	mesh.height = from.distance_to(to)
-	mesh.radial_segments = 12      # round profile; a box silhouette reads as CG
-	mesh.rings = 1
-	# repeat the banding along the tube rather than stretching one tile over it
-	# tile the banding at a fixed world size (~22 cm per band) instead of
-	# stretching one tile over the whole tube, which read as half orange /
-	# half white rather than striped
-	var mat: StandardMaterial3D = _gate_tube_mat.duplicate()
-	mat.uv1_scale = Vector3(1.0, maxf(1.0, mesh.height / 0.44), 1.0)
-	mesh.material = mat
-	var mi := MeshInstance3D.new()
-	mi.mesh = mesh
-	mi.position = (from + to) * 0.5
-	# CylinderMesh runs along +Y; rotate that onto the segment direction
-	var dir := (to - from).normalized()
-	if absf(dir.dot(Vector3.UP)) < 0.999:
-		var axis := Vector3.UP.cross(dir).normalized()
-		mi.rotate(axis, Vector3.UP.angle_to(dir))
-	parent.add_child(mi)
-
-	# matching collision capsule (gates are solid now); the rounded caps
-	# overreach each end by `radius`, along the tube axis only — outside the
-	# opening, so the flyable gap is exactly the visual gap
-	var body := StaticBody3D.new()
-	body.set_meta("pw_surface", PwProtocol.SURF_GATE)
-	var shape := CollisionShape3D.new()
-	var cap := CapsuleShape3D.new()
-	cap.radius = radius
-	cap.height = mesh.height + 2.0 * radius
-	shape.shape = cap
-	body.add_child(shape)
-	body.transform = mi.transform
-	parent.add_child(body)
-
-
-func _build_gate(z: float, idx: int) -> void:
-	_gate_materials()
-	var rng := RandomNumberGenerator.new()
-	rng.seed = WORLD_SEED + idx * 131   # deterministic per-gate variation
-
-	var gate := Node3D.new()
-	gate.position = Vector3(0, 0, z)
-	gate.rotate_y(rng.randf_range(-0.05, 0.05))   # nothing on a field is square
-	_world.add_child(gate)
-
-	# uprights and top bar -- the opening itself, unchanged from the box version
-	_add_tube(gate, Vector3(-GATE_HALF, 0.0, 0), Vector3(-GATE_HALF, GATE_H, 0), TUBE_R)
-	_add_tube(gate, Vector3(GATE_HALF, 0.0, 0), Vector3(GATE_HALF, GATE_H, 0), TUBE_R)
-	_add_tube(gate, Vector3(-GATE_HALF - TUBE_R, GATE_H, 0),
-			Vector3(GATE_HALF + TUBE_R, GATE_H, 0), TUBE_R)
-
-	# corner braces: short diagonals just under the top bar. Outside the flight
-	# line, and they stop the frame reading as three disconnected sticks.
-	var brace := 0.34
-	_add_tube(gate, Vector3(-GATE_HALF, GATE_H - brace, 0),
-			Vector3(-GATE_HALF + brace, GATE_H, 0), TUBE_R * 0.6)
-	_add_tube(gate, Vector3(GATE_HALF, GATE_H - brace, 0),
-			Vector3(GATE_HALF - brace, GATE_H, 0), TUBE_R * 0.6)
-
-	# feet: a gate standing on nothing is one of the strongest "floating CG"
-	# cues, and these also ground it against the shadow
-	for sx in [-1.0, 1.0]:
-		var foot := MeshInstance3D.new()
-		var fm := BoxMesh.new()
-		fm.size = Vector3(0.34, 0.045, 0.30)
-		fm.material = _gate_foot_mat
-		foot.mesh = fm
-		foot.position = Vector3(sx * GATE_HALF, 0.022, 0)
-		gate.add_child(foot)
-
-		var body := StaticBody3D.new()
-		body.set_meta("pw_surface", PwProtocol.SURF_OBJECT)
-		var shape := CollisionShape3D.new()
-		var box := BoxShape3D.new()
-		box.size = fm.size
-		shape.shape = box
-		body.add_child(shape)
-		body.position = foot.position
-		gate.add_child(body)
-
-
 func _build_goggle_layer() -> void:
 	if DisplayServer.get_name() == "headless" or _autotest:
 		return   # nothing is rasterised; the tests read stdout
@@ -1854,12 +1554,17 @@ func _on_window_resized() -> void:
 
 func _build_world() -> void:
 	_make_world_root()
-	_build_sky_and_sun()
-	_build_ground()
-	_build_treeline()
 
-	for i in range(3):
-		_build_gate(-6.0 - i * 8.0, i)
+	# Scenery (sky, ground, treeline, gates). The tier is baked in at build
+	# time — tree count and leaf-card count are geometry, not a live setting —
+	# which is why _resolve_quality runs before this.
+	var scene := OS.get_environment(SCENE_ENV)
+	if scene.is_empty():
+		scene = PwWorld.DEFAULT_SCENE
+	_world_builder = PwWorld.new()
+	_world_builder.build(scene, _world, _q)
+	_env = _world_builder.env    # the exposure hunt drives tonemap_exposure
+	_sun = _world_builder.sun    # ...and needs the sun for its alignment term
 
 	# drone + FPV camera
 	_drone = Node3D.new()
@@ -1880,6 +1585,11 @@ func _build_world() -> void:
 	cam.position = CAM_POS
 	cam.rotation_degrees = Vector3(CAM_TILT_DEG, 0, 0)
 	cam.set_cull_mask_value(FPV_HIDDEN_LAYER, false)   # see _hide_from_fpv
+	# Named, because the director adds two more cameras to the scene and
+	# fpv_cull_test has to assert against THIS one specifically — "the first
+	# Camera3D found by a depth-first walk" stopped being an identity the
+	# moment there was more than one.
+	cam.name = "FpvCamera"
 	_drone.add_child(cam)
 	cam.current = true
 	_cam = cam
@@ -1963,3 +1673,9 @@ func _build_world() -> void:
 	_toast.offset_bottom += 210
 	_toast.visible = false
 	ui.add_child(_toast)
+
+	# Camera rig + captions. Last, because it needs the FPV camera, the OSD
+	# label and the goggle material to already exist.
+	_director = PwDemoDirector.new()
+	_director.setup(self, _world, FPV_HIDDEN_LAYER)
+	_director.build_captions(ui)

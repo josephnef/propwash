@@ -40,8 +40,11 @@ jobs:
 
       - name: Core tests (headless, no GPU / no joystick)
         run: |
-          # the Godot client tests need a godot binary; run everything else
-          ctest --test-dir build --output-on-failure -E 'godot_client|flythrough'
+          # the Godot client tests need a godot binary; run everything else.
+          # (CMake does not even register them without GODOT_BIN — this is
+          # belt-and-braces so the intent survives a runner that has Godot.)
+          ctest --test-dir build --output-on-failure \
+            -E 'godot_client|flythrough|fpv_cull|client_collision|repair_flow|quality_tiers|shader_compile|acro_gateline|demo_'
 
   build-and-test-windows:
     runs-on: windows-latest
@@ -99,7 +102,7 @@ jobs:
           # full core suite runs here now; only the Godot client tests are
           # excluded (no godot binary on this runner).
           ctest --test-dir build --output-on-failure \
-            -E 'godot_client|flythrough'
+            -E 'godot_client|flythrough|fpv_cull|client_collision|repair_flow|quality_tiers|shader_compile|acro_gateline|demo_'
 
   python-gym:
     runs-on: ubuntu-latest
@@ -241,5 +244,9 @@ jobs:
           # installs no Godot) never registers them — this is the only job that
           # can run them at all. fpv_cull in particular is what pins the drone
           # model's node names, prop order and FPV layer split.
+          # `demo_` is a PREFIX match on purpose. This used to be a hand-written
+          # list of six names, so seven Godot tests added in one PR silently
+          # never ran here and CI went green without touching any of them.
+          # Anything named demo_* is picked up automatically from now on.
           ctest --test-dir build --output-on-failure \
-            -R 'godot_client|flythrough|fpv_cull|client_collision|repair_flow|quality_tiers'
+            -R 'godot_client|flythrough|fpv_cull|client_collision|repair_flow|quality_tiers|shader_compile|acro_gateline|demo_'

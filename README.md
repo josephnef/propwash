@@ -32,7 +32,9 @@ normal sim can't do:
    it ([Determinism](#determinism)). That's what backs a reproducible RL gym
    and blackbox replay for sim-vs-real validation.
 3. **Configurator-compatible** — the real Betaflight Configurator connects over
-   TCP and tunes it live, exactly like a bench quad.
+   TCP and tunes it live, exactly like a bench quad. `PROPWASH_DEMO=retune`
+   does it end to end: fly a roll, land, change `roll_srate` over the CLI,
+   save, fly the identical stick input again — and the quad rolls 1.5× faster.
 4. **Crashes are real** — contacts are resolved as forces inside the physics
    tick, so the firmware *feels* impacts on its virtual gyro/accel exactly like
    real hardware (its own crash detection works, straight from your dump).
@@ -175,6 +177,60 @@ upside-down: disarm, flip the turtle switch (`F`), arm, and roll — the props
 reverse over real DSHOT spin-direction commands and the quad pivots itself
 upright over a duct edge, exactly the crashflip maneuver from the real quad.
 
+### Demo mode
+
+```bash
+PROPWASH_DEMO=reel PROPWASH_SCENE=park PROPWASH_QUALITY=high \
+  PROPWASH_EEPROM=$PWD/eeprom.bin godot --path client-godot
+```
+
+The demo flies in **real ACRO** — self-levelling off, so the sticks command
+rates and the firmware's own rate curve and PID loop are genuinely in the path.
+A cascaded controller (`client-godot/scripts/demo_pilot.gd`) closes position,
+velocity, attitude and rate loops itself. It deliberately does **not** model
+your rate curve: reading it would mean talking MSP mid-run, which forfeits
+determinism, so the inner loop closes on rate *error* and works against any
+tune.
+
+| chapter | what it shows |
+|---|---|
+| `reel` | `freestyle` → `turtle` → `ghost` as one continuous take — the capture chapter |
+| `freestyle` | 22 maneuvers in the park: gates, backflip, loop gate, slalom, roll, a 15 m dive off the scaffold tower, an orbit, a split-S, a yaw spin |
+| `turtle` | crash inverted, flip back over on reversed props, fly away |
+| `ghost` | record a stick tape, reset, replay it against a translucent ghost of the previous run — then change one stick sample by a microsecond |
+| `retune` | fly a roll, land, change `roll_srate` over the real CLI, save, fly the same input again — peak roll rate goes 683 → 1031 deg/s |
+| `gateline` | the three race gates in ACRO (the minimal controller regression) |
+| `probe` | prints what each stick actually does; how the sign table was measured |
+| `move:<kind>` | one maneuver in isolation — `flip`, `roll`, `split_s`, `dive`, `orbit`, `yaw_spin`, `hover` |
+| `loop` | `reel` on repeat for a stand; move a stick on a connected handset to take over, and it hands back after 6 s of quiet |
+| `acro` | the original ANGLE-mode gate run, unchanged (what the `flythrough` ctest asserts) |
+
+The **ghost** chapter is the one worth watching. Determinism is otherwise only
+visible as a green test: here the replayed run and the recorded ghost stay
+welded together at **exactly 0.000000000 m**, and then a single stick sample
+altered by one microsecond — the finest step the RC link can express — pulls
+them ~13 cm apart. Both halves matter; a run that ignored its inputs would be
+trivially repeatable.
+
+Cameras cut per maneuver between the FPV feed, a chase view and a ground-level
+LOS "tripod" (`C` cycles them by hand too). The O3 goggle treatment and the
+Betaflight OSD run **only** on the FPV view — on real hardware the goggles draw
+the OSD, so it belongs to the pilot's view and to nothing else.
+
+To capture the reel, let Godot render it at a fixed frame delta rather than
+screen-recording it:
+
+```bash
+PROPWASH_DEMO=reel PROPWASH_SCENE=park PROPWASH_QUALITY=high \
+  godot --path client-godot --write-movie reel.avi
+```
+
+The **retune** chapter is the Configurator claim made physical, and it has to
+follow the real bench workflow because the firmware enforces it: fly a
+full-stick roll, **land and disarm** (Betaflight refuses to open the CLI while
+armed), change `roll_srate` over TCP 5761, `save`, then fly the *identical*
+stick input again. Measured, not asserted by eye: **683 → 1031 deg/s, ×1.51**.
+
 ### Wind
 
 `PROPWASH_WIND="3,0,0" PROPWASH_GUST=1.5 godot --path client-godot` gives a
@@ -183,8 +239,12 @@ the same run; calm runs are byte-identical to a build without wind.
 
 ### Configurator and the real OSD
 
-- **Betaflight Configurator** connects any time to TCP `127.0.0.1:5761` (MSP/CLI)
-  and tunes it live.
+- **Betaflight Configurator** connects to TCP `127.0.0.1:5761` (MSP/CLI) and
+  tunes it live. **Land and disarm first:** stock Betaflight ignores the `#`
+  CLI escape while the quad is armed (`fc/tasks.c` passes
+  `MSP_SKIP_NON_MSP_DATA` when `ARMING_FLAG(ARMED)`), exactly as on real
+  hardware. MSP itself keeps working armed or not — it is only CLI *entry*
+  that is gated.
 - The **real Betaflight OSD** is overlaid on the FPV view — crisp, above the
   camera-feed pass, because on a real DJI system the goggles draw it from
   MSP-DisplayPort data rather than it being encoded into the video.
@@ -223,7 +283,8 @@ discoverable by reading the source.
 |---|---|
 | `PROPWASH_EEPROM=<path>` | eeprom the client's core boots from (your baked tune) |
 | `PROPWASH_CORE=<path>` | propwash-core binary to spawn; defaults to `../build/propwash-core` |
-| `PROPWASH_DEMO=acro` | autonomous fly-through of all three gates, prints `[demo] PASS` |
+| `PROPWASH_DEMO=<chapter>` | autonomous demo; see [Demo mode](#demo-mode) for the chapters |
+| `PROPWASH_SCENE=field\|park` | `field` is the original flying field; `park` adds the freestyle furniture |
 | `PROPWASH_AUTOTEST=1` | headless arm + hover self-test, exits 0/1 (what CI runs) |
 | `PROPWASH_SHOTS=<dir>` | save PNG frames at fixed times during a demo run |
 | `PROPWASH_QUALITY=low\|medium\|high` | override the auto-selected render tier |
@@ -341,8 +402,8 @@ CLI/Configurator data path, real-tune loading, joystick calibration, autonomous
 gate fly-through, a **[Gymnasium environment](python/propwash_gym/)** (RL,
 `uv`-managed, subprocess-per-env, `frame_id` lockstep), and a
 **[blackbox replay + system-ID pipeline](tools/sysid/)** (RC & physics-only
-replay, physics-parameter fitting over `PW_INIT`). **22 self-tests** (15
-always, +6 with a Godot binary, +1 with Python) cover it with the real core in
+replay, physics-parameter fitting over `PW_INIT`). **31 self-tests** (16
+always, +13 with a Godot binary, +2 with Python/OpenSCAD) cover it with the real core in
 the loop: boot/MSP identity, hover, contact settling (level *and* inverted),
 the crash→repair lifecycle, damage over the wire, DSHOT + turtle mode + the
 RPM filter, both determinism gates, wire-codec parity, OSD render, real-tune
